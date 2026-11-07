@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@opencode/plugin-superagent",
+  "version": "2.2.5",
+  "description": "Superagent P0 prototype: a resident router session with background worker sessions",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/opencode.git",
+    "directory": "packages/plugins/superagent"
+  },
+  "exports": {
+    ".": "./server.ts",
+    "./server": "./server.ts",
+    "./tui": "./tui.tsx"
+  },
+  "files": [
+    "server.ts",
+    "tui.tsx",
+    "src",
+    "agent"
+  ],
+  "scripts": {
+    "typecheck": "bun check --no-script",
+    "typecheck:tsc": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.27 || ^0.0.0-dev",
+    "effect": "^4.1.0 || ^0.0.0-dev"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "workspace:*",
+    "@opencode/schema": "workspace:*",
+    "@tsconfig/bun": "catalog:",
+    "@types/bun": "catalog:",
+    "@typescript/native": "catalog:",
+    "effect": "catalog:"
+  }
+}
