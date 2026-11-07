@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Option, Stream } from "effect"
 import { ensureRouter } from "./router.js"
-import { saveThread, saveWorker, store, threadKey, toSessionID } from "./state.js"
+import { saveWorker, store, toSessionID } from "./state.js"
 import { reportWorkerToTelegram } from "./telegram.js"
 
 const REPORT_LIMIT = 1200
@@ -69,19 +69,10 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   const report = lastAssistantText(messages)
   if (report !== undefined) worker.lastReport = truncateReport(report)
   yield* saveWorker(ctx, worker)
-  // Release the thread subscriptions so the next message on the same thread
-  // returns to the Router (fresh dispatch) instead of reusing a stale session.
-  // The worker record itself is kept for status/history.
-  for (const threadID of worker.threads) {
-    const rest = (store.threads.get(threadID) ?? []).filter((id) => id !== sessionID)
-    if (rest.length === 0) {
-      store.threads.delete(threadID)
-      yield* ctx.storage.remove(threadKey(threadID)).pipe(Effect.catch(() => Effect.void))
-    } else {
-      store.threads.set(threadID, rest)
-      yield* saveThread(ctx, { threadID, workers: [...rest], updatedAt: Date.now() })
-    }
-  }
+  // Keep the thread subscriptions after the worker ends: follow-ups on the
+  // same thread resume this worker (prompting a finished session starts a new
+  // execution in it) instead of spawning a fresh session per message. The
+  // user starts a genuinely new task with /new, which clears the affinity.
   yield* reportWorkerToTelegram(ctx, sessionID).pipe(
     Effect.catch((cause) => Effect.logWarning("superagent telegram report failed", { sessionID, cause })),
   )

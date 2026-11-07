@@ -6,7 +6,7 @@
 
 - 一个 Router 会话：和用户交互，用 `dispatch` 并行派活。
 - 多个 Worker 会话：各自独立执行任务，结束时把结论作为 report 交回 Router。
-- thread 亲和：首次出现的事件进入 Router，后续事件直投该 thread 的 Worker。
+- thread 亲和（粘性续聊）：首次出现的事件进入 Router 建 Worker，后续事件回到同一 Worker 继续（已结束会被唤起，不会每句话建新会话）；`/new` 清绑定另起新任务。
 - 批处理：相邻事件合批，减少重复唤醒。
 - TUI 入口：`/superagent` 打开 Router，`/superagent-demo` 注入一组演示事件并显示每条事件的路由结果。
 
@@ -134,10 +134,9 @@ Token 读取顺序（永不落明文、不打日志）：
 （私聊 chat id == user id，群是负数）直接丢弃、不回包；发送侧同样过滤。
 不配置则保持开放（兼容旧行为）。
 
-Router 接管对话：插件选项 `telegramViaRouter`（或 `telegram.viaRouter`，
-环境变量 `TELEGRAM_VIA_ROUTER=1`）为 true 时，每条 Telegram 消息都进
-Router 派发新 Worker；运行中的 Worker 结束后自动解绑 thread，下条消息
-回到 Router。默认 false（粘性直投：同 thread 追问直达运行中的 Worker）。
+粘性续聊（默认行为，不可关闭）：同一聊天（thread）的追问回到上一个
+Worker 继续（运行中直接收，已结束会被唤起），`failed` 的 Worker 除外
+（下一条走 Router 重新派发）。另起一件事时发 `/new` 清掉绑定。
 
 `sources` allowlist 已有值时必须加上 `"telegram"`，否则新消息会被 `dropped`。
 未配置（allowlist 缺失会打 `logWarning`，无 Token 则打 `logInfo` 并停用适配器，
@@ -149,8 +148,6 @@ Router 派发新 Worker；运行中的 Worker 结束后自动解绑 thread，下
   "sources": ["demo", "telegram"],
   // 私有 Bot：只允许自己的私聊 chat id（== user id），陌生人消息直接丢弃
   "telegramAllowedChatIDs": [708532537],
-  // Router 接管对话：每条 Telegram 消息都经 Router 派发新 Worker，不粘旧会话
-  "telegramViaRouter": true,
 }
 ```
 
@@ -168,15 +165,16 @@ export TELEGRAM_BOT_TOKEN="<BotFather token>"
 Router/Worker 的模型与目录、`store` 看 Router/pending/Workers）：
 
 - 命令（客户端 `/` 菜单，启动时由 `setMyCommands` 注册）：`/menu` `/models`
-  `/dir` `/workers` `/status` `/stop`（`/start`/`/help` 同 `/menu`）。
+  `/dir` `/workers` `/status` `/stop` `/new`（`/start`/`/help` 同 `/menu`）。
 - 内联按钮（`callback_data` 形如 `sa:menu` / `sa:models:<page>` /
   `sa:mset:<page>:<idx>` / `sa:dir` / `sa:dset:<idx>` / `sa:workers` /
-  `sa:wdetail:<sessionID>` / `sa:wstop:<sessionID>` / `sa:status`，64 字节内，
+  `sa:wdetail:<sessionID>` / `sa:wstop:<sessionID>` / `sa:status` / `sa:new`，64 字节内，
   下标每次按实时列表解析，服务端无缓存）：
 
 | 入口 | 内容 | 动作 |
 |------|------|------|
-| `/menu` 主菜单 | 2×2 按钮 | 进模型/目录/Workers/状态视图 |
+| `/menu` 主菜单 | 模型/目录/Workers/状态 + 🆕 新任务按钮 | 进各视图；🆕 清掉本聊天绑定 |
+| `/new` | 清掉本聊天（thread）的 Worker 绑定 | 下条消息走 Router 派发全新 Worker |
 | `/models` | Router 当前模型 + 可用模型分页（8/页，✓ 标记当前） | 点按钮 `session.switchModel` 切 Router，新 Worker 跟随 Router 模型（`dispatch` 既有镜像逻辑） |
 | `/dir` | Router 当前目录、服务默认目录、最近 Worker 目录候选；或 `/dir /绝对路径` | 点按钮/`/dir` 用 `session.move` 搬 Router，新 Worker 跟随 Router 目录（`dispatch` 新增镜像逻辑） |
 | `/workers` | 运行中（🟢，每行详情+停止按钮）与历史（✅/❌/💤，最近 10 条） | 详情看标题/state/threads/结论；停止调 `session.interrupt` |
@@ -200,10 +198,12 @@ Router/Worker 的模型与目录、`store` 看 Router/pending/Workers）：
 去重键为 `telegram:<chat>:<message_id>`（Router 路径复用 pending 去重；
 `update_id` 偏移持久化在 KV `telegram:offset`，崩溃重启后断点续拉）。
 
-### 回复链路
+### 回复链路与粘性续聊
 
+- 同一聊天（thread）的追问默认**回到上一个 Worker 继续**：运行中直接收，已结束（done/idle）会被唤起继续，不会每句话建新会话。
+- 只有全新 topic（该 thread 没有 Worker 记录）或上一个 Worker 失败了，消息才进 Router → `dispatch` 建新 Worker。
+- 想另起一件事：发 `/new`（或点主菜单 🆕）清掉该聊天的绑定，下条消息即派发全新 Worker；旧会话保留在 `/workers` 历史里。
 - 新 thread：先回一条 `已收到，正在处理…` ack，消息进 Router → `dispatch` 建 Worker。
-- 同 thread 后续消息：直投已订阅该 thread 的 Worker（`server.ts` 既有逻辑）。
 - Worker 结束（`succeeded`/`failed`/`interrupted`）时，`watcher.ts` 在写回 Router
   的同时调 `reportWorkerToTelegram` 把 `lastReport`（截断 4000 字）发回对应聊天。
 - `/start` 回帮助文本 + 主菜单按钮；命令（`/models` 等）只回对应视图，不进 trigger；非文本消息（贴纸/图片/系统消息）直接跳过。

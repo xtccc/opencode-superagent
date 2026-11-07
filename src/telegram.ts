@@ -3,7 +3,7 @@ import type { Model } from "@opencode/schema/model"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Duration, Effect } from "effect"
 import { ensureRouter } from "./router.js"
-import { store, toSessionID, type TriggerInput } from "./state.js"
+import { store, threadKey, toSessionID, type TriggerInput } from "./state.js"
 
 /** Trigger source value for all Telegram ingress. Add it to the `sources` allowlist to enable. */
 export const TELEGRAM_SOURCE = "telegram"
@@ -19,7 +19,7 @@ const DEFAULT_POLL_IDLE_MS = 2000
 const SEND_LIMIT = 4000
 
 const START_HELP =
-  "我是 Superagent Router。直接发文字即派发任务，Router 会分给 Worker 执行；结论完成后发回这里。\n\n按钮菜单：/menu ｜ 模型：/models ｜ 目录：/dir ｜ Workers：/workers ｜ 状态：/status ｜ 停止任务：/stop"
+  "我是 Superagent Router。直接发文字即派发任务，同一聊天的追问会回到上一个 Worker 继续；结论完成后发回这里。\n\n按钮菜单：/menu ｜ 模型：/models ｜ 目录：/dir ｜ Workers：/workers ｜ 状态：/status ｜ 停止任务：/stop ｜ 新任务：/new"
 
 export interface TelegramTriggerResult {
   readonly route: "router" | "worker" | "dropped"
@@ -96,7 +96,6 @@ export function readTelegramToken(ctx: Plugin.Context): string | undefined {
 }
 
 const TELEGRAM_ALLOWED_ENV = "TELEGRAM_ALLOWED_CHAT_IDS"
-const TELEGRAM_VIA_ROUTER_ENV = "TELEGRAM_VIA_ROUTER"
 
 function toChatIDList(value: unknown): Array<number> {
   const out: Array<number> = []
@@ -150,24 +149,6 @@ export function isTelegramAllowed(ctx: Plugin.Context, chatID: number): boolean 
   const allowlist = readTelegramAllowlist(ctx)
   if (allowlist === undefined) return true
   return allowlist.includes(chatID)
-}
-
-/**
- * Router-first ingress for Telegram: every message goes through the Router,
- * which dispatches a fresh Worker per request. Disabled by default to keep
- * the sticky thread affinity; enable with `telegramViaRouter` (or
- * `telegram.viaRouter`, env `TELEGRAM_VIA_ROUTER=1`).
- */
-export function readTelegramViaRouter(ctx: Plugin.Context): boolean {
-  const direct = ctx.options["telegramViaRouter"]
-  if (typeof direct === "boolean") return direct
-  const nested = ctx.options["telegram"]
-  if (isRecord(nested) && typeof nested["viaRouter"] === "boolean") return nested["viaRouter"]
-  if (typeof process !== "undefined") {
-    const raw = process.env[TELEGRAM_VIA_ROUTER_ENV]
-    if (raw === "1" || raw === "true" || raw === "yes") return true
-  }
-  return false
 }
 
 /** Private chat -> `telegram:<chatID>`; forum topic -> `telegram:<chatID>:<topicID>`. */
@@ -342,6 +323,7 @@ function menuRows(): Array<Array<TelegramButton>> {
   return [
     [button("🤖 模型", "sa:models:0"), button("📁 目录", "sa:dir")],
     [button("👷 Workers", "sa:workers"), button("📊 状态", "sa:status")],
+    [button("🆕 新任务（换会话）", "sa:new")],
   ]
 }
 
@@ -349,7 +331,7 @@ function menuRows(): Array<Array<TelegramButton>> {
  * `callback_data` is capped at 64 bytes, so payloads are short codes:
  * `sa:menu`, `sa:models:<page>`, `sa:mset:<page>:<idx>`, `sa:dir`,
  * `sa:dset:<idx>`, `sa:workers`, `sa:wdetail:<sessionID>`,
- * `sa:wstop:<sessionID>`, `sa:status`. Model/dir indices resolve against
+ * `sa:wstop:<sessionID>`, `sa:status`, `sa:new`. Model/dir indices resolve against
  * freshly listed state, so no server-side cache is needed. */
 
 const sendMessage = Effect.fn("superagent.telegramSend")(function* (
@@ -406,7 +388,7 @@ const setMyCommands = Effect.fn("superagent.telegramCommands")(function* (token:
       { command: "dir", description: "查看/切换工作目录" },
       { command: "workers", description: "运行中与历史 Workers" },
       { command: "status", description: "Router 与队列状态" },
-      { command: "stop", description: "停止一个 Worker" },
+      { command: "new", description: "另起新任务（换会话）" },
       { command: "stop", description: "停止一个 Worker" },
     ],
   })
@@ -451,7 +433,7 @@ function shortTitle(title: string | undefined, limit: number): string {
 
 function menuView(): { text: string; replyMarkup: TelegramMarkup } {
   return {
-    text: "Superagent 控制面板：\n🤖 模型：查看/切换 Router 与后续 Worker 的模型\n📁 目录：查看/切换工作目录（新 Worker 跟随 Router 目录）\n👷 Workers：运行中与历史任务，可看详情、可停止\n📊 状态：Router、队列与 Worker 汇总\n\n直接发文字即派发任务。",
+    text: "Superagent 控制面板（同聊天的追问默认回到上一个 Worker 继续；换新任务点下面 🆕 或发 /new）：\n🤖 模型：查看/切换 Router 与后续 Worker 的模型\n📁 目录：查看/切换工作目录（新 Worker 跟随 Router 目录）\n👷 Workers：运行中与历史任务，可看详情、可停止\n📊 状态：Router、队列与 Worker 汇总",
     replyMarkup: markup(menuRows()),
   }
 }
@@ -685,6 +667,21 @@ const stopWorkerByID = Effect.fn("superagent.telegramStopWorker")(function* (ctx
   return result.interrupted
 })
 
+/**
+ * Clear the thread affinity for one chat (topic): the next message on that
+ * thread goes through the Router as a fresh dispatch instead of resuming the
+ * previous worker. The old worker record stays for status/history.
+ */
+const clearAffinity = Effect.fn("superagent.telegramNew")(function* (
+  ctx: Plugin.Context,
+  chatID: number,
+  messageThreadID: number | undefined,
+) {
+  const threadID = threadIDForChat(chatID, messageThreadID)
+  store.threads.delete(threadID)
+  yield* ctx.storage.remove(threadKey(threadID)).pipe(Effect.catch(() => Effect.void))
+})
+
 const handleCommand = Effect.fn("superagent.telegramCommand")(function* (
   ctx: Plugin.Context,
   token: string,
@@ -757,9 +754,17 @@ const handleCommand = Effect.fn("superagent.telegramCommand")(function* (
       )
       return
     }
+    case "/new": {
+      yield* clearAffinity(ctx, chatID, messageThreadID)
+      const view = menuView()
+      yield* sendMessage(token, chatID, `已另起新任务：下条消息会派发全新的 Worker。之前的会话保留在历史里，可用 /workers 查看。\n\n${view.text}`, messageThreadID, view.replyMarkup).pipe(
+        Effect.catch((cause) => Effect.logWarning("superagent telegram new reply failed", { cause })),
+      )
+      return
+    }
     default: {
       const view = menuView()
-      yield* sendMessage(token, chatID, `未知命令 ${name}，可用：/menu /models /dir /workers /status /stop`, messageThreadID, view.replyMarkup).pipe(
+      yield* sendMessage(token, chatID, `未知命令 ${name}，可用：/menu /models /dir /workers /status /stop /new`, messageThreadID, view.replyMarkup).pipe(
         Effect.catch((cause) => Effect.logWarning("superagent telegram unknown command reply failed", { cause })),
       )
     }
@@ -870,6 +875,13 @@ const handleCallback = Effect.fn("superagent.telegramCallback")(function* (
     const stopped = yield* stopWorkerByID(ctx, sessionID)
     yield* say(stopped ? "已发送停止信号" : "该 Worker 不在运行中", !stopped)
     const view = workersView()
+    yield* show(view.text, view.replyMarkup)
+    return
+  }
+  if (data === "sa:new") {
+    yield* clearAffinity(ctx, query.chatID, query.messageThreadID)
+    const view = menuView()
+    yield* say("已另起新任务，下条消息会派发全新 Worker")
     yield* show(view.text, view.replyMarkup)
     return
   }

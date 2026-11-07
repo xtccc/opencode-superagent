@@ -105,6 +105,9 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
     const threadID = input.threadID
     const existing = store.threads.get(threadID) ?? []
     if (!existing.includes(created.id)) existing.push(created.id)
+    // Affinity lists persist after workers end; cap them so long-lived
+    // threads don't grow unbounded in memory and KV.
+    if (existing.length > 20) existing.splice(0, existing.length - 20)
     store.threads.set(threadID, existing)
     yield* ctx.storage
       .set(threadKey(threadID), encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }))

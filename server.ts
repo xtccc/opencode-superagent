@@ -5,7 +5,7 @@ import { registerTools } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
-import { TELEGRAM_SOURCE, readTelegramViaRouter, registerTelegram } from "./src/telegram.js"
+import { registerTelegram } from "./src/telegram.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
@@ -15,13 +15,22 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
   if (Array.isArray(sources) && !sources.includes(input.source)) return { route: "dropped" as const }
   if (input.text.trim() === "") return { route: "dropped" as const }
   const formatted = formatTrigger(input)
-  // Router-first mode (Telegram opt-in): every message goes through the Router,
-  // which dispatches a fresh Worker per request. Otherwise only live (running)
-  // workers receive direct delivery; finished workers release the thread so the
-  // next message returns to the Router instead of reusing a stale session.
-  const viaRouter = input.source === TELEGRAM_SOURCE && readTelegramViaRouter(ctx)
-  const subscribed = viaRouter ? [] : (store.threads.get(input.threadID) ?? [])
-  const targets = subscribed.filter((sessionID) => store.workers.get(sessionID)?.state === "running")
+  // Sticky thread affinity: follow-ups on a known thread go straight back to
+  // its worker instead of spawning a fresh session per message. Running
+  // workers get everything; otherwise the most recent idle/done worker is
+  // resumed (prompting a finished session starts a new execution in it, and
+  // the watcher flips it back to running). Failed workers are skipped so the
+  // next message gets a fresh dispatch through the Router. Truly new tasks
+  // start with /new, which clears the thread affinity.
+  const subscribed = store.threads.get(input.threadID) ?? []
+  const running = subscribed.filter((sessionID) => store.workers.get(sessionID)?.state === "running")
+  const resumed = [...subscribed]
+    .reverse()
+    .find((sessionID) => {
+      const state = store.workers.get(sessionID)?.state
+      return state === "idle" || state === "done"
+    })
+  const targets = running.length > 0 ? running : resumed === undefined ? [] : [resumed]
   if (targets.length > 0) {
     const sessions = ctx.session
     let delivered = 0
