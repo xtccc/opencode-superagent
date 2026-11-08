@@ -1,9 +1,10 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
 import { Effect, Option, type Schema } from "effect"
+import { threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
+import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
 import { ROUTER_KEY, store, toSessionID, type PendingTrigger, type TriggerInput } from "./state.js"
 
-const ROUTER_TITLE = "Superagent"
 const ROUTER_AGENT = "superagent-router"
 const MAX_FLUSH = 20
 
@@ -157,7 +158,7 @@ export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx:
   const created = yield* sessions.create({
     title: ROUTER_TITLE,
     ...(routerAgent === undefined ? {} : { agent: routerAgent }),
-    metadata: { superagent: { role: "router" } },
+    metadata: superagentMetadata("router"),
     permissions: [
       { action: "*", resource: "*", effect: "deny" },
       { action: "dispatch", resource: "*", effect: "allow" },
@@ -183,7 +184,11 @@ export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx:
   const batch = store.pending.slice(0, MAX_FLUSH)
   const text = [
     `${batch.length} new event(s) for the router:`,
-    ...batch.map((item) => formatTrigger(item.trigger)),
+    ...batch.map((item) => {
+      const base = formatTrigger(item.trigger)
+      const hint = threadDirHint(item.trigger.threadID)
+      return hint === undefined ? base : `${base}\n${hint}`
+    }),
   ].join("\n\n")
   const delivered = yield* ctx.session
     .synthetic({ sessionID: toSessionID(routerID), text, description: "superagent triggers", delivery: "queue" })

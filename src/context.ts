@@ -1,13 +1,14 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
+import { directorySummary } from "./dirs.js"
 import { ROUTER_PROMPT } from "./prompts.js"
 import { registerRecall } from "./recall.js"
 import { store } from "./state.js"
-
-const ROUTER_TOOLS: ReadonlySet<string> = new Set(["dispatch", "status", "thread_detail", "worker_detail"])
+import { ROUTER_TOOLS } from "./tools.js"
 
 /**
- * Router-only context hook: strip every tool outside the router set,
+ * Router-only context hook: strip every tool outside the router set
+ * (derived from the tool catalog in `src/tools.ts`),
  * then append the router prompt plus a short live status line.
  */
 export const registerContext = Effect.fn("superagent.registerContext")(function* (ctx: Plugin.Context) {
@@ -19,7 +20,7 @@ export const registerContext = Effect.fn("superagent.registerContext")(function*
       }
       event.system.push({
         type: "text",
-        text: `${ROUTER_PROMPT}\n\nStatus: workers=${store.workers.size} pending=${store.pending.length} triggers=${store.triggerTotal}.`,
+        text: `${ROUTER_PROMPT}\n\nStatus: workers=${store.workers.size} pending=${store.pending.length} triggers=${store.triggerTotal}. ${directorySummary()}.`,
       })
     }),
   )

@@ -11,6 +11,7 @@ export interface WorkerRecord {
   state: WorkerState
   readonly createdAt: number
   lastReport?: string
+  directory?: string
 }
 
 export interface ThreadRecord {
@@ -229,6 +230,7 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
     state: value["state"] as WorkerState,
     createdAt: optionalNumber(value, "createdAt") ?? 0,
     lastReport: optionalString(value, "lastReport"),
+    ...(optionalString(value, "directory") === undefined ? {} : { directory: optionalString(value, "directory") }),
   }
 }
 
@@ -274,6 +276,7 @@ export function encodeWorker(record: WorkerRecord): Schema.Json {
     state: record.state,
     createdAt: record.createdAt,
     ...(record.lastReport === undefined ? {} : { lastReport: record.lastReport }),
+    ...(record.directory === undefined ? {} : { directory: record.directory }),
   } as unknown as Schema.Json
 }
 

@@ -1,15 +1,20 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
+import { AbsolutePath } from "@opencode/schema/schema"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
+import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
+import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { encodeThread, saveWorker, store, threadKey, toSessionID } from "./state.js"
+import { specFor } from "./tools.js"
 
 const WORKER_AGENT = "superagent-worker"
 
-const DispatchInput = Schema.Struct({
+export const DispatchInput = Schema.Struct({
   task: Schema.String,
   title: Schema.optionalKey(Schema.String),
   threadID: Schema.optionalKey(Schema.String),
   agent: Schema.optionalKey(Schema.String),
+  directory: Schema.optionalKey(Schema.String),
 })
 
 const StatusOutput = Schema.Struct({ text: Schema.String })
@@ -20,13 +25,7 @@ interface DispatchInput {
   readonly title?: string
   readonly threadID?: string
   readonly agent?: string
-}
-
-function defaultTitle(task: string): string {
-  const line = task.split("\n")[0] ?? ""
-  const clean = line.trim().slice(0, 60)
-  if (clean === "") return "Worker task"
-  return clean
+  readonly directory?: string
 }
 
 function workerPrompt(threadID: string | undefined, title: string | undefined, task: string): string {
@@ -42,7 +41,8 @@ function statusText(): string {
     const title = worker.title ?? "-"
     const threads = worker.threads.length === 0 ? "-" : worker.threads.join(",")
     const report = worker.lastReport ?? "-"
-    lines.push(`- ${id} ${title} [${threads}] ${worker.state} ${report}`.slice(0, 200))
+    const dir = worker.directory ?? "-"
+    lines.push(`- ${id} ${title} [${threads}] ${worker.state} dir=${dir} ${report}`.slice(0, 220))
   }
   return lines.join("\n")
 }
@@ -59,7 +59,10 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
   const agents = ctx.agent
   const sessions = ctx.session
   const requested = input.agent ?? WORKER_AGENT
-  const resolved = yield* agents.get({ agentID: Agent.ID.make(requested) }).pipe(
+  if (input.directory !== undefined && normalizeDirectory(input.directory) === undefined) {
+    return yield* new Tool.Error({ message: "dispatch directory must be an absolute path, e.g. /opt/ai-gw" })
+  }
+  const agentResolved = yield* agents.get({ agentID: Agent.ID.make(requested) }).pipe(
     Effect.map((result) => result.data.id),
     Effect.catch((cause) =>
       Effect.logWarning("superagent worker agent missing, creating session without it", {
@@ -82,14 +85,31 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
   )
   const routerModel = routerInherit?.model
   const routerDirectory = routerInherit?.directory
-  const threads = input.threadID === undefined ? [] : [input.threadID]
+  // Single gateway, Router-managed directories: explicit directory wins,
+  // otherwise thread binding / alias match, otherwise follow Router. The
+  // gateway process directory itself is irrelevant.
+  const requestedDir = input.directory === undefined ? undefined : normalizeDirectory(input.directory)
+  const rememberedDir = resolveDirectory({
+    threadID: input.threadID,
+    task: input.task,
+    requested: requestedDir,
+  })
+  const targetDirectory = rememberedDir ?? routerDirectory
+  const threadID = input.threadID
+  const threads = threadID === undefined ? [] : [threadID]
   const created = yield* sessions
     .create({
-      title: input.title ?? defaultTitle(input.task),
-      ...(resolved === undefined ? {} : { agent: resolved }),
+      // The prefix keeps workers recognizable in session lists; metadata, not
+      // this title, is what identifies the session after a user rename.
+      title: workerTitle({
+        task: input.task,
+        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(threadID === undefined ? {} : { threadID }),
+      }),
+      ...(agentResolved === undefined ? {} : { agent: agentResolved }),
       ...(input.agent === undefined && routerModel !== undefined ? { model: routerModel } : {}),
-      ...(routerDirectory === undefined ? {} : { location: { directory: routerDirectory } }),
-      metadata: { superagent: { role: "worker", threads } },
+      ...(targetDirectory === undefined ? {} : { location: { directory: AbsolutePath.make(targetDirectory) } }),
+      metadata: superagentMetadata("worker", threads),
     })
     .pipe(Effect.mapError((cause) => new Tool.Error({ message: `failed to create worker session: ${String(cause)}` })))
   const record = {
@@ -98,11 +118,16 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
     threads,
     state: "running" as const,
     createdAt: Date.now(),
+    ...(targetDirectory === undefined ? {} : { directory: targetDirectory }),
   }
   store.workers.set(created.id, record)
   yield* saveWorker(ctx, record)
-  if (input.threadID !== undefined) {
-    const threadID = input.threadID
+  if (targetDirectory !== undefined) {
+    yield* rememberDirectory(ctx, { threadID, directory: targetDirectory }).pipe(
+      Effect.catch((cause) => Effect.logWarning("superagent failed to remember directory", { cause })),
+    )
+  }
+  if (threadID !== undefined) {
     const existing = store.threads.get(threadID) ?? []
     if (!existing.includes(created.id)) existing.push(created.id)
     // Affinity lists persist after workers end; cap them so long-lived
@@ -116,13 +141,14 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
   yield* sessions
     .prompt({
       sessionID: created.id,
-      text: workerPrompt(input.threadID, input.title, input.task),
+      text: workerPrompt(threadID, input.title, input.task),
       delivery: "queue",
     })
     .pipe(Effect.mapError((cause) => new Tool.Error({ message: `failed to prompt worker session: ${String(cause)}` })))
+  const where = targetDirectory === undefined ? "gateway default directory" : targetDirectory
   return {
     output: { sessionID: created.id },
-    content: `Worker ${created.id} started in the background and will report back. Do not poll; wait for its report.`,
+    content: `Worker ${created.id} started in ${where} in the background and will report back. Do not poll; wait for its report.`,
   }
 })
 
@@ -130,14 +156,14 @@ export const registerTools = Effect.fn("superagent.registerTools")(function* (ct
   yield* ctx.tool.transform((editor) => {
     editor.add({
       name: "dispatch",
-      description: "Dispatch one independent task to a background worker session. Only the router may call it.",
+      description: specFor("dispatch").description,
       input: DispatchInput,
       output: DispatchOutput,
       execute: (input, context) => runDispatch(ctx, input, context.sessionID),
     })
     editor.add({
       name: "status",
-      description: "Show a compact summary of the router, pending triggers and worker sessions.",
+      description: specFor("status").description,
       input: Schema.Struct({}),
       output: StatusOutput,
       execute: () => {

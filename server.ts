@@ -1,10 +1,12 @@
 import { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
 import { registerContext } from "./src/context.js"
+import { hydrateDirs } from "./src/dirs.js"
 import { registerTools } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
+import { hydrateSessionMeta } from "./src/session-meta.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
@@ -63,6 +65,8 @@ export default Plugin.define({
   effect: Effect.fn(function* (ctx) {
     yield* hydrate(ctx)
     yield* hydratePending(ctx)
+    yield* hydrateDirs(ctx)
+    yield* hydrateSessionMeta(ctx)
     yield* registerTools(ctx)
     yield* registerContext(ctx)
     yield* registerRouterIdle(ctx)

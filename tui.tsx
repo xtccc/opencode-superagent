@@ -1,6 +1,15 @@
 import type { RpcCallOptions, RpcClient } from "@opencode/client/promise"
 import { Plugin } from "@opencode/plugin/tui"
 import { Definition } from "./src/protocol"
+import {
+  describeLimits,
+  describeTool,
+  GROUP_LABELS,
+  RISK_LABELS,
+  ROUTER_LIMITS,
+  ROUTER_TOOL_SPECS,
+  specFor,
+} from "./src/tools"
 
 type SuperagentRpc = RpcClient<typeof Definition>
 
@@ -45,6 +54,13 @@ export default Plugin.define({
           run: () => tasks(context),
         },
         {
+          id: "superagent.tools",
+          title: "Superagent tools",
+          palette: true,
+          slash: { name: "tools", aliases: ["superagent-tools"] },
+          run: () => tools(context),
+        },
+        {
           id: "superagent.demo",
           title: "Superagent demo triggers",
           palette: true,
@@ -86,6 +102,54 @@ async function tasks(context: Plugin.Context) {
     gotoSession(context, sessionID)
   } catch (error) {
     context.ui.toast.show({ title: "Superagent tasks", message: message(error), variant: "error" })
+  }
+}
+
+/** Doc row in the tool browser; every other value is a tool name. */
+const LIMITS_CHOICE = "__limits__"
+
+/**
+ * Browse the Router toolset. The list comes from `src/tools.ts`, so a newly
+ * registered tool appears here without changing this command; each row opens
+ * its parameter table, and the last row documents what the Router cannot do.
+ */
+async function tools(context: Plugin.Context) {
+  try {
+    // Stay in the browser until the user closes the list, so reading several
+    // tools does not mean retyping the command.
+    for (;;) {
+      const selection = await context.ui.dialog.select({
+        title: `Superagent 工具 · ${ROUTER_TOOL_SPECS.length}`,
+        placeholder: "搜索工具：dispatch / abort / status …",
+        options: [
+          ...ROUTER_TOOL_SPECS.map((spec) => {
+            const required = spec.params.flatMap((param) => (param.required ? [param.name] : []))
+            return {
+              title: spec.name,
+              description: `${RISK_LABELS[spec.risk]} · ${spec.summary}`,
+              footer: required.length === 0 ? (spec.params.length === 0 ? "无参数" : "无必填") : required.join(","),
+              category: GROUP_LABELS[spec.group],
+              value: spec.name,
+            }
+          }),
+          {
+            title: "能力边界",
+            description: `Router 不能做什么（${ROUTER_LIMITS.length} 条）`,
+            footer: "不含工具",
+            category: "说明",
+            value: LIMITS_CHOICE,
+          },
+        ],
+      })
+      if (selection === undefined) return
+      if (selection === LIMITS_CHOICE) {
+        await context.ui.dialog.alert({ title: "Superagent 能力边界", message: describeLimits() })
+        continue
+      }
+      await context.ui.dialog.alert({ title: `Superagent ${selection}`, message: describeTool(specFor(selection)) })
+    }
+  } catch (error) {
+    context.ui.toast.show({ title: "Superagent tools", message: message(error), variant: "error" })
   }
 }
 
