@@ -6,6 +6,7 @@ import { hydrateDirs } from "./src/dirs.js"
 import { registerTools } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
+import { hydrateReports } from "./src/report.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
 import { hydrateSessionMeta } from "./src/session-meta.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
@@ -71,6 +72,7 @@ export default Plugin.define({
     yield* hydrateDirs(ctx)
     yield* hydrateSessionMeta(ctx)
     yield* hydrateTickets(ctx)
+    yield* hydrateReports(ctx)
     yield* registerTools(ctx)
     yield* registerTicketTools(ctx)
     yield* registerAbort(ctx)

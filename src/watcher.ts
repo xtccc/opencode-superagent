@@ -1,15 +1,26 @@
 import type { Plugin } from "@opencode/plugin/effect"
-import { Effect, Option, Stream } from "effect"
+import { Effect, Stream } from "effect"
+import { buildReport, reportNotice, reportSummary, saveReport } from "./report.js"
 import { ensureRouter } from "./router.js"
-import { saveWorker, store, toSessionID } from "./state.js"
+import { saveWorker, store, toSessionID, type WorkerRecord } from "./state.js"
 import { closeTicketsForWorker } from "./ticket.js"
 
-const REPORT_LIMIT = 1200
-
-function truncateReport(text: string): string {
-  if (text.length <= REPORT_LIMIT) return text
-  return `${text.slice(0, REPORT_LIMIT)}…`
-}
+/**
+ * Capture one finished report: the complete text goes to `report:<sessionID>`
+ * first, then the worker record keeps a short summary for status lines and the
+ * router injection. The full text is written before anything else so a crash
+ * between the two writes can only lose the summary, never the evidence.
+ */
+export const captureReport = Effect.fn("superagent.captureReport")(function* (
+  ctx: Plugin.Context,
+  worker: WorkerRecord,
+  text: string,
+) {
+  const record = buildReport(worker.sessionID, text)
+  yield* saveReport(ctx, record)
+  worker.lastReport = reportSummary(record)
+  return record
+})
 
 function lastAssistantText(messages: ReadonlyArray<unknown>): string | undefined {
   for (let index = messages.length - 1; index >= 0; index--) {
@@ -70,7 +81,9 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
     .context({ sessionID: toSessionID(sessionID) })
     .pipe(Effect.catch(() => Effect.succeed([])))
   const report = lastAssistantText(messages)
-  if (report !== undefined) worker.lastReport = truncateReport(report)
+  // Full text first: `report:<sessionID>` is the read-back handle. The worker
+  // record only keeps a summary, which is what list/status lines show.
+  const captured = report === undefined ? undefined : yield* captureReport(ctx, worker, report)
   yield* saveWorker(ctx, worker)
   // A worker that reached a terminal state closes its in-progress ticket.
   // Interruptions (`idle`) leave it open: the abort tool closes it explicitly
@@ -103,10 +116,11 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
         : state === "failed"
           ? "failed"
           : "interrupted"
+  const label = worker.title === undefined ? `Worker ${sessionID}` : `Worker ${sessionID} (${worker.title})`
   const text =
-    report !== undefined
-      ? `Worker ${sessionID} finished (${state}):\n${worker.lastReport ?? ""}`
-      : `Worker ${sessionID} finished (${state}) with no report (outcome: ${outcome}).${detail === undefined ? "" : ` Cause: ${detail}.`} Suggest: 可换模型重派.`
+    report !== undefined && captured !== undefined
+      ? [`${label} finished (${state}):`, reportSummary(captured), "---", reportNotice(captured)].join("\n")
+      : `${label} finished (${state}) with no report (outcome: ${outcome}).${detail === undefined ? "" : ` Cause: ${detail}.`} Suggest: 可换模型重派.`
   const routerID = yield* ensureRouter(ctx).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("superagent cannot report without a router", { cause }).pipe(Effect.as(undefined)),

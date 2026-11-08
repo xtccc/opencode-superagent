@@ -1,16 +1,26 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
+import { threadDirs } from "./dirs.js"
+import { requireRouter } from "./guard.js"
+import { loadReport, REPORT_DEFAULT_LIMIT, REPORT_MAX_LIMIT, REPORT_TEXT_LIMIT, sliceReport } from "./report.js"
 import { saveTrigger, store, toSessionID, upsertDirectTrigger, type DirectTriggerInput } from "./state.js"
+import { specFor } from "./tools.js"
 
-const ThreadDetailInput = Schema.Struct({
+export const ThreadDetailInput = Schema.Struct({
   threadID: Schema.String,
   limit: Schema.optionalKey(Schema.Number),
 })
 
-const WorkerDetailInput = Schema.Struct({
+export const WorkerDetailInput = Schema.Struct({
   sessionID: Schema.String,
   messages: Schema.optionalKey(Schema.Number),
+})
+
+export const ReportReadInput = Schema.Struct({
+  sessionID: Schema.String,
+  offset: Schema.optionalKey(Schema.Number),
+  limit: Schema.optionalKey(Schema.Number),
 })
 
 const DetailOutput = Schema.Struct({ text: Schema.String })
@@ -25,17 +35,35 @@ interface WorkerDetailInput {
   readonly messages?: number
 }
 
+interface ReportReadInput {
+  readonly sessionID: string
+  readonly offset?: number
+  readonly limit?: number
+}
+
 /** Single response budget: compact text, truncated with a note when over. */
-const MAX_TEXT = 4000
+const MAX_TEXT = 6000
 const THREAD_ITEM_LIMIT = 300
-const MESSAGE_ITEM_LIMIT = 500
+/** Per-message text in `worker_detail`; overridable through plugin options. */
+const MESSAGE_ITEM_LIMIT = 1500
+const MESSAGE_ITEM_MIN = 200
+const MESSAGE_ITEM_MAX = 4000
 const DEFAULT_THREAD_LIMIT = 20
 const DEFAULT_MESSAGE_COUNT = 5
 const MAX_MESSAGE_COUNT = 10
 
-function truncate(text: string, limit: number): string {
+function truncate(text: string, limit: number, hint?: string): string {
   if (text.length <= limit) return text
-  return `${text.slice(0, limit)}...(${text.length - limit} chars truncated)`
+  const suffix = `(${text.length - limit} chars truncated)${hint === undefined ? "" : ` ${hint}`}`
+  return `${text.slice(0, limit)}...${suffix}`
+}
+
+/** Plugin option `worker_detail_message_limit`, clamped so one message cannot eat the whole budget. */
+function messageItemLimit(ctx: Plugin.Context): number {
+  const raw = ctx.options["worker_detail_message_limit"]
+  const value = typeof raw === "number" ? raw : Number(raw)
+  if (!Number.isFinite(value)) return MESSAGE_ITEM_LIMIT
+  return Math.min(MESSAGE_ITEM_MAX, Math.max(MESSAGE_ITEM_MIN, Math.floor(value)))
 }
 
 function fitBudget(text: string): string {
@@ -43,17 +71,12 @@ function fitBudget(text: string): string {
   return `${text.slice(0, MAX_TEXT)}\n...(truncated to ${MAX_TEXT} chars)`
 }
 
-const requireRouter = Effect.fn("superagent.requireRouter")(function* (caller: string, tool: string) {
-  if (store.routerID === undefined || caller !== store.routerID) {
-    return yield* new Tool.Error({ message: `${tool} is only available to the router session` })
-  }
-})
-
 function workerLine(sessionID: string): string {
   const worker = store.workers.get(sessionID)
   if (worker === undefined) return `- ${sessionID} untracked`
   const threads = worker.threads.length === 0 ? "-" : worker.threads.join(",")
-  return `- ${worker.sessionID} ${worker.title ?? "-"} [${threads}] ${worker.state} ${worker.lastReport ?? "-"}`
+  const dir = worker.directory ?? "-"
+  return `- ${worker.sessionID} ${worker.title ?? "-"} [${threads}] ${worker.state} dir=${dir} ${worker.lastReport ?? "-"}`
 }
 
 const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (input: ThreadDetailInput, caller: string) {
@@ -66,6 +89,7 @@ const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (input: T
   const workers = [...store.workers.values()].filter((worker) => worker.threads.includes(input.threadID))
   const lines = [
     `thread ${input.threadID}: ${triggers.length} trigger(s), ${workers.length} worker(s)`,
+    `directory: ${threadDirs.get(input.threadID) ?? "(no binding, use gateway default and confirm with user)"}`,
     `triggers (showing ${shown.length} of ${triggers.length}):`,
   ]
   for (const record of shown) {
@@ -103,7 +127,7 @@ function assistantTexts(messages: ReadonlyArray<unknown>, count: number): Array<
   return collected.reverse()
 }
 
-const runWorkerDetail = Effect.fn("superagent.workerDetail")(function* (
+export const runWorkerDetail = Effect.fn("superagent.workerDetail")(function* (
   ctx: Plugin.Context,
   input: WorkerDetailInput,
   caller: string,
@@ -114,20 +138,29 @@ const runWorkerDetail = Effect.fn("superagent.workerDetail")(function* (
       ? DEFAULT_MESSAGE_COUNT
       : Math.min(MAX_MESSAGE_COUNT, Math.max(1, Math.floor(input.messages)))
   const worker = store.workers.get(input.sessionID)
+  const stored = yield* loadReport(ctx, input.sessionID)
   const messages = yield* ctx.session
     .context({ sessionID: toSessionID(input.sessionID) })
     .pipe(Effect.catch(() => Effect.succeed([])))
   const texts = assistantTexts(messages, count)
+  const handle =
+    stored === undefined
+      ? "none (无全文记录：Worker 还没结束过，或没有 assistant 文本)"
+      : `${stored.length} chars${stored.truncated ? ` (仅存前 ${stored.text.length})` : ""}，用 report_read 读取全文`
   const lines =
     worker === undefined
       ? [`worker ${input.sessionID}: not tracked by the router`]
       : [
           `worker ${worker.sessionID} ${worker.title ?? "-"} [${worker.threads.join(",") || "-"}] ${worker.state}`,
+          `directory: ${worker.directory ?? "(gateway default)"}`,
           `report: ${worker.lastReport ?? "none"}`,
+          `report full: ${handle}`,
         ]
+  const perMessage = messageItemLimit(ctx)
+  const hint = `用 report_read(sessionID: "${input.sessionID}") 读取全文`
   lines.push(`recent assistant messages (last ${texts.length} of up to ${count}):`)
   texts.forEach((text, index) => {
-    lines.push(`${index + 1}. ${truncate(text, MESSAGE_ITEM_LIMIT)}`)
+    lines.push(`${index + 1}. ${truncate(text, perMessage, hint)}`)
   })
   if (texts.length === 0) lines.push("(no assistant text found)")
   const text = fitBudget(lines.join("\n"))
@@ -135,6 +168,48 @@ const runWorkerDetail = Effect.fn("superagent.workerDetail")(function* (
     output: { text },
     content: text,
   }
+})
+
+/** Page through the full report kept at `report:<sessionID>`. */
+export const runReportRead = Effect.fn("superagent.reportRead")(function* (
+  ctx: Plugin.Context,
+  input: ReportReadInput,
+  caller: string,
+) {
+  yield* requireRouter(caller, "report_read")
+  const record = yield* loadReport(ctx, input.sessionID)
+  if (record === undefined) {
+    return yield* new Tool.Error({
+      message: `no stored report for ${input.sessionID}: 该 Worker 没有全文报告（可能还没结束过，或没有 assistant 文本）；先用 worker_detail 看摘要`,
+    })
+  }
+  const rawOffset = input.offset ?? 0
+  const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0
+  if (offset >= record.text.length) {
+    return yield* new Tool.Error({
+      message: `offset ${offset} 超出已存全文长度 ${record.text.length}${record.truncated ? `（原文 ${record.length} 字，已截断存储）` : ""}`,
+    })
+  }
+  const rawLimit = input.limit ?? REPORT_DEFAULT_LIMIT
+  const limit = Number.isFinite(rawLimit)
+    ? Math.min(REPORT_MAX_LIMIT, Math.max(1, Math.floor(rawLimit)))
+    : REPORT_DEFAULT_LIMIT
+  const slice = sliceReport(record, offset, limit)
+  const lines = [
+    `report ${record.sessionID}: 全文 ${record.length} 字，已存 ${record.text.length} 字${
+      record.truncated ? `（超出 ${REPORT_TEXT_LIMIT} 字上限，已截断保存）` : ""
+    }`,
+    `captured ${new Date(record.capturedAt).toISOString()} · 本次 [${slice.offset}, ${slice.end}) · limit=${limit}`,
+    "",
+    slice.text,
+  ]
+  if (slice.hasMore) {
+    lines.push("", `还有后续：report_read(sessionID: "${record.sessionID}", offset: ${slice.nextOffset})`)
+  } else {
+    lines.push("", "已到末尾。")
+  }
+  const text = lines.join("\n")
+  return { output: { text }, content: text }
 })
 
 const TRIGGER_HEADER = /^\[trigger:(.+?)\] source=(\S+) thread=(\S+) author=(\S+) at=(\S+)(?:\n([\s\S]*))?$/
@@ -172,7 +247,7 @@ export const registerRecall = Effect.fn("superagent.registerRecall")(function* (
   yield* ctx.tool.transform((editor) => {
     editor.add({
       name: "thread_detail",
-      description: "Show a thread's trigger history plus its subscribed workers. Only the router may call it.",
+      description: specFor("thread_detail").description,
       input: ThreadDetailInput,
       output: DetailOutput,
       options: { permission: "status" },
@@ -180,11 +255,19 @@ export const registerRecall = Effect.fn("superagent.registerRecall")(function* (
     })
     editor.add({
       name: "worker_detail",
-      description: "Show a worker's state plus its recent assistant messages. Only the router may call it.",
+      description: specFor("worker_detail").description,
       input: WorkerDetailInput,
       output: DetailOutput,
       options: { permission: "status" },
       execute: (input, context) => runWorkerDetail(ctx, input, context.sessionID),
+    })
+    editor.add({
+      name: "report_read",
+      description: specFor("report_read").description,
+      input: ReportReadInput,
+      output: DetailOutput,
+      options: { permission: "status" },
+      execute: (input, context) => runReportRead(ctx, input, context.sessionID),
     })
   })
   yield* ctx.session.hook("prompt", (event) =>
