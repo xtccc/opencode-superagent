@@ -1,10 +1,11 @@
-import { Plugin } from "@opencode/plugin/effect"
-import { Effect } from "effect"
+import { Plugin, Rpc } from "@opencode/plugin/effect"
+import type { RpcHandlers } from "@opencode/plugin/effect/rpc"
+import { Effect, Schema } from "effect"
 import { registerAbort, runAbort } from "./src/abort.js"
 import { registerAgents } from "./src/agents.js"
 import { registerContext } from "./src/context.js"
 import { hydrateDirs } from "./src/dirs.js"
-import { registerTools, runDispatch } from "./src/dispatch.js"
+import { registerTools } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { hydrateReports } from "./src/report.js"
@@ -57,13 +58,55 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
   return { route: "router" as const, sessionID: routerID }
 })
 
-const runStop = Effect.fn("superagent.runStop")(function* (ctx: Plugin.Context, sessionID: string) {
-  if (!store.workers.has(sessionID)) return { interrupted: false }
-  const result = yield* ctx.session
-    .interrupt({ sessionID: toSessionID(sessionID) })
-    .pipe(Effect.catch(() => Effect.succeed({ interrupted: false })))
-  return { interrupted: result.interrupted }
-})
+/**
+ * The RPC surface this server registers. `stop` gains its rejection error here
+ * rather than in the shared TUI contract: only the server refuses router-only
+ * calls, and the TUI never calls `stop`.
+ */
+export const ServerDefinition = {
+  ...Definition,
+  methods: {
+    ...Definition.methods,
+    stop: {
+      ...Definition.methods.stop,
+      errors: { "stop.rejected": Schema.toStandardSchemaV1(Schema.Struct({})) },
+    },
+  },
+} as const satisfies Rpc.Definition
+
+type ServerRpcHandlers = RpcHandlers<typeof ServerDefinition>
+
+/**
+ * Router-only RPC methods are rejected unconditionally.
+ *
+ * The RPC transport does not expose a caller identity: `RpcCallContext` only
+ * carries `error`. The old handler therefore passed `store.routerID` as
+ * `runDispatch`'s caller, which let every RPC client act as the router. Input
+ * fields such as `caller` / `routerID` are just as forgeable (and the router
+ * id is public in `status`), so they are never used as proof of identity.
+ * Until the host exposes the calling session on the RPC context, the safe
+ * behavior is to keep router-only effects off the RPC surface. The real
+ * router still works through its tools, whose `context.sessionID` is
+ * authoritative and is checked by `runDispatch` / `runAbort`.
+ */
+export const rejectedRouterRpc: Pick<ServerRpcHandlers, "dispatch" | "stop"> = {
+  dispatch: (_input, context) =>
+    Effect.fail(
+      context.error(
+        "dispatch.rejected",
+        "dispatch is only available to the router session; RPC callers cannot prove that identity — use the router's dispatch tool",
+        {},
+      ),
+    ),
+  stop: (_input, context) =>
+    Effect.fail(
+      context.error(
+        "stop.rejected",
+        "stop is only available to the router session; RPC callers cannot prove that identity — use abort_session from the router",
+        {},
+      ),
+    ),
+}
 
 export default Plugin.define({
   id: "opencode.superagent",
@@ -86,7 +129,7 @@ export default Plugin.define({
     yield* registerWatcher(ctx)
     yield* registerWatchdog(ctx)
     yield* ctx.rpc
-      .register(Definition, {
+      .register(ServerDefinition, {
         router: () =>
           ensureRouter(ctx).pipe(
             Effect.map((sessionID) => ({ sessionID })),
@@ -109,39 +152,34 @@ export default Plugin.define({
               state: worker.state,
             })),
           })),
-        tickets: (input) =>
-          Effect.sync(() =>
+        tickets: (input, context) => {
+          // The protocol literal already rejects unknown states with
+          // `rpc.invalid_input`; keep an explicit RPC error as a second line of
+          // defence so a bypassed/older client can never turn an unknown status
+          // into an unfiltered list.
+          if (input.status !== undefined && !TICKET_STATES.includes(input.status as TicketState)) {
+            return Effect.fail(
+              context.error("tickets.invalid_status", `invalid ticket status: ${String(input.status)}`, {
+                status: String(input.status),
+              }),
+            )
+          }
+          return Effect.sync(() =>
             renderTicketsText({
               ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
-              ...(input.status === undefined || !TICKET_STATES.includes(input.status as TicketState)
-                ? {}
-                : { status: input.status as TicketState }),
+              ...(input.status === undefined ? {} : { status: input.status }),
               ...(input.limit === undefined ? {} : { limit: input.limit }),
             }),
-          ).pipe(Effect.map((text) => ({ text }))),
+          ).pipe(Effect.map((text) => ({ text })))
+        },
         ticket: (input) => Effect.sync(() => ({ text: renderTicketText(input.ticketID) })),
-        // RPC dispatches go through the same implementation as the tool, so
-        // the ticket gate (required ticketID, workable state, thread match, no
-        // running worker) cannot be skipped by calling the RPC directly.
-        dispatch: (input, context) =>
-          runDispatch(ctx, input, store.routerID ?? "").pipe(
-            Effect.map((result) => result.output),
-            Effect.catchTag("Tool.Error", (error) =>
-              Effect.fail(context.error("dispatch.rejected", error.message, {})),
-            ),
-          ),
+        ...rejectedRouterRpc,
         trigger: (input) =>
           runTrigger(ctx, input).pipe(
             Effect.catch((cause) =>
               Effect.logWarning("superagent trigger handler failed", { cause }).pipe(
                 Effect.as({ route: "dropped" as const }),
               ),
-            ),
-          ),
-        stop: (input) =>
-          runStop(ctx, input.sessionID).pipe(
-            Effect.catch((cause) =>
-              Effect.logWarning("superagent stop handler failed", { cause }).pipe(Effect.as({ interrupted: false })),
             ),
           ),
         abort: (input, context) =>
