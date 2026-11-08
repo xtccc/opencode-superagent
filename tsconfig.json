@@ -6,5 +6,5 @@
     "noEmit": true,
     "noUncheckedIndexedAccess": false
   },
-  "include": ["server.ts", "tui.tsx", "src"]
+  "include": ["server.ts", "tui.tsx", "src", "test"]
 }

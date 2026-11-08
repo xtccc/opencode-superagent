@@ -61,6 +61,20 @@ export default Plugin.define({
           run: () => tools(context),
         },
         {
+          id: "superagent.tickets",
+          title: "Superagent tickets",
+          palette: true,
+          slash: { name: "tickets" },
+          run: () => tickets(context),
+        },
+        {
+          id: "superagent.ticket",
+          title: "Superagent ticket detail",
+          palette: true,
+          slash: { name: "ticket", arguments: true },
+          run: (input) => ticket(context, input),
+        },
+        {
           id: "superagent.demo",
           title: "Superagent demo triggers",
           palette: true,
@@ -150,6 +164,31 @@ async function tools(context: Plugin.Context) {
     }
   } catch (error) {
     context.ui.toast.show({ title: "Superagent tools", message: message(error), variant: "error" })
+  }
+}
+
+/** `/tickets`: one compact list grouped by state, safe on a narrow terminal. */
+async function tickets(context: Plugin.Context) {
+  try {
+    const rpc = context.client.rpc(Definition)
+    const { text } = await rpc.tickets({}, options(context))
+    await context.ui.dialog.alert({ title: "Superagent 工单", message: text })
+  } catch (error) {
+    context.ui.toast.show({ title: "Superagent tickets", message: message(error), variant: "error" })
+  }
+}
+
+/** `/ticket <id>`: full detail for one ticket; prompts for the id when omitted. */
+async function ticket(context: Plugin.Context, input?: string) {
+  try {
+    const ticketID =
+      input?.trim() || (await context.ui.dialog.prompt({ title: "/ticket", placeholder: "tk_…" }))?.trim()
+    if (ticketID === undefined || ticketID === "") return
+    const rpc = context.client.rpc(Definition)
+    const { text } = await rpc.ticket({ ticketID }, options(context))
+    await context.ui.dialog.alert({ title: `Superagent ${ticketID}`, message: text })
+  } catch (error) {
+    context.ui.toast.show({ title: "Superagent ticket", message: message(error), variant: "error" })
   }
 }
 

@@ -4,6 +4,7 @@ import { threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
 import { ROUTER_KEY, store, toSessionID, type PendingTrigger, type TriggerInput } from "./state.js"
+import { noteRouterTrigger } from "./ticket.js"
 
 const ROUTER_AGENT = "superagent-router"
 const MAX_FLUSH = 20
@@ -200,6 +201,10 @@ export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx:
     return
   }
   store.pending.splice(0, batch.length)
+  // Remember what the Router was just told: `ticket_create` copies this
+  // trigger into the ticket's authorization (id + quote).
+  const newest = batch[batch.length - 1]
+  if (newest !== undefined) noteRouterTrigger(newest.trigger)
   for (const item of batch) {
     yield* ctx.storage.remove(keyOf(item)).pipe(Effect.catch(() => Effect.void))
   }

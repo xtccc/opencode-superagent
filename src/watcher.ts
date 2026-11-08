@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Option, Stream } from "effect"
 import { ensureRouter } from "./router.js"
 import { saveWorker, store, toSessionID } from "./state.js"
+import { closeTicketsForWorker } from "./ticket.js"
 
 const REPORT_LIMIT = 1200
 
@@ -68,6 +69,20 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   const report = lastAssistantText(messages)
   if (report !== undefined) worker.lastReport = truncateReport(report)
   yield* saveWorker(ctx, worker)
+  // A worker that reached a terminal state closes its in-progress ticket.
+  // Interruptions (`idle`) leave it open: the abort tool closes it explicitly
+  // and a plain interrupt may still be resumed with a follow-up.
+  if (state === "done" || state === "failed") {
+    yield* closeTicketsForWorker(ctx, {
+      sessionID,
+      outcome: state,
+      summary: worker.lastReport ?? report ?? detail ?? `${state} (worker ${sessionID})`,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to close ticket for ended worker", { sessionID, cause }),
+      ),
+    )
+  }
   // Keep the thread subscriptions after the worker ends: follow-ups on the
   // same thread resume this worker (prompting a finished session starts a new
   // execution in it) instead of spawning a fresh session per message. A

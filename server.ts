@@ -8,6 +8,8 @@ import { Definition } from "./src/protocol.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
 import { hydrateSessionMeta } from "./src/session-meta.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
+import { hydrateTickets, TICKET_STATES, type TicketState } from "./src/ticket.js"
+import { registerTicketTools, renderTicketText, renderTicketsText } from "./src/ticket-tools.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
 
@@ -67,7 +69,9 @@ export default Plugin.define({
     yield* hydratePending(ctx)
     yield* hydrateDirs(ctx)
     yield* hydrateSessionMeta(ctx)
+    yield* hydrateTickets(ctx)
     yield* registerTools(ctx)
+    yield* registerTicketTools(ctx)
     yield* registerContext(ctx)
     yield* registerRouterIdle(ctx)
     yield* registerWatcher(ctx)
@@ -96,6 +100,17 @@ export default Plugin.define({
               state: worker.state,
             })),
           })),
+        tickets: (input) =>
+          Effect.sync(() =>
+            renderTicketsText({
+              ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+              ...(input.status === undefined || !TICKET_STATES.includes(input.status as TicketState)
+                ? {}
+                : { status: input.status as TicketState }),
+              ...(input.limit === undefined ? {} : { limit: input.limit }),
+            }),
+          ).pipe(Effect.map((text) => ({ text }))),
+        ticket: (input) => Effect.sync(() => ({ text: renderTicketText(input.ticketID) })),
         trigger: (input) =>
           runTrigger(ctx, input).pipe(
             Effect.catch((cause) =>

@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { DateTime, Effect, Option, Stream } from "effect"
 import { ensureRouter } from "./router.js"
 import { saveWorker, store, toSessionID } from "./state.js"
+import { closeTicketsForWorker } from "./ticket.js"
 
 /** Default interval between stall checks. Overridable with the `watchdogIntervalMs` plugin option. */
 export const WATCHDOG_INTERVAL_MS = 60_000
@@ -59,6 +60,13 @@ const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
   worker.state = "failed"
   worker.lastReport = `${STALLED_PREFIX} ${minutes}m${worker.lastReport === undefined ? "" : ` | ${worker.lastReport}`}`
   yield* saveWorker(ctx, worker)
+  yield* closeTicketsForWorker(ctx, {
+    sessionID,
+    outcome: "failed",
+    summary: `watchdog: stalled ${minutes}m`,
+  }).pipe(
+    Effect.catch((cause) => Effect.logWarning("superagent watchdog failed to close ticket", { sessionID, cause })),
+  )
 })
 
 const checkAll = Effect.fn("superagent.watchdogCheckAll")(function* (ctx: Plugin.Context, stallTimeoutMs: number) {

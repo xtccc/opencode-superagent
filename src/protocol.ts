@@ -34,6 +34,20 @@ export const Definition = Rpc.define({
         }),
       ),
     },
+    tickets: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          threadID: Schema.optionalKey(Schema.String),
+          status: Schema.optionalKey(Schema.String),
+          limit: Schema.optionalKey(Schema.Number),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),
+    },
+    ticket: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ ticketID: Schema.String })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),
+    },
     trigger: {
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
