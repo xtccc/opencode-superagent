@@ -90,6 +90,23 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     ],
   },
   {
+    name: "sleep",
+    group: "control",
+    description:
+      'Pause the router for a bounded number of seconds (default 30, range 1..600) with a real timer, never a busy loop, and return "slept Ns". In Goal mode, call it after dispatch to pause and give the Worker execution time before you check in again. Only the router may call it; tracked worker sessions neither see nor may call it.',
+    summary: "暂停指定秒数（默认 30，范围 1..600），给 Worker 预留执行时间。",
+    params: [{ name: "seconds", required: false, type: "number", note: "默认 30，1..600 的整数" }],
+    risk: "read",
+    permission: "status",
+    confirmation: "只读等待，自动执行（permission: status）；非法秒数直接报错。",
+    usage: [
+      "Goal 模式：dispatch 后先 sleep，再回来汇总，不要空转轮询 Worker。",
+      "seconds 缺省 30；必须是 1..600 的整数，0/负数/超界/非数字都报错。",
+      "真实定时器（Effect.sleep）：等待期间 Router 与其他任务照常推进。",
+      "仅 Router 可见：Worker 会话的工具列表里没有它，直调也会被拒绝。",
+    ],
+  },
+  {
     name: "ticket_create",
     group: "dispatch",
     description:

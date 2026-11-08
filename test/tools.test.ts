@@ -5,6 +5,7 @@ import { Effect } from "effect"
 import { AbortInput } from "../src/abort.js"
 import { DispatchInput } from "../src/dispatch.js"
 import { ReportReadInput, ThreadDetailInput, WorkerDetailInput } from "../src/recall.js"
+import { SleepInput } from "../src/sleep.js"
 import {
   registerTicketTools,
   TicketCloseInput,
@@ -39,6 +40,7 @@ const schemas = {
   worker_detail: WorkerDetailInput,
   report_read: ReportReadInput,
   abort_session: AbortInput,
+  sleep: SleepInput,
 } as Record<string, Schema.Schema<unknown>>
 
 interface Field {
