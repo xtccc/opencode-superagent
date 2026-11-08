@@ -3,7 +3,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Effect, type Schema } from "effect"
 import { createHash } from "node:crypto"
 import { normalizeDirectory } from "./dirs.js"
-import { store, type TriggerInput } from "./state.js"
+import { store, type TriggerInput, type WorkerState } from "./state.js"
 import { displayWidth, wrapText } from "./tools.js"
 
 /**
@@ -287,6 +287,17 @@ export function activeTicketSummary(threadID: string | undefined, limit = 3): st
 /** Active ticket for a worker session, used when a worker ends. */
 export function activeTicketForWorker(sessionID: string): Ticket | undefined {
   return [...tickets.values()].find((ticket) => ticket.workerSessionID === sessionID && ticket.state === "in_progress")
+}
+
+/**
+ * Worker states after which the ticket may be dispatched again. `idle` is not
+ * here on purpose: an idle session can still be resumed, so a re-dispatch
+ * would race a live worker.
+ */
+export const TERMINAL_WORKER_STATES: ReadonlyArray<WorkerState> = ["done", "failed", "aborted"]
+
+export function isWorkerTerminal(state: WorkerState): boolean {
+  return TERMINAL_WORKER_STATES.includes(state)
 }
 
 // ── validation ────────────────────────────────────────────────────────────────
@@ -734,7 +745,7 @@ export function listTickets(input: ListTicketsInput = {}): Array<Ticket> {
  * Gate every dispatch must pass: a dispatch always names a ticket, and that
  * ticket must be workable right now. The rules are enforced here (not in the
  * prompt) so a Router cannot dispatch without a ticket, onto a closed ticket,
- * across threads, or onto a ticket that already has a running worker.
+ * across threads, or onto a ticket that already has a live (non-terminal) worker.
  */
 export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket")(function* (
   ticketID: string | undefined,
@@ -764,11 +775,16 @@ export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket
     })
   }
   // One ticket never runs two workers at once: the previous worker must be
-  // terminal (aborted, failed, done) before anything is dispatched again.
+  // terminal (done, failed, aborted) before anything is dispatched again.
+  // `idle` is NOT terminal — the session may still be resumed — so it blocks
+  // a re-dispatch exactly like `running`. A worker record that is gone blocks
+  // nothing: there is no live worker left to wait for.
   const workerID = ticket.workerSessionID
-  if (workerID !== undefined && store.workers.get(workerID)?.state === "running") {
+  const worker = workerID === undefined ? undefined : store.workers.get(workerID)
+  if (workerID !== undefined && worker !== undefined && !isWorkerTerminal(worker.state)) {
+    const article = worker.state === "idle" ? "an" : "a"
     return yield* new Tool.Error({
-      message: `ticket ${ticket.id} already has a running worker ${workerID}; wait for it or abort_session it first, then ticket_create a new ticket for the re-dispatch`,
+      message: `ticket ${ticket.id} already has ${article} ${worker.state} worker ${workerID}; wait for it to finish, abort_session it, or ticket_create a new ticket for the re-dispatch`,
     })
   }
   return ticket
