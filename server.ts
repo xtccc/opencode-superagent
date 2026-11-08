@@ -11,6 +11,7 @@ import { Definition } from "./src/protocol.js"
 import { hydrateReports } from "./src/report.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
 import { hydrateSessionMeta } from "./src/session-meta.js"
+import { registerSleep } from "./src/sleep.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { hydrateTickets, TICKET_STATES, type TicketState } from "./src/ticket.js"
 import { registerTicketTools, renderTicketText, renderTicketsText } from "./src/ticket-tools.js"
@@ -122,6 +123,7 @@ export default Plugin.define({
     yield* hydrateSessionMeta(ctx)
     yield* hydrateReports(ctx)
     yield* registerTools(ctx)
+    yield* registerSleep(ctx)
     yield* registerTicketTools(ctx)
     yield* registerAbort(ctx)
     yield* registerContext(ctx)

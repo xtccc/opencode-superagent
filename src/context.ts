@@ -66,9 +66,24 @@ export function buildRecallInjection(threadID: string | undefined): string {
 }
 
 /**
- * Router-only context hook: strip every tool outside the router set
- * (derived from the tool catalog in `src/tools.ts`),
- * then append the router prompt plus a short live status line.
+ * Narrow one request's toolset by session role. The Router keeps only the
+ * catalog tools; a tracked Worker loses every router-only tool (dispatch,
+ * sleep, tickets, recall, abort_session), so those tools are not listed to
+ * the worker model at all. User sessions are left untouched.
+ */
+export function filterSessionTools(sessionID: string, tools: Record<string, unknown>): void {
+  const router = store.routerID !== undefined && sessionID === store.routerID
+  const worker = store.workers.has(sessionID)
+  if (!router && !worker) return
+  for (const name of Object.keys(tools)) {
+    if (router ? !ROUTER_TOOLS.has(name) : ROUTER_TOOLS.has(name)) delete tools[name]
+  }
+}
+
+/**
+ * Context hook: strip each session's toolset to what that role may see
+ * (Router: catalog only; Worker: catalog tools removed), then append the
+ * router prompt plus a short live status line for the Router.
  *
  * The status line carries the ticket counters and the current thread's
  * in-progress ticket ids/titles, so a follow-up can be linked back to an
@@ -77,10 +92,10 @@ export function buildRecallInjection(threadID: string | undefined): string {
 export const registerContext = Effect.fn("superagent.registerContext")(function* (ctx: Plugin.Context) {
   yield* ctx.session.hook("context", (event) =>
     Effect.sync(() => {
-      if (store.routerID === undefined || event.sessionID !== store.routerID) return
-      for (const name of Object.keys(event.tools)) {
-        if (!ROUTER_TOOLS.has(name)) delete event.tools[name]
-      }
+      const router = store.routerID !== undefined && event.sessionID === store.routerID
+      if (!router && !store.workers.has(event.sessionID)) return
+      filterSessionTools(event.sessionID, event.tools)
+      if (!router) return
       const stats = ticketStats()
       const threadID = currentTrigger()?.threadID
       const active = activeTicketSummary(threadID)
