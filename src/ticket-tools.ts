@@ -13,7 +13,7 @@ import {
   updateTicket,
   type TicketState,
 } from "./ticket.js"
-import { specFor } from "./tools.js"
+import { specFor, toolPermission } from "./tools.js"
 
 /**
  * Router-only ticket tools. They are a thin adapter: validation, the state
@@ -188,6 +188,7 @@ export const registerTicketTools = Effect.fn("superagent.registerTicketTools")(f
       description: specFor("ticket_create").description,
       input: TicketCreateInput,
       output: TicketRefOutput,
+      options: { permission: toolPermission(specFor("ticket_create")) },
       execute: (input, context) => runTicketCreate(ctx, input, context.sessionID),
     })
     editor.add({
@@ -195,7 +196,7 @@ export const registerTicketTools = Effect.fn("superagent.registerTicketTools")(f
       description: specFor("ticket_list").description,
       input: TicketListInput,
       output: TicketTextOutput,
-      options: { permission: "status" },
+      options: { permission: toolPermission(specFor("ticket_list")) },
       execute: (input, context) => runTicketList(input, context.sessionID),
     })
     editor.add({
@@ -203,6 +204,7 @@ export const registerTicketTools = Effect.fn("superagent.registerTicketTools")(f
       description: specFor("ticket_update").description,
       input: TicketUpdateInput,
       output: TicketRefOutput,
+      options: { permission: toolPermission(specFor("ticket_update")) },
       execute: (input, context) => runTicketUpdate(ctx, input, context.sessionID),
     })
     editor.add({
@@ -210,6 +212,7 @@ export const registerTicketTools = Effect.fn("superagent.registerTicketTools")(f
       description: specFor("ticket_close").description,
       input: TicketCloseInput,
       output: TicketRefOutput,
+      options: { permission: toolPermission(specFor("ticket_close")) },
       execute: (input, context) => runTicketClose(ctx, input, context.sessionID),
     })
   })

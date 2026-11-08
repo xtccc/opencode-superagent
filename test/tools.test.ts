@@ -1,9 +1,17 @@
+import type { Plugin } from "@opencode/plugin/effect"
 import type { Schema } from "effect"
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 import { AbortInput } from "../src/abort.js"
 import { DispatchInput } from "../src/dispatch.js"
 import { ReportReadInput, ThreadDetailInput, WorkerDetailInput } from "../src/recall.js"
-import { TicketCloseInput, TicketCreateInput, TicketListInput, TicketUpdateInput } from "../src/ticket-tools.js"
+import {
+  registerTicketTools,
+  TicketCloseInput,
+  TicketCreateInput,
+  TicketListInput,
+  TicketUpdateInput,
+} from "../src/ticket-tools.js"
 import {
   describeLimits,
   describeTool,
@@ -11,9 +19,12 @@ import {
   GROUP_LABELS,
   RISK_LABELS,
   ROUTER_LIMITS,
+  ROUTER_PERMISSION_ACTIONS,
+  ROUTER_PERMISSIONS,
   ROUTER_TOOL_SPECS,
   ROUTER_TOOLS,
   specFor,
+  toolPermission,
   type ToolParam,
 } from "../src/tools.js"
 
@@ -108,5 +119,45 @@ describe("superagent tool catalog", () => {
     expect(ROUTER_LIMITS.length).toBeGreaterThan(0)
     expect(displayWidth("abort")).toBe(5)
     expect(displayWidth("能力边界")).toBe(8)
+  })
+
+  test("every catalog tool declares an action the router session allows", () => {
+    expect(ROUTER_PERMISSIONS[0]).toEqual({ action: "*", resource: "*", effect: "deny" })
+    for (const spec of ROUTER_TOOL_SPECS) {
+      const action = toolPermission(spec)
+      expect({ tool: spec.name, allowed: ROUTER_PERMISSION_ACTIONS.includes(action) }).toEqual({
+        tool: spec.name,
+        allowed: true,
+      })
+      // Last matching rule decides, exactly like Tool.snapshot's filter.
+      const deciding = ROUTER_PERMISSIONS.filter((rule) => rule.action === "*" || rule.action === action).at(-1)
+      expect({ tool: spec.name, effect: deciding?.effect }).toEqual({ tool: spec.name, effect: "allow" })
+    }
+    // Actions no tool declares stay denied, so file and shell tools never appear.
+    expect(ROUTER_PERMISSIONS.some((rule) => rule.action === "edit" || rule.action === "read")).toBe(false)
+  })
+
+  test("the ticket tools register the catalog permission action", async () => {
+    const registered: Array<{ name: string; options?: { permission?: string } }> = []
+    const editor = { add: (tool: (typeof registered)[number]) => registered.push(tool) }
+    const ctx = {
+      tool: { transform: (fn: (target: typeof editor) => void) => Effect.sync(() => fn(editor)) },
+    } as unknown as Plugin.Context
+    await Effect.runPromise(Effect.scoped(registerTicketTools(ctx)))
+    expect(registered.map((tool) => tool.name)).toEqual([
+      "ticket_create",
+      "ticket_list",
+      "ticket_update",
+      "ticket_close",
+    ])
+    // Without a permission option the tool's action is its own name, which the
+    // router denies: ticket_create/ticket_update/ticket_close disappear from
+    // the model's toolset while ticket_list stays.
+    for (const tool of registered) {
+      expect({ tool: tool.name, permission: tool.options?.permission }).toEqual({
+        tool: tool.name,
+        permission: "status",
+      })
+    }
   })
 })

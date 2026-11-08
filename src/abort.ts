@@ -5,7 +5,7 @@ import { DateTime, Effect, Option, Schema } from "effect"
 import { requireRouter } from "./guard.js"
 import { encodeThread, saveWorker, store, threadKey, toSessionID } from "./state.js"
 import { closeTicketsForWorker } from "./ticket.js"
-import { specFor } from "./tools.js"
+import { specFor, toolPermission } from "./tools.js"
 
 /** How long a terminating call waits for an interrupted worker to settle before reporting a timeout. */
 export const ABORT_TIMEOUT_MS = 10_000
@@ -212,7 +212,7 @@ export const registerAbort = Effect.fn("superagent.registerAbort")(function* (ct
       description: specFor("abort_session").description,
       input: AbortInput,
       output: AbortOutput,
-      options: { permission: "status" },
+      options: { permission: toolPermission(specFor("abort_session")) },
       execute: (input, context) => runAbort(ctx, input, context.sessionID),
     })
   })

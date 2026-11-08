@@ -1,11 +1,14 @@
 /**
  * The Router tool catalog: one entry per tool the Router session may call.
  *
- * It is the single source of truth for three consumers:
- * - `server.ts` registrations take their description from here (`specFor`),
- *   which throws when a tool has no entry, so a registration cannot ship
- *   undocumented;
+ * It is the single source of truth for four consumers:
+ * - `server.ts` registrations take their description and permission action
+ *   from here (`specFor`), which throws when a tool has no entry, so a
+ *   registration cannot ship undocumented or invisible;
  * - `context.ts` filters the Router's toolset by `ROUTER_TOOLS`, derived below;
+ * - the Router session's permissions come from `ROUTER_PERMISSIONS`, also
+ *   derived below, because `Tool.snapshot` hides a tool whose permission
+ *   action is wholly denied;
  * - the TUI `/tools` command renders the same entries, so a new tool shows up
  *   without touching the command.
  *
@@ -35,6 +38,14 @@ export interface ToolSpec {
   readonly summary: string
   readonly params: ReadonlyArray<ToolParam>
   readonly risk: ToolRisk
+  /**
+   * Permission action registered with the tool, which decides catalog
+   * visibility. Defaults to the tool name. `Tool.snapshot` drops a tool whose
+   * action is wholly denied, so the Router session must allow every action the
+   * catalog declares (`ROUTER_PERMISSIONS`), or the tool simply never reaches
+   * the model.
+   */
+  readonly permission?: string
   /** How a call is gated: automatic, or through a permission action. */
   readonly confirmation: string
   /** Extra usage notes for the detail view. */
@@ -93,6 +104,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "dedupeKey", required: false, type: "string", note: "默认按来源+thread+目标生成" },
     ],
     risk: "write",
+    permission: "status",
     confirmation: "自动执行：仅建单，不派活；authorization 自动取当前触发器的 id 与原话摘要。",
     usage: [
       "acceptance 为空直接拒绝建单：想不出验收标准就先问用户。",
@@ -118,6 +130,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "limit", required: false, type: "number", note: "默认 20，上限 100" },
     ],
     risk: "read",
+    permission: "status",
     confirmation: "只读，自动执行（permission: status）。",
     usage: ["按 updatedAt 倒序；需要某张单的完整验收标准用 /ticket <id>。"],
   },
@@ -139,6 +152,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "note", required: false, type: "string", note: "备注，写入 history" },
     ],
     risk: "write",
+    permission: "status",
     confirmation: "自动执行：状态迁移按状态机校验。",
     usage: ["结束任务优先用 ticket_close（带 outcome 与 summary），不要手动跳到 done。"],
   },
@@ -154,6 +168,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "summary", required: true, type: "string", note: "结论，≤500 字" },
     ],
     risk: "write",
+    permission: "status",
     confirmation: "自动执行：已结单的工单保持原状态，改结论需新建工单。",
     usage: ["Worker 结束会自动结单；只有在 Router 主动放弃/改判时才手动调用。"],
   },
@@ -190,6 +205,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "messages", required: false, type: "number", note: "默认 5，上限 10" },
     ],
     risk: "read",
+    permission: "status",
     confirmation: "只读，自动执行（permission: status）。",
     usage: ["用于验收 Worker 的中间结论，不必等它结束。", "单条消息默认截断 1500 字；要看完整报告用 report_read。"],
   },
@@ -205,6 +221,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "limit", required: false, type: "number", note: "默认 4000，上限 20000" },
     ],
     risk: "read",
+    permission: "status",
     confirmation: "只读，自动执行（permission: status）。",
     usage: [
       "只存 Worker 结束时捕获的全文；没有全文记录会直接报错，此时用 worker_detail。",
@@ -224,6 +241,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       { name: "stale", required: false, type: "boolean", values: ["true"], note: "只清理已结束" },
     ],
     risk: "terminate",
+    permission: "status",
     confirmation: "自动执行（permission: status）：只接受插件跟踪的 Worker，Router 自身与用户会话一律拒绝。",
     usage: [
       "sessionID 与 all/stale 二选一；stale 不会中断运行中的 Worker。",
@@ -243,6 +261,29 @@ export function specFor(name: string): ToolSpec {
   if (spec === undefined) throw new Error(`superagent tool ${name} has no entry in src/tools.ts`)
   return spec
 }
+
+/** The permission action a tool registers with; absent means its own name. */
+export const toolPermission = (spec: ToolSpec): string => spec.permission ?? spec.name
+
+/** Visibility actions the catalog needs; sorted so the ruleset stays stable across restarts. */
+export const ROUTER_PERMISSION_ACTIONS: ReadonlyArray<string> = [
+  ...new Set(ROUTER_TOOL_SPECS.map(toolPermission)),
+].sort()
+
+/**
+ * The Router session's permission ruleset. Deny everything first, then allow
+ * exactly the actions its catalog tools register with: `Tool.snapshot` drops a
+ * tool whose action is wholly denied, so a missing allow here hides the tool
+ * from the model even though it is registered and documented.
+ */
+export const ROUTER_PERMISSIONS: ReadonlyArray<{
+  readonly action: string
+  readonly resource: string
+  readonly effect: "allow" | "deny"
+}> = [
+  { action: "*", resource: "*", effect: "deny" },
+  ...ROUTER_PERMISSION_ACTIONS.map((action) => ({ action, resource: "*", effect: "allow" as const })),
+]
 
 /** What the Router cannot do, independent of which tools it currently has. */
 export const ROUTER_LIMITS: ReadonlyArray<string> = [

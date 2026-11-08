@@ -5,6 +5,7 @@ import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
 import { ROUTER_KEY, store, toSessionID, type PendingTrigger, type TriggerInput } from "./state.js"
 import { noteRouterTrigger } from "./ticket.js"
+import { ROUTER_PERMISSIONS } from "./tools.js"
 
 const ROUTER_AGENT = "superagent-router"
 const MAX_FLUSH = 20
@@ -160,11 +161,10 @@ export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx:
     title: ROUTER_TITLE,
     ...(routerAgent === undefined ? {} : { agent: routerAgent }),
     metadata: superagentMetadata("router"),
-    permissions: [
-      { action: "*", resource: "*", effect: "deny" },
-      { action: "dispatch", resource: "*", effect: "allow" },
-      { action: "status", resource: "*", effect: "allow" },
-    ],
+    // Derived from the tool catalog: a tool whose permission action is not
+    // allowed here is dropped from the Router's toolset by `Tool.snapshot`,
+    // so adding a tool without its action would hide it silently.
+    permissions: ROUTER_PERMISSIONS,
   })
   store.routerID = created.id
   store.routerBusy = false
