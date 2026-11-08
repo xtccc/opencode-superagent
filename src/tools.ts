@@ -191,11 +191,16 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     summary: "查看某个 thread 的触发器历史（谁在何时说了什么）与订阅它的 Worker。",
     params: [
       { name: "threadID", required: true, type: "string", note: "thread 标识" },
-      { name: "limit", required: false, type: "number", note: "默认 20 条" },
+      { name: "limit", required: false, type: "number", note: "默认 20 条，上限 200" },
+      { name: "offset", required: false, type: "number", note: "从最新往前跳过 N 条，默认 0" },
     ],
     risk: "read",
+    permission: "status",
     confirmation: "只读，自动执行（permission: status）。",
-    usage: ["详细信息不在 system 里：需要原文时用它，不要猜。"],
+    usage: [
+      "详细信息不在 system 里：需要原文时用它，不要猜。",
+      "内存只留最近 200 条；offset/limit 超出时按需从 KV 回源，每次最多补 20 条。",
+    ],
   },
   {
     name: "worker_detail",

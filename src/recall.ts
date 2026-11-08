@@ -4,12 +4,22 @@ import { Effect, Schema } from "effect"
 import { threadDirs } from "./dirs.js"
 import { requireRouter } from "./guard.js"
 import { loadReport, REPORT_DEFAULT_LIMIT, REPORT_MAX_LIMIT, REPORT_TEXT_LIMIT, sliceReport } from "./report.js"
-import { saveTrigger, store, toSessionID, upsertDirectTrigger, type DirectTriggerInput } from "./state.js"
-import { specFor } from "./tools.js"
+import {
+  decodeTrigger,
+  saveTrigger,
+  store,
+  toSessionID,
+  TRIGGER_PREFIX,
+  upsertDirectTrigger,
+  type DirectTriggerInput,
+  type TriggerRecord,
+} from "./state.js"
+import { specFor, toolPermission } from "./tools.js"
 
 export const ThreadDetailInput = Schema.Struct({
   threadID: Schema.String,
   limit: Schema.optionalKey(Schema.Number),
+  offset: Schema.optionalKey(Schema.Number),
 })
 
 export const WorkerDetailInput = Schema.Struct({
@@ -28,6 +38,7 @@ const DetailOutput = Schema.Struct({ text: Schema.String })
 interface ThreadDetailInput {
   readonly threadID: string
   readonly limit?: number
+  readonly offset?: number
 }
 
 interface WorkerDetailInput {
@@ -49,6 +60,12 @@ const MESSAGE_ITEM_LIMIT = 1500
 const MESSAGE_ITEM_MIN = 200
 const MESSAGE_ITEM_MAX = 4000
 const DEFAULT_THREAD_LIMIT = 20
+const MAX_THREAD_TAKE = 200
+/** KV fallback is bounded: one page read at a time, so a recall never fans out into per-id reads. */
+const KV_SCAN_PAGE = 100
+const KV_SCAN_MAX_ENTRIES = 2_000
+/** At most this many older triggers are pulled from KV for one `thread_detail` call. */
+const KV_BACKFILL_MAX = 20
 const DEFAULT_MESSAGE_COUNT = 5
 const MAX_MESSAGE_COUNT = 10
 
@@ -79,23 +96,84 @@ function workerLine(sessionID: string): string {
   return `- ${worker.sessionID} ${worker.title ?? "-"} [${threads}] ${worker.state} dir=${dir} ${worker.lastReport ?? "-"}`
 }
 
-const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (input: ThreadDetailInput, caller: string) {
+export const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (
+  ctx: Plugin.Context,
+  input: ThreadDetailInput,
+  caller: string,
+) {
   yield* requireRouter(caller, "thread_detail")
-  const take = input.limit === undefined ? DEFAULT_THREAD_LIMIT : Math.max(1, Math.floor(input.limit))
-  const triggers = [...store.triggers.values()]
+  const take = Math.min(
+    MAX_THREAD_TAKE,
+    input.limit === undefined ? DEFAULT_THREAD_LIMIT : Math.max(1, Math.floor(input.limit)),
+  )
+  const offset = input.offset === undefined ? 0 : Math.max(0, Math.floor(input.offset))
+  const memory = [...store.triggers.values()]
     .filter((record) => record.threadID === input.threadID)
     .sort((left, right) => left.createdAt - right.createdAt)
-  const shown = triggers.slice(-take)
-  const workers = [...store.workers.values()].filter((worker) => worker.threads.includes(input.threadID))
+  // Memory keeps only the newest 200 triggers. When the requested window
+  // starts before that, scan the trigger prefix once (paged, bounded) and keep
+  // the older records. This is a prefix scan, not one KV read per missing id,
+  // so a stale thread cannot fan out into hundreds of round trips.
+  let triggers = memory
+  let kvFilled = 0
+  let kvTruncated = false
+  if (offset + take > memory.length) {
+    const seen = new Set(memory.map((record) => record.id))
+    const found: Array<TriggerRecord> = []
+    let scanned = 0
+    let after: string | undefined
+    // Scan the whole bounded prefix first, then keep the newest missing
+    // records: stopping at the first 20 matches would return key order, not
+    // the most recent triggers of the thread.
+    while (scanned < KV_SCAN_MAX_ENTRIES) {
+      const page = yield* ctx.storage
+        .scan({ prefix: TRIGGER_PREFIX, after, limit: KV_SCAN_PAGE })
+        .pipe(Effect.catch(() => Effect.succeed({ entries: [], next: undefined })))
+      if (page.entries.length === 0) break
+      scanned += page.entries.length
+      for (const entry of page.entries) {
+        const record = decodeTrigger(entry.value)
+        if (record === undefined || record.threadID !== input.threadID || seen.has(record.id)) continue
+        seen.add(record.id)
+        found.push(record)
+      }
+      after = page.next
+      if (after === undefined) break
+    }
+    found.sort((left, right) => right.createdAt - left.createdAt)
+    const older = found.slice(0, KV_BACKFILL_MAX)
+    // Still more pages or more matching records than the cap: say so instead of
+    // pretending the list is complete.
+    if (after !== undefined || found.length > KV_BACKFILL_MAX) kvTruncated = true
+    kvFilled = older.length
+    if (older.length > 0) triggers = [...memory, ...older].sort((left, right) => left.createdAt - right.createdAt)
+  }
+  const total = triggers.length
+  const end = Math.max(0, total - offset)
+  const start = Math.max(0, end - take)
+  const shown = triggers.slice(start, end)
+  const workers = [...store.workers.values()].filter(
+    (worker) => worker.threadID === input.threadID || worker.threads.includes(input.threadID),
+  )
+  const source = kvFilled > 0 ? `memory ${memory.length} + KV ${kvFilled}` : `memory ${memory.length}`
   const lines = [
-    `thread ${input.threadID}: ${triggers.length} trigger(s), ${workers.length} worker(s)`,
+    `thread ${input.threadID}: ${total} trigger(s) (${source}), ${workers.length} worker(s)`,
     `directory: ${threadDirs.get(input.threadID) ?? "(no binding, use gateway default and confirm with user)"}`,
-    `triggers (showing ${shown.length} of ${triggers.length}):`,
+    `triggers (offset=${offset}, showing ${shown.length} of ${total}):`,
   ]
   for (const record of shown) {
     const at = new Date(record.createdAt).toISOString()
     lines.push(
       `- [${at}] ${record.author ?? "unknown"} (${record.route ?? "queued"}): ${truncate(record.text, THREAD_ITEM_LIMIT)}`,
+    )
+  }
+  if (shown.length === 0) lines.push("(no trigger in this range)")
+  if (offset >= total) {
+    lines.push(`offset ${offset} 超出已知 ${total} 条；thread_detail 每次最多从 KV 回源 ${KV_BACKFILL_MAX} 条。`)
+  }
+  if (kvTruncated) {
+    lines.push(
+      `KV 回源已截断：本次扫描 ${KV_SCAN_MAX_ENTRIES} 条、最多补 ${KV_BACKFILL_MAX} 条，仍有更早的 trigger 未列出。`,
     )
   }
   lines.push(`workers (${workers.length}):`)
@@ -250,15 +328,15 @@ export const registerRecall = Effect.fn("superagent.registerRecall")(function* (
       description: specFor("thread_detail").description,
       input: ThreadDetailInput,
       output: DetailOutput,
-      options: { permission: "status" },
-      execute: (input, context) => runThreadDetail(input, context.sessionID),
+      options: { permission: toolPermission(specFor("thread_detail")) },
+      execute: (input, context) => runThreadDetail(ctx, input, context.sessionID),
     })
     editor.add({
       name: "worker_detail",
       description: specFor("worker_detail").description,
       input: WorkerDetailInput,
       output: DetailOutput,
-      options: { permission: "status" },
+      options: { permission: toolPermission(specFor("worker_detail")) },
       execute: (input, context) => runWorkerDetail(ctx, input, context.sessionID),
     })
     editor.add({
@@ -266,7 +344,7 @@ export const registerRecall = Effect.fn("superagent.registerRecall")(function* (
       description: specFor("report_read").description,
       input: ReportReadInput,
       output: DetailOutput,
-      options: { permission: "status" },
+      options: { permission: toolPermission(specFor("report_read")) },
       execute: (input, context) => runReportRead(ctx, input, context.sessionID),
     })
   })
