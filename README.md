@@ -76,6 +76,7 @@
   5. 最后注入 `T-2` 的 2 条、`T-3` 的 1 条事件；这些 thread 首次出现，期望返回 `router`。
 - 相邻事件间隔 150ms，最后用 toast 汇总每条事件的返回路由：`thread=router`、`thread=worker` 或 `thread=dropped`；20 秒内没等到 `T-1` 的 Worker 时，toast 会附带 `T-1 wait timed out`。
 - 演示命令先创建 Router 再注入事件，因此不需要靠“先失败再创建 Router”的兜底逻辑。
+- TUI 右侧栏（42 列）里有一块「工单」面板，常驻显示工单清单，见下节「侧栏工单面板」。
 
 ## 数据流
 
@@ -133,6 +134,36 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 - 存储：`ticket:<id>` 存全量记录；`ticketidx:status:<state>`、`ticketidx:thread:<threadID>`、`ticketidx:all` 是按 createdAt 倒序的派生索引（各截断 200 项）。hydrate 扫 `ticket:` 前缀重建内存与索引，索引丢失不会丢单；历史 Worker 不回填工单。
 - 强制：`dispatch` 的 `ticketID` 必填（工具与 RPC 同一实现）。缺失、单据不存在、单据已关闭（非 `open/in_progress`）、`threadID` 与单据不符、或单据已绑定运行中的 Worker，一律拒绝并给出可操作提示；RPC 直达同样被拦。
 - 联动：派发成功即原子绑定——写入 `workerSessionID`、`attempts` 追加一条、`state → in_progress`；绑定失败会回滚新建的 Worker 会话（不会出现「Worker 起来了但单没绑上」）。Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 与 watchdog 置 `failed`（note=aborted / stalled）。
+
+## 侧栏工单面板
+
+`tui.tsx` 通过公开 slot API 往 OpenCode 会话侧栏注册了一块只读面板，不改 `packages/tui` / `packages/plugin` 任何源码：
+
+```tsx
+context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets context={context} /> })
+```
+
+- **位置**：`append: "sidebar.content"`，排在内置 Todo / MCP / Limit 模块之后；侧栏只有 42 列（`SESSION_SIDEBAR_WIDTH`），`sidebar.content` 的 slot input 只有 `sessionID`、没有宽度，所以面板按固定 36 cell 布局（42 − 4 padding − 1 滚动条列，再留 1 cell 余量）。
+- **渲染**：
+  - 标题行：`工单 <总数>`，有未结单时追加 ` · <N> 未结`（`open`/`in_progress`/`blocked` 计为未结）。
+  - 每行：状态符号 + 标题 + 4 位短 ID（`tk_mw7tqs9a_ximd` → `ximd`）。符号与颜色按语义取 theme token：`●` 进行中（info）、`◆` 阻塞（warning）、`○` 待办、`✓` 完成（success）、`✗` 失败（error）、`⊘`/`·` 取消/被取代（muted）。
+  - 排序：`in_progress` → `blocked` → `open` → 终态；同一状态内保持服务端 `listTickets` 的 `updatedAt` 倒序（稳定排序）。
+  - 终态最多显示 3 条，其余折成 `… 另有 N 条已结`。
+  - 截断：标题按**终端显示宽度**截断（CJK 算 2 cell），宽度预算 `36 − 符号1 − 空格1 − 短ID4 − 空格1 = 29`，再保守封顶 26 cell，超出用 `…`；`<text wrapMode="none" truncate>` 再兜一层，保证任何一行都不超宽。
+- **数据与刷新**：数据来自既有 RPC `tickets({ limit: 20 })`（`ticket_list` 的渲染版），启动即拉一次，之后每 4s 轮询（`TICKET_PANEL_REFRESH_MS`）。面板只在侧栏可见时挂载（侧栏 `Show` 控制），组件 `onMount`/`onCleanup` 起停定时器，切到终端面板或隐藏侧栏后不再轮询；同一时刻只有一个请求在飞。
+- **空态**：没有任何工单时整块不渲染（与内置 sidebar 模块一致），不占侧栏空间、不留空标题。
+- **失败降级**：RPC 抛错时显示 `工单 读取失败`（warning 色）；已有列表时降级为标题行追加 ` · 读取失败`，保留上一次的旧数据，不抛错、不影响其他 sidebar 模块。
+- **交互**：点击任意一行等同 `/ticket <id>`，弹窗显示该工单详情。slot 只提供渲染，不接管键盘，所以没有回车跳转。
+- **为什么解析文本**：`tickets` RPC 只返回 `{ text }`。服务端 `server.ts` 属于后台服务的代码，改动需 `opencode service restart` 才能生效，而本次改动要求不动服务、只重启 TUI，所以面板把 `renderTicketList` 的文本解析回行（`src/ticket-view.ts` 的 `parseTicketList`）。解析对未知行是忽略而非报错；`test/ticket-view.test.ts` 用真实的 `renderTicketList` 输出做往返断言，格式一改测试就会红。
+- **已知限制**：`sidebar.content` 的 slot input 没有宽度，面板按固定 36 cell 排；RPC 只给 `{ text }`，所以行数据靠解析、标题在换行处拼接会丢掉断行处的空格（随后统一按 26 cell 截断，不影响观感）；`tickets` 一次最多 20 条，标题里的 `工单 N` 是**本次返回的条数**，工单超过 20 张时不会显示真实总数。
+- **验证步骤**（宽终端效果最直观，需要 ≥121 列才会自动显示侧栏）：
+  1. 只改 TUI：重启 TUI（`bun run dev:live` 或重开 `opencode`），**不需要**重启后台服务；服务端本次没有改动。
+  2. 打开一个 **root 会话**（子会话/Worker 会话按上游逻辑不显示侧栏）。
+  3. 宽度 ≥121 列时侧栏自动出现；更窄或之前手动隐藏过，用 `Ctrl-x b`（`session.sidebar.toggle`，默认 leader `<leader>b`）切换。
+  4. 有工单时应看到 `工单 N · M 未结` 与若干行 `<符号> <标题> <短ID>`，终态超过 3 条时末行为 `… 另有 N 条已结`。
+  5. 无工单时整块消失（空态）。
+  6. 窄屏（≤120 列）注意：上游 `session-frame.tsx` 只在 `width - verticalTabsWidth > 120` 时渲染右侧栏，所以此时 `Ctrl-x b` 不会有可见效果——需要把终端调宽，这不是本面板的限制。
+  7. RPC 失败降级：停掉后台服务后，面板下一轮（≤4s）显示 `工单 读取失败`；恢复服务后自动回到列表。
 
 ## 单网关多目录（Router 自管，用户无需暴露映射表）
 
@@ -205,8 +236,9 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 
 ```text
 packages/plugins/superagent/
-├── tui.tsx                      # TUI 入口：keymap、slash 命令、RPC 调用
+├── tui.tsx                      # TUI 入口：keymap、slash 命令、RPC 调用、侧栏工单面板
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
+├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
 ├── src/                          # 服务端 Router/Worker/批处理实现
 ├── agent/
 │   ├── superagent-router.md     # Router agent 模板（mode: primary）
@@ -237,7 +269,8 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 在插件包目录内做类型检查：
 
 ```sh
-bun run --cwd packages/plugins/superagent typecheck
+bun run --cwd packages/plugins/superagent typecheck      # bun check（bun 1.4.0 没有该子命令，会报 Script not found）
+bun run --cwd packages/plugins/superagent typecheck:tsc  # tsc --noEmit，CI 口径，推荐
 ```
 
 不要在仓库根目录直接运行测试（仓库有 `do-not-run-tests-from-root` 保护）；需要跑测试时进入对应包目录。

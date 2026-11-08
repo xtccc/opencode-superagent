@@ -1,6 +1,16 @@
 import type { RpcCallOptions, RpcClient } from "@opencode/client/promise"
 import { Plugin } from "@opencode/plugin/tui"
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { Definition } from "./src/protocol"
+import {
+  parseTicketList,
+  TICKET_PANEL_LIMIT,
+  TICKET_PANEL_REFRESH_MS,
+  TICKET_STATE_SYMBOL,
+  ticketPanel,
+  type TicketRow,
+  type TicketState,
+} from "./src/ticket-view"
 import {
   describeLimits,
   describeTool,
@@ -90,8 +100,109 @@ export default Plugin.define({
         },
       ],
     }))
+
+    // Append below the built-in sidebar modules (todo, mcp, limit). The claim
+    // only mounts while the sidebar itself is on screen, so its polling stops
+    // when the sidebar is hidden or the pane switches to a terminal.
+    context.ui.slot({
+      append: "sidebar.content",
+      render: () => <SidebarTickets context={context} />,
+    })
   },
 })
+
+type Theme = Plugin.Context["theme"]
+
+function ticketStateColor(theme: Theme, state: TicketState) {
+  switch (state) {
+    case "in_progress":
+      return theme.text.feedback.info.base
+    case "blocked":
+      return theme.text.feedback.warning.base
+    case "done":
+      return theme.text.feedback.success.base
+    case "failed":
+      return theme.text.feedback.error.base
+    case "cancelled":
+    case "superseded":
+      return theme.text.muted
+    case "open":
+      return theme.text.base
+  }
+}
+
+/** Fixed 36-cell layout: the sidebar publishes no width, and 42 columns are fixed upstream. */
+function SidebarTickets(props: { context: Plugin.Context }) {
+  const theme = props.context.theme
+  const [rows, setRows] = createSignal<ReadonlyArray<TicketRow>>([])
+  const [failed, setFailed] = createSignal(false)
+  let disposed = false
+  let running = false
+
+  const refresh = async () => {
+    if (running) return
+    running = true
+    try {
+      const rpc = props.context.client.rpc(Definition)
+      const { text } = await rpc.tickets({ limit: TICKET_PANEL_LIMIT }, options(props.context))
+      if (disposed) return
+      setRows(parseTicketList(text))
+      setFailed(false)
+    } catch {
+      if (!disposed) setFailed(true)
+    } finally {
+      running = false
+    }
+  }
+
+  // The slot content mounts with the sidebar, so mount/cleanup is the
+  // visibility signal: no polling while the panel is not on screen.
+  onMount(() => {
+    void refresh()
+    const timer = setInterval(() => void refresh(), TICKET_PANEL_REFRESH_MS)
+    onCleanup(() => {
+      disposed = true
+      clearInterval(timer)
+    })
+  })
+
+  const panel = createMemo(() => ticketPanel(rows()))
+
+  return (
+    <Show when={panel().items.length > 0 || failed()}>
+      <box>
+        <Show
+          when={panel().items.length > 0}
+          fallback={<text fg={theme.text.feedback.warning.base}>工单 读取失败</text>}
+        >
+          <text fg={theme.text.base} wrapMode="none" truncate>
+            <b>工单 {panel().total}</b>
+            <Show when={panel().active > 0}>
+              <span style={{ fg: theme.text.muted }}> · {panel().active} 未结</span>
+            </Show>
+            <Show when={failed()}>
+              <span style={{ fg: theme.text.feedback.warning.base }}> · 读取失败</span>
+            </Show>
+          </text>
+          <For each={panel().items}>
+            {(item) => (
+              <box flexDirection="row" minWidth={0} onMouseUp={() => void ticket(props.context, item.id)}>
+                <text wrapMode="none" truncate>
+                  <span style={{ fg: ticketStateColor(theme, item.state) }}>{TICKET_STATE_SYMBOL[item.state]}</span>
+                  <span style={{ fg: theme.text.base }}> {item.title}</span>
+                  <span style={{ fg: theme.text.muted }}> {item.shortID}</span>
+                </text>
+              </box>
+            )}
+          </For>
+          <Show when={panel().hidden > 0}>
+            <text fg={theme.text.muted}>… 另有 {panel().hidden} 条已结</text>
+          </Show>
+        </Show>
+      </box>
+    </Show>
+  )
+}
 
 async function open(context: Plugin.Context) {
   try {

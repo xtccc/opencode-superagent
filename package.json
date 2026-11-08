@@ -33,9 +33,11 @@
   "devDependencies": {
     "@opencode/plugin": "workspace:*",
     "@opencode/schema": "workspace:*",
+    "@opentui/solid": "catalog:",
     "@tsconfig/bun": "catalog:",
     "@types/bun": "catalog:",
     "@typescript/native": "catalog:",
-    "effect": "catalog:"
+    "effect": "catalog:",
+    "solid-js": "catalog:"
   }
 }

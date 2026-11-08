@@ -4,7 +4,13 @@
   "compilerOptions": {
     "types": ["bun"],
     "noEmit": true,
-    "noUncheckedIndexedAccess": false
+    "noUncheckedIndexedAccess": false,
+    // `tui.tsx` renders OpenTUI components in the sidebar slot, the same way
+    // the host's own feature plugins do. The TUI compiles plugin JSX with
+    // solid's transform; this pairing only feeds the typecheck.
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"]
   },
   "include": ["server.ts", "tui.tsx", "src", "test"]
 }
