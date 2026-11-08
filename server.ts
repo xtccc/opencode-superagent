@@ -107,16 +107,26 @@ export default Plugin.define({
               state: worker.state,
             })),
           })),
-        tickets: (input) =>
-          Effect.sync(() =>
+        tickets: (input, context) => {
+          // The protocol literal already rejects unknown states with
+          // `rpc.invalid_input`; keep an explicit RPC error as a second line of
+          // defence so a bypassed/older client can never turn an unknown status
+          // into an unfiltered list.
+          if (input.status !== undefined && !TICKET_STATES.includes(input.status as TicketState)) {
+            return Effect.fail(
+              context.error("tickets.invalid_status", `invalid ticket status: ${String(input.status)}`, {
+                status: String(input.status),
+              }),
+            )
+          }
+          return Effect.sync(() =>
             renderTicketsText({
               ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
-              ...(input.status === undefined || !TICKET_STATES.includes(input.status as TicketState)
-                ? {}
-                : { status: input.status as TicketState }),
+              ...(input.status === undefined ? {} : { status: input.status }),
               ...(input.limit === undefined ? {} : { limit: input.limit }),
             }),
-          ).pipe(Effect.map((text) => ({ text }))),
+          ).pipe(Effect.map((text) => ({ text })))
+        },
         ticket: (input) => Effect.sync(() => ({ text: renderTicketText(input.ticketID) })),
         // RPC dispatches go through the same implementation as the tool, so
         // the ticket gate (required ticketID, workable state, thread match, no

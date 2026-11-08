@@ -1,5 +1,9 @@
 import { Rpc } from "@opencode/plugin/effect"
 import { Schema } from "effect"
+// `ticket-view` carries the TUI-safe copy of the state list (it must not import
+// the KV-backed store); `test/ticket-view.test.ts` keeps it in step with
+// `src/ticket.ts`, so reusing it here keeps the RPC enum from drifting.
+import { TICKET_STATES } from "./ticket-view.js"
 
 /**
  * Server-side RPC contract for the Super-agent P0 prototype.
@@ -38,11 +42,14 @@ export const Definition = Rpc.define({
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
           threadID: Schema.optionalKey(Schema.String),
-          status: Schema.optionalKey(Schema.String),
+          status: Schema.optionalKey(Schema.Literals(TICKET_STATES)),
           limit: Schema.optionalKey(Schema.Number),
         }),
       ),
       output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),
+      errors: {
+        "tickets.invalid_status": Schema.toStandardSchemaV1(Schema.Struct({ status: Schema.String })),
+      },
     },
     ticket: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ ticketID: Schema.String })),
