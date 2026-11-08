@@ -164,14 +164,14 @@ describe("dispatch requires a work ticket", () => {
   })
 })
 
-// ── the RPC path ─────────────────────────────────────────────────────────────
+// ── the shared gate ──────────────────────────────────────────────────────────
 
-describe("the dispatch RPC shares the gate", () => {
+describe("runDispatch keeps the router and ticket gate", () => {
   test("a direct RPC dispatch of a closed ticket is refused", async () => {
     const ctx = dispatchContext()
     const created = await succeed(createTicket(ctx, base))
     await succeed(closeTicket(ctx, { ticketID: created.ticket.id, outcome: "cancelled", summary: "用户取消" }))
-    // `server.ts` runs this exact function with the router id as the caller.
+    // The router tool passes the real session id; RPC no longer forwards here.
     const message = await failure(runDispatch(ctx, { task: "修日志", ticketID: created.ticket.id }, ROUTER))
     expect(message).toContain("only open/in_progress")
     expect(store.workers.size).toBe(0)
