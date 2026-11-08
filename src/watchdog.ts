@@ -1,8 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { DateTime, Effect, Option, Stream } from "effect"
 import { ensureRouter } from "./router.js"
-import { saveWorker, store, toSessionID } from "./state.js"
-import { closeTicketsForWorker } from "./ticket.js"
+import { store, toSessionID } from "./state.js"
 
 /** Default interval between stall checks. Overridable with the `watchdogIntervalMs` plugin option. */
 export const WATCHDOG_INTERVAL_MS = 60_000
@@ -10,8 +9,23 @@ export const WATCHDOG_INTERVAL_MS = 60_000
 /** Default stall threshold. Overridable with the `stallTimeoutMs` plugin option. */
 export const STALL_TIMEOUT_MS = 30 * 60_000
 
-/** Prefix marking a worker already reported as stalled. Guards duplicate watchdog alerts. */
+/**
+ * Older records may still carry the watchdog marker in `lastReport`; keep
+ * honouring it so a restart cannot re-alert the same legacy stall.
+ */
 export const STALLED_PREFIX = "watchdog: stalled"
+
+/**
+ * Sessions already reported for their current busy window. Alert-only mode
+ * never mutates the worker record, so dedupe lives in memory. Keying by
+ * `time.busy` lets a resumed worker alert once more if it stalls again.
+ */
+const alerted = new Map<string, number>()
+
+/** Test/hydrate hook: forget every in-memory stall alert. */
+export function resetWatchdogAlerts(): void {
+  alerted.clear()
+}
 
 function optionMs(ctx: Plugin.Context, key: string, fallback: number): number {
   const raw: unknown = ctx.options[key]
@@ -19,15 +33,17 @@ function optionMs(ctx: Plugin.Context, key: string, fallback: number): number {
   return raw
 }
 
-const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
+export const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
   ctx: Plugin.Context,
   sessionID: string,
   now: number,
   stallTimeoutMs: number,
 ) {
   const worker = store.workers.get(sessionID)
-  if (worker === undefined || worker.state !== "running") return
-  // Already alerted: only the running→failed transition reports once.
+  if (worker === undefined || worker.state !== "running") {
+    alerted.delete(sessionID)
+    return
+  }
   if (worker.lastReport !== undefined && worker.lastReport.startsWith(STALLED_PREFIX)) return
   const info = yield* ctx.session.get({ sessionID: toSessionID(sessionID) }).pipe(Effect.option)
   if (Option.isNone(info)) {
@@ -35,12 +51,20 @@ const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
     return
   }
   const busy = info.value.time.busy
-  if (busy === undefined) return
+  if (busy === undefined) {
+    alerted.delete(sessionID)
+    return
+  }
   const busyMs = DateTime.toEpochMillis(busy)
   const idle = info.value.time.idle
   // While a session runs, `idle` still holds the previous execution's end.
   // Only an `idle` newer than `busy` proves progress since this execution started.
-  if (idle !== undefined && DateTime.toEpochMillis(idle) > busyMs) return
+  if (idle !== undefined && DateTime.toEpochMillis(idle) > busyMs) {
+    alerted.delete(sessionID)
+    return
+  }
+  // One alert per busy window: duplicate checks must not spam the Router.
+  if (alerted.get(sessionID) === busyMs) return
   const stalledMs = now - busyMs
   if (stalledMs <= stallTimeoutMs) return
   const minutes = Math.floor(stalledMs / 60_000)
@@ -56,17 +80,11 @@ const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
       .synthetic({ sessionID: toSessionID(routerID), text, description: "superagent watchdog", delivery: "queue" })
       .pipe(Effect.catch((cause) => Effect.logWarning("superagent watchdog failed to report to router", { cause })))
   }
-  // Alert only: never interrupt automatically, so long tasks are not killed by mistake.
-  worker.state = "failed"
-  worker.lastReport = `${STALLED_PREFIX} ${minutes}m${worker.lastReport === undefined ? "" : ` | ${worker.lastReport}`}`
-  yield* saveWorker(ctx, worker)
-  yield* closeTicketsForWorker(ctx, {
-    sessionID,
-    outcome: "failed",
-    summary: `watchdog: stalled ${minutes}m`,
-  }).pipe(
-    Effect.catch((cause) => Effect.logWarning("superagent watchdog failed to close ticket", { sessionID, cause })),
-  )
+  alerted.set(sessionID, busyMs)
+  // Alert only: never change worker.state, never close its ticket and never
+  // interrupt automatically, so a long task is not killed by mistake. The
+  // Router decides whether to stop/re-dispatch.
+  yield* Effect.logWarning("superagent watchdog: worker stalled", { sessionID, minutes })
 })
 
 const checkAll = Effect.fn("superagent.watchdogCheckAll")(function* (ctx: Plugin.Context, stallTimeoutMs: number) {
@@ -81,9 +99,10 @@ const checkAll = Effect.fn("superagent.watchdogCheckAll")(function* (ctx: Plugin
 /**
  * Periodic stall detector. Every interval it flags `running` workers whose
  * session has been busy longer than the stall timeout without an `idle`
- * update, reports them to the router, and marks them `failed`. It never
- * interrupts: stalled workers stay alive until someone stops or re-dispatches
- * them. All errors are swallowed with a warning so the loop never dies.
+ * update, and reports them to the router. It is alert-only: the worker record
+ * keeps its `running` state, its ticket stays open and the worker is never
+ * interrupted, so the Router stays in control. Alerts are deduped per busy
+ * window. All errors are swallowed with a warning so the loop never dies.
  */
 export const registerWatchdog = Effect.fn("superagent.registerWatchdog")(function* (ctx: Plugin.Context) {
   const intervalMs = optionMs(ctx, "watchdogIntervalMs", WATCHDOG_INTERVAL_MS)

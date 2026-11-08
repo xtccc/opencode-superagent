@@ -155,7 +155,7 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 - authorization：自动取 Router 最近一次被投递的 trigger（`triggerID` + 原文摘要 ≤300 字），所以每张单都能追溯「用户当时怎么说的」。
 - 存储：`ticket:<id>` 存全量记录；`ticketidx:status:<state>`、`ticketidx:thread:<threadID>`、`ticketidx:all` 是按 createdAt 倒序的派生索引（各截断 200 项）。hydrate 扫 `ticket:` 前缀重建内存与索引，索引丢失不会丢单；历史 Worker 不回填工单。
 - 强制：`dispatch` 的 `ticketID` 必填（工具与 RPC 同一实现）。缺失、单据不存在、单据已关闭（非 `open/in_progress`）、`threadID` 与单据不符、或单据已绑定运行中的 Worker，一律拒绝并给出可操作提示；RPC 直达同样被拦。
-- 联动：派发成功即原子绑定——写入 `workerSessionID`、`attempts` 追加一条、`state → in_progress`；绑定失败会回滚新建的 Worker 会话（不会出现「Worker 起来了但单没绑上」）。Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 与 watchdog 置 `failed`（note=aborted / stalled）。
+- 联动：派发成功即原子绑定——写入 `workerSessionID`、`attempts` 追加一条、`state → in_progress`；绑定失败会回滚新建的 Worker 会话（不会出现「Worker 起来了但单没绑上」）。Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 关闭为 `failed`；watchdog 只告警，不改状态也不结单。
 
 ## 侧栏工单面板
 
@@ -231,8 +231,9 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
   - `stale: true`：只清理 `done`/`failed`/`idle`/`aborted` 的记录，不中断运行中的 Worker。
   - `all: true`：全部 Worker 都终止，运行中的先中断。
 - 单个终止的校验顺序：调用者自身 → Router 会话 → 必须是 superagent 记录的 Worker；用户手动会话、未知 sessionID 一律拒绝（不会误删用户会话）。
-- 运行中的 Worker：先 `session.interrupt`（优雅中断，`resume: false`，不重放队列），再 `session.wait` 等终态，超时 `ABORT_TIMEOUT_MS = 10s`（超时也会标记 `aborted` 并在结果里注明 `settle-timeout`）。
-- 已结束的 Worker（`done`/`failed`/`idle`，或 `time.busy` 不新于 `time.idle`）：不发中断信号，只做清理语义，返回 `already-ended`。
+- 所有存在的 Worker：无条件先 `session.interrupt`（未运行视为无害 no-op，但会清掉排队中的 prompt，避免 abort 返回后它才开始）。
+- 运行中的 Worker：再 `session.wait` 等终态，超时 `ABORT_TIMEOUT_MS = 10s`（超时也会标记 `aborted` 并在结果里注明 `settle-timeout`）。
+- 已结束的 Worker（`done`/`failed`/`idle`，或 `time.busy` 不新于 `time.idle`）：不等待，返回 `already-ended`；若 interrupt 清掉了排队 prompt，`lastReport` 记 `interrupted queued prompt`。
 - KV 变更（`worker:<sessionID>`）：`state` 置为 `aborted`，`lastReport` 前缀 `aborted (<reason>) [<detail>]`（保留旧 report），`updatedAt` 刷新；**记录保留**，不删除，便于追溯。
 - thread 亲和：从 `thread:<threadID>` 的 `workers` 列表移除该会话（列表空则删除该键），后续消息不再投给它；该 thread 没有其它可用 Worker 时，下条消息回落 Router 重新 `dispatch`。Worker 记录里的 `threads` 保留用于追溯。
 - 竞态保护：`state` 在中断**之前**就置为 `aborted`，`watcher.ts` 的 `handleEnded`/`session.idle` 会跳过 `aborted`，避免中断落地时被改回 `idle`/`done` 或重复向 Router 报“已完成”。
@@ -328,7 +329,7 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 
 - **检查间隔**：插件 scope 内 `Stream.tick` 每 60 秒跑一次（`src/watchdog.ts` 的 `WATCHDOG_INTERVAL_MS`），可用插件选项 `watchdogIntervalMs`（毫秒）覆盖。
 - **停滞定义**：`state` 为 `running` 的 Worker，若其会话 `time.busy` 比当前早超过 30 分钟（`STALL_TIMEOUT_MS`，可用 `stallTimeoutMs` 覆盖），且 `time.idle` 没有新于 `busy` 的更新（执行期间 `idle` 只保留上一次执行的结束时间），视为停滞。
-- **只告警不自动杀**：停滞后向 Router 注入一条 delivery `queue` 的提示（`Worker <sid>（<title>）已停滞 <N> 分钟，建议：stop 后重派或人工介入`），并把该 Worker 记为 `failed`（`lastReport` 前缀 `watchdog: stalled <N>m`）。不 interrupt，避免误杀长任务。
+- **只告警不自动杀**：停滞后向 Router 注入一条 delivery `queue` 的提示（`Worker <sid>（<title>）已停滞 <N> 分钟，建议：stop 后重派或人工介入`）。不修改 Worker 的 `state`/`lastReport`，不结单，也不 interrupt；同一繁忙窗口只告警一次，避免误杀长任务和重复刷屏。
 - **单轮错误隔离**：单个 Worker 检查失败只 `logWarning` 并继续下一个；整轮失败也只告警，循环永不退出。
 - **pending 队列崩溃恢复**：入队时同步写 KV（键前缀 `pending:`，纯 JSON），flush 成功后删除该键；setup 时从 KV 读回未 flush 的 trigger 重新入内存队列（不自动建 Router，等下一次 `router` RPC 或新 trigger 时再 flush）。同一 id 重复入队会被去重。
 - **status 无 Router**：Router 尚未创建时 `status` 返回 `{pending, workers}` 且不含 `router` 字段（显式 `undefined` 会导致输出校验失败，故直接省略该键）。

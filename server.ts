@@ -68,13 +68,15 @@ const runStop = Effect.fn("superagent.runStop")(function* (ctx: Plugin.Context, 
 export default Plugin.define({
   id: "opencode.superagent",
   effect: Effect.fn(function* (ctx) {
+    // Tickets first: hydrating workers reconciles finished `running` records
+    // and closes their tickets, so the ticket store must already be loaded.
+    yield* hydrateTickets(ctx)
     yield* hydrate(ctx)
     // Before any session work: the Router and Worker sessions resolve their agent by id.
     yield* registerAgents(ctx)
     yield* hydratePending(ctx)
     yield* hydrateDirs(ctx)
     yield* hydrateSessionMeta(ctx)
-    yield* hydrateTickets(ctx)
     yield* hydrateReports(ctx)
     yield* registerTools(ctx)
     yield* registerTicketTools(ctx)
