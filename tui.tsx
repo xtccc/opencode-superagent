@@ -54,6 +54,13 @@ export default Plugin.define({
           run: () => tasks(context),
         },
         {
+          id: "superagent.abort",
+          title: "Superagent abort worker",
+          palette: true,
+          slash: { name: "abort" },
+          run: () => abort(context),
+        },
+        {
           id: "superagent.tools",
           title: "Superagent tools",
           palette: true,
@@ -116,6 +123,40 @@ async function tasks(context: Plugin.Context) {
     gotoSession(context, sessionID)
   } catch (error) {
     context.ui.toast.show({ title: "Superagent tasks", message: message(error), variant: "error" })
+  }
+}
+
+/** Stale cleanup entry in the abort picker; any other value is a worker session id. */
+const STALE_CHOICE = "__stale__"
+
+async function abort(context: Plugin.Context) {
+  try {
+    const rpc = context.client.rpc(Definition)
+    const call = options(context)
+    const status = await rpc.status({}, call)
+    const selection = await context.ui.dialog.select({
+      title: "Superagent abort",
+      options: [
+        {
+          title: "清理全部已结束 worker",
+          description: "stale：只清理 done/failed/idle/aborted，不中断运行中的 worker",
+          value: STALE_CHOICE,
+        },
+        ...status.workers.map((worker) => ({
+          title: worker.title ?? worker.sessionID.slice(0, 8),
+          description: `${worker.state} · ${worker.threads.join(",") || "-"} · ${worker.sessionID.slice(0, 8)}`,
+          value: worker.sessionID,
+        })),
+      ],
+    })
+    if (selection === undefined) return
+    const result =
+      selection === STALE_CHOICE
+        ? await rpc.abort({ stale: true }, call)
+        : await rpc.abort({ sessionID: selection }, call)
+    context.ui.toast.show({ title: "Superagent abort", message: result.text, variant: "info" })
+  } catch (error) {
+    context.ui.toast.show({ title: "Superagent abort", message: message(error), variant: "error" })
   }
 }
 

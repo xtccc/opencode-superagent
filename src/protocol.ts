@@ -28,7 +28,7 @@ export const Definition = Rpc.define({
               sessionID: Schema.String,
               title: Schema.optionalKey(Schema.String),
               threads: Schema.Array(Schema.String),
-              state: Schema.Literals(["running", "idle", "failed", "done"]),
+              state: Schema.Literals(["running", "idle", "failed", "done", "aborted"]),
             }),
           ),
         }),
@@ -70,6 +70,18 @@ export const Definition = Rpc.define({
     stop: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ sessionID: Schema.String })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ interrupted: Schema.Boolean })),
+    },
+    abort: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          sessionID: Schema.optionalKey(Schema.String),
+          reason: Schema.optionalKey(Schema.String),
+          all: Schema.optionalKey(Schema.Boolean),
+          stale: Schema.optionalKey(Schema.Boolean),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),
+      errors: { "abort.rejected": Schema.toStandardSchemaV1(Schema.Struct({})) },
     },
   },
   events: {},

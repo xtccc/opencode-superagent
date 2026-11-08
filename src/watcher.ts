@@ -62,6 +62,9 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   const sessions = ctx.session
   const worker = store.workers.get(sessionID)
   if (worker === undefined) return
+  // A terminated worker keeps `aborted`; the abort tool already reported the
+  // outcome to whoever asked, so do not re-announce it as finished.
+  if (worker.state === "aborted") return
   worker.state = state
   const messages = yield* sessions
     .context({ sessionID: toSessionID(sessionID) })
@@ -165,7 +168,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
             }
             case "session.idle": {
               const worker = store.workers.get(sessionID)
-              if (worker === undefined || worker.state === "idle") return
+              if (worker === undefined || worker.state === "idle" || worker.state === "aborted") return
               worker.state = "idle"
               yield* saveWorker(ctx, worker)
               return

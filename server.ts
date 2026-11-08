@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
+import { registerAbort, runAbort } from "./src/abort.js"
 import { registerContext } from "./src/context.js"
 import { hydrateDirs } from "./src/dirs.js"
 import { registerTools } from "./src/dispatch.js"
@@ -72,6 +73,7 @@ export default Plugin.define({
     yield* hydrateTickets(ctx)
     yield* registerTools(ctx)
     yield* registerTicketTools(ctx)
+    yield* registerAbort(ctx)
     yield* registerContext(ctx)
     yield* registerRouterIdle(ctx)
     yield* registerWatcher(ctx)
@@ -124,6 +126,11 @@ export default Plugin.define({
             Effect.catch((cause) =>
               Effect.logWarning("superagent stop handler failed", { cause }).pipe(Effect.as({ interrupted: false })),
             ),
+          ),
+        abort: (input, context) =>
+          runAbort(ctx, input).pipe(
+            Effect.map((result) => ({ text: result.output.text })),
+            Effect.catchTag("Tool.Error", (error) => Effect.fail(context.error("abort.rejected", error.message, {}))),
           ),
       })
       .pipe(Effect.orDie)

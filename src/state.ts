@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import type { Session } from "@opencode/schema/session"
 import { Effect, type Schema } from "effect"
 
-export type WorkerState = "running" | "idle" | "failed" | "done"
+export type WorkerState = "running" | "idle" | "failed" | "done" | "aborted"
 
 export interface WorkerRecord {
   readonly sessionID: string
@@ -10,6 +10,8 @@ export interface WorkerRecord {
   readonly threads: Array<string>
   state: WorkerState
   readonly createdAt: number
+  /** Last persisted write. Refreshed by `saveWorker`, so an aborted record keeps a traceable timestamp. */
+  updatedAt?: number
   lastReport?: string
   directory?: string
 }
@@ -195,7 +197,7 @@ export const triggerKey = (id: string) => `${TRIGGER_PREFIX}${id}`
 /** Brands are compile-time only, so a validated session id string converts freely. */
 export const toSessionID = (id: string) => id as Session.ID
 
-const STATES: ReadonlyArray<WorkerState> = ["running", "idle", "failed", "done"]
+const STATES: ReadonlyArray<WorkerState> = ["running", "idle", "failed", "done", "aborted"]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -223,12 +225,14 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
   if (typeof value["state"] !== "string" || !STATES.includes(value["state"] as WorkerState)) return undefined
   const threads = stringArray(value["threads"])
   if (threads === undefined) return undefined
+  const createdAt = optionalNumber(value, "createdAt") ?? 0
   return {
     sessionID: value["sessionID"],
     title: optionalString(value, "title"),
     threads,
     state: value["state"] as WorkerState,
-    createdAt: optionalNumber(value, "createdAt") ?? 0,
+    createdAt,
+    updatedAt: optionalNumber(value, "updatedAt") ?? createdAt,
     lastReport: optionalString(value, "lastReport"),
     ...(optionalString(value, "directory") === undefined ? {} : { directory: optionalString(value, "directory") }),
   }
@@ -275,6 +279,7 @@ export function encodeWorker(record: WorkerRecord): Schema.Json {
     threads: [...record.threads],
     state: record.state,
     createdAt: record.createdAt,
+    ...(record.updatedAt === undefined ? {} : { updatedAt: record.updatedAt }),
     ...(record.lastReport === undefined ? {} : { lastReport: record.lastReport }),
     ...(record.directory === undefined ? {} : { directory: record.directory }),
   } as unknown as Schema.Json
@@ -408,7 +413,11 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
   }
 })
 
-export const saveWorker = persistWorker
+/** Every worker write refreshes `updatedAt`, so an aborted record keeps a traceable timestamp. */
+export const saveWorker = Effect.fn("superagent.saveWorker")(function* (ctx: Plugin.Context, record: WorkerRecord) {
+  record.updatedAt = Date.now()
+  yield* persistWorker(ctx, record)
+})
 
 export const saveTrigger = persistTrigger
 
