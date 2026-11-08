@@ -40,25 +40,27 @@ opencode plugin add opencode-superagent
 - `agent/*.md` 随包内置（见下面第 2 条），agent 定义由插件在 setup 里程序化注册，**不需要复制任何 markdown 文件**。
 - 安装后同样要关闭 Location 空闲回收（见下面本地安装的第 3 条），然后重启 TUI。
 
-### 本地开发安装（仓库内）
+### 本地开发安装（本仓库源码）
 
-1. 在项目或全局 `opencode.jsonc` 中把插件目录加入 `plugins`。注意：相对路径是**相对于配置文件所在目录**解析的（见 `packages/core/src/config/plugin/source.ts` 的 `scan`：以 `path.dirname(entry.path)` 为基准 `resolve` 以 `./` 或 `../` 开头的目标），不是相对仓库根目录：
+本仓库根就是插件包本身。
 
-   项目级（配置文件是 `.opencode/opencode.jsonc`，需上一级再进 `packages/`）：
+1. 在项目或全局 `opencode.jsonc` 中把插件目录加入 `plugins`。注意：相对路径是**相对于配置文件所在目录**解析的（OpenCode 上游 `config/plugin/source.ts` 的 `scan` 以 `path.dirname(entry.path)` 为基准 `resolve` 以 `./` 或 `../` 开头的目标），不是相对仓库根目录：
+
+   项目级（配置文件是本仓库的 `.opencode/opencode.jsonc`，插件目录即仓库根，所以上一级是 `..`）：
 
    ```jsonc
    {
-     "plugins": ["../packages/plugins/superagent"],
+     "plugins": [".."],
    }
    ```
 
-   写成 `"./packages/plugins/superagent"` 会被解析成 `.opencode/packages/plugins/superagent`，加载失败（日志 `failed to load plugin … ENOENT`）。
+   写成 `"."` 会被解析到 `.opencode` 自身，加载失败（日志 `failed to load plugin … ENOENT`）。
 
-   全局（配置文件是 `~/.config/opencode/opencode.jsonc`）：不要用相对路径；插件路径不支持 `~` 展开（只处理 `file://`、`./`、`../` 开头和绝对路径），请写绝对路径：
+   全局（配置文件是 `~/.config/opencode/opencode.jsonc`）：不要用相对路径；插件路径不支持 `~` 展开（只处理 `file://`、`./`、`../` 开头和绝对路径），请写本仓库的绝对路径：
 
    ```jsonc
    {
-     "plugins": ["/abs/path/to/opencode/packages/plugins/superagent"],
+     "plugins": ["/abs/path/to/opencode-superagent"],
    }
    ```
 
@@ -79,7 +81,7 @@ opencode plugin add opencode-superagent
    }
    ```
 
-   本仓库的 `.opencode/opencode.jsonc` 已经包含上述配置。
+   开发时把上述配置写进仓库根的 `.opencode/opencode.jsonc` 即可（本仓库不提交该文件）。
 
 4. 重启 TUI，确认插件加载成功。
 
@@ -157,7 +159,7 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 
 ## 侧栏工单面板
 
-`tui.tsx` 通过公开 slot API 往 OpenCode 会话侧栏注册了一块只读面板，不改 `packages/tui` / `packages/plugin` 任何源码：
+`tui.tsx` 通过公开 slot API 往 OpenCode 会话侧栏注册了一块只读面板，不改 OpenCode 上游 `packages/tui` / `packages/plugin` 任何源码：
 
 ```tsx
 context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets context={context} /> })
@@ -205,7 +207,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 
 ```jsonc
 {
-  "plugins": ["/abs/path/to/opencode/packages/plugins/superagent"],
+  "plugins": ["/abs/path/to/opencode-superagent"],
 }
 ```
 
@@ -256,7 +258,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 ## 文件结构
 
 ```text
-packages/plugins/superagent/
+.                              # 仓库根即本包
 ├── tui.tsx                      # TUI 入口：keymap、slash 命令、RPC 调用、侧栏工单面板
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
 ├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
@@ -293,19 +295,18 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 
 ## 开发
 
-在插件包目录内做类型检查：
+在插件包（本仓库根）内做类型检查：
 
 ```sh
-bun run --cwd packages/plugins/superagent typecheck      # bun check（bun 1.4.0 没有该子命令，会报 Script not found）
-bun run --cwd packages/plugins/superagent typecheck:tsc  # tsc --noEmit，CI 口径，推荐
+bun run typecheck      # bun check（bun 1.4.0 没有该子命令，会报 Script not found）
+bun run typecheck:tsc  # tsc --noEmit，CI 口径，推荐
 ```
 
-不要在仓库根目录直接运行测试（仓库有 `do-not-run-tests-from-root` 保护）；需要跑测试时进入对应包目录。
+测试用 `bun test`，在仓库根直接运行即可（本仓库不含上游的 `do-not-run-tests-from-root` 保护）。
 
 ## 发布与构建
 
 ```sh
-cd packages/plugins/superagent
 bun run build          # 清空 dist/，tsc 产出 server + d.ts，bun build 产出 tui.js
 npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build）
 ```
@@ -314,7 +315,7 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 - **外置模块**：两份产物都把 `effect`、`@opencode/plugin`、`@opencode/client`、`@opentui/*`、`solid-js` 保持为裸导入。OpenCode 宿主提供这些单例，并会拒绝从插件 `node_modules` 加载 `effect`/`@opencode/plugin` 的副本。
 - **依赖划分**：`@opencode/schema`（`Tool`、`AbsolutePath` 等运行时用的 schema 助手）是真正的 `dependencies`，宿主不提供它；`@opencode/plugin`、`effect`、`@opentui/solid`、`solid-js` 挂在 `peerDependencies` 且标 `optional`，因为它们只由宿主提供、npm 不该再装一份（`optional` 是为了避免裸 `npm install` 时的噪声告警）。
 - **包字段**：`exports` 指向 `./dist/server.js` 与 `./dist/tui.js`（类型由同名 `.d.ts` 解析）；`files` 为 `dist`、`agent`、`README.md`、`LICENSE`；`publishConfig.access: public`。
-- **待用户确认的占位**：`repository`/`homepage`/`bugs` 用的是 `xtccc/opencode-superagent`（发布前请确认这个 GitHub 仓库就是目标仓库，不行就整体替换）；`LICENSE` 的版权人现为 `<COPYRIGHT HOLDER>`，需确认署名。两处都只影响元数据，不影响加载。
+- **包元数据**：`repository`/`homepage`/`bugs` 均指向 `xtccc/opencode-superagent`，`LICENSE` 版权人为 `xtccc`；这两处只影响元数据，不影响加载。
 - **已知限制**：
   - `tui.d.ts` 只声明默认导出的 `Plugin.Definition`，不描述 `setup` 内部类型；TUI 插件是动态加载的，消费方通常只需要包名。
   - `dist/tui.js` 约 41 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。

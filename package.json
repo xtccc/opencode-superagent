@@ -69,14 +69,13 @@
     }
   },
   "devDependencies": {
-    "@opencode/client": "workspace:*",
-    "@opencode/plugin": "workspace:*",
-    "@opencode/schema": "workspace:*",
-    "@opentui/solid": "catalog:",
-    "@tsconfig/bun": "catalog:",
-    "@types/bun": "catalog:",
-    "@typescript/native": "catalog:",
-    "effect": "catalog:",
-    "solid-js": "catalog:"
+    "@opencode/client": "^2.2.5",
+    "@opencode/plugin": "^2.2.5",
+    "@opentui/solid": "0.8.1",
+    "@tsconfig/bun": "1.0.9",
+    "@types/bun": "1.4.3",
+    "@typescript/native": "npm:typescript@7.1.0-beta",
+    "effect": "4.1.0",
+    "solid-js": "1.9.17"
   }
 }
