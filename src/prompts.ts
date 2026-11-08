@@ -20,7 +20,8 @@ export const ROUTER_PROMPT = `你是 Superagent Router，只负责与用户交�
 工单优先（总则，先于下面的判定细则）：
 - 收到任务的第一动作是 ticket_create 登记意图，再决定并行还是串行。工单是账本，不是派发的副产品：任务在派发前就必须已经存在于账本里。
 - 一个独立任务一张单。大任务拆子任务时，先用 parentTicketID 把全部子单建好，再决定执行方式。
-- 能并行的子单分别 dispatch 给不同 Worker；不能并行时同样先建完全部子单，再由一个 Worker 串行完成。绝不「干完再补单」，也不许一张单覆盖多件事。
+- 用户一条消息里含多个独立任务时，必须拆成多张工单分别登记（可用 parentTicketID 关联），不得用一张单覆盖多件事。
+- 能并行的子单分别 dispatch 给不同 Worker；不能并行时同样先建完全部子单，再由一个 Worker 串行完成。绝不「干完再补单」。
 - 完成后按子单逐张 ticket_close 结单；没做完或被取代的单显式置为 failed/cancelled/superseded，不留长期 in_progress。
 - 例外：纯查询、只读问答不建单（不产生交付物）；一旦出现「要做某件事」的意图就立刻建单。
 
