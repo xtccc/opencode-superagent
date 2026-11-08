@@ -39,6 +39,26 @@ interface DispatchInput {
   readonly ticketID: string
 }
 
+/**
+ * Tickets with a dispatch currently in flight in this process. `runDispatch`
+ * checks and inserts in one synchronous block, so two concurrent dispatches of
+ * the same ticket cannot both pass: the loser fails with an explicit error
+ * instead of creating a second worker session. The claim is released on
+ * success, failure and interruption via `Effect.ensuring`.
+ */
+const inFlightTickets = new Set<string>()
+
+/** Synchronous check-and-claim: only the first caller for a ticket gets `true`. */
+function claimDispatch(ticketID: string): boolean {
+  if (inFlightTickets.has(ticketID)) return false
+  inFlightTickets.add(ticketID)
+  return true
+}
+
+function releaseDispatch(ticketID: string): void {
+  inFlightTickets.delete(ticketID)
+}
+
 /** The ticket header a worker sees first: objective and acceptance, verbatim. */
 function ticketHeader(ticket: Ticket): string {
   const acceptance = ticket.acceptance.map((item, index) => `${index + 1}. ${item}`).join("\n")
@@ -153,16 +173,39 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
     return yield* new Tool.Error({ message: "dispatch is only available to the router session" })
   }
   const routerID = store.routerID
+  // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
+  // an unknown/closed one, a thread mismatch and a ticket whose worker is
+  // still running, so no dispatch can bypass the work-order record.
+  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID)
+  // Claim the ticket synchronously before any further dispatch step. Check
+  // and insert happen in one uninterrupted block, so two concurrent calls can
+  // never both see the ticket as free and race into `sessions.create`; the
+  // loser gets an explicit error instead of a second worker.
+  if (!claimDispatch(ticket.id)) {
+    return yield* new Tool.Error({ message: `dispatch already in progress for ticket ${ticket.id}` })
+  }
+  return yield* completeDispatch(ctx, input, routerID, ticket).pipe(
+    // Success, failure and interruption all release the claim.
+    Effect.ensuring(Effect.sync(() => releaseDispatch(ticket.id))),
+  )
+})
+
+/**
+ * Body of a dispatch that already owns the ticket claim. `runDispatch` is the
+ * only caller and releases the claim on every exit path.
+ */
+const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
+  ctx: Plugin.Context,
+  input: DispatchInput,
+  routerID: string,
+  ticket: Ticket,
+) {
   const agents = ctx.agent
   const sessions = ctx.session
   const requested = input.agent ?? WORKER_AGENT
   if (input.directory !== undefined && normalizeDirectory(input.directory) === undefined) {
     return yield* new Tool.Error({ message: "dispatch directory must be an absolute path, e.g. /opt/ai-gw" })
   }
-  // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
-  // an unknown/closed one, a thread mismatch and a ticket whose worker is
-  // still running, so no dispatch can bypass the work-order record.
-  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID)
   // The ticket carries its thread; the dispatch must agree with it and
   // inherits it when the call omits one.
   const threadID = input.threadID ?? ticket.threadID
