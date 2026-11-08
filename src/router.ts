@@ -1,5 +1,5 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
-import { Effect, Option, type Schema } from "effect"
+import { Effect, Option, Semaphore, type Schema } from "effect"
 import { ROUTER_AGENT } from "./agents.js"
 import { threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
@@ -9,6 +9,14 @@ import { noteRouterTrigger } from "./ticket.js"
 import { ROUTER_PERMISSIONS } from "./tools.js"
 
 const MAX_FLUSH = 20
+
+/**
+ * Serialise flushes. A second caller waits for the in-flight flush to finish,
+ * then observes the drained queue and only flushes events enqueued meanwhile,
+ * so the same batch is never injected twice. Effect releases the permit on
+ * success, failure and interruption.
+ */
+const flushLock = Semaphore.makeUnsafe(1)
 
 /** KV prefix for crash-safe pending triggers. Owned by the router; `state.ts` stays untouched. */
 export const PENDING_PREFIX = "pending:"
@@ -179,10 +187,14 @@ export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx:
  * leave the queue (memory and KV) only after the injection succeeds; on
  * failure they stay queued for the next attempt.
  */
-export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx: Plugin.Context) {
+const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(function* (ctx: Plugin.Context) {
   if (store.pending.length === 0) return
   const routerID = yield* ensureRouter(ctx)
   const batch = store.pending.slice(0, MAX_FLUSH)
+  // Identity snapshot of this delivery. Removal below matches these ids
+  // instead of the queue prefix, so events enqueued while the injection is
+  // in flight survive.
+  const batchIDs = new Set(batch.map((item) => pendingID(item.trigger, item.arrivedAt)))
   const text = [
     `${batch.length} new event(s) for the router:`,
     ...batch.map((item) => {
@@ -200,7 +212,14 @@ export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx:
     })
     return
   }
-  store.pending.splice(0, batch.length)
+  // Remove by delivered id, never by position: the queue may have grown at
+  // the tail (or been trimmed elsewhere) while `synthetic` was awaited.
+  for (let index = store.pending.length - 1; index >= 0; index -= 1) {
+    const item = store.pending[index]
+    if (item !== undefined && batchIDs.has(pendingID(item.trigger, item.arrivedAt))) {
+      store.pending.splice(index, 1)
+    }
+  }
   // Remember what the Router was just told: `ticket_create` copies this
   // trigger into the ticket's authorization (id + quote).
   const newest = batch[batch.length - 1]
@@ -208,6 +227,14 @@ export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx:
   for (const item of batch) {
     yield* ctx.storage.remove(keyOf(item)).pipe(Effect.catch(() => Effect.void))
   }
+})
+
+/**
+ * Serialised entry point for every flush caller (idle hook, RPC, tests).
+ * Concurrent calls wait on `flushLock`, so one batch is delivered once.
+ */
+export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx: Plugin.Context) {
+  yield* flushLock.withPermit(flushPendingUnlocked(ctx))
 })
 
 /**
