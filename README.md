@@ -117,20 +117,22 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 | `report_read({ sessionID, offset?, limit? })`                                                                  | 按字符区间读取 Worker 结束报告的**完整全文**（默认 4000 字/页，上限 20000），返回总长度与 nextOffset           |
 | `abort_session({ sessionID?, reason?, all?, stale? })`                                                         | 终止/清理 Worker：中断、等待终态、标记 `aborted`、解除 thread 亲和（见下）                                     |
 
-- 只有 Router 能调这些工具（`thread_detail`/`worker_detail`/`abort_session` 复用 `status` 的权限位，Router 会话已放行；其他会话直调会被拒绝）。
+- 只有 Router 能调这些工具（`ticket_*`、`thread_detail`/`worker_detail`/`report_read`/`abort_session` 复用 `status` 的权限位，Router 会话已放行；其他会话直调会被拒绝）。
+- Router 会话的权限位由 `src/tools.ts` 的目录派生（`ROUTER_PERMISSIONS`）：新增工具必须在 spec 里声明 `permission`，`Tool.snapshot` 会按该权限位过滤，漏声明会让工具从模型可见列表里消失。
 - 所有 Spill 输出都是紧凑文本，`thread_detail`/`worker_detail` 单次总长度控制在 6000 字内，超出截断并注明；`report_read` 按页返回（默认 4000 字/页）。
 - trigger 历史持久化在 KV（`trigger:<id>`，含全文、route、sessionID）：排队事件入队即记（全文，内存同步+KV 异步），flush 后补 `route=router`；直投 Worker 的事件由 prompt 钩子补记（文本与 Worker 可见格式一致）。hydrate 只加载最近 200 条（按 createdAt 倒序），`triggerTotal` 记总数。
 
 ## 工单（Ticket）
 
-工单是「用户要什么 + 怎么算完成」的持久记录。Router 先建单再派活，Worker 的终态自动回写：
+工单是「用户要什么 + 怎么算完成」的持久记录。Router 先建单再派活，Worker 的终态自动回写。核心原则：**先建单登记意图，再决定并行或串行；工单是账本，不是派发的副产品**——拆子任务先建全部子单（`parentTicketID`），完成后逐张结单。
 
 - 状态机：`open → in_progress → blocked/done/failed/cancelled/superseded`；`blocked → in_progress` 可回；`done/failed/cancelled/superseded` 为终态，任何非法迁移都报错。`open` 也可直接 `done/failed/cancelled`（派活前就完成/放弃的情况）。
 - 必填：`objective`、`acceptance`（1-10 条）、`directory`（绝对路径）；`acceptance` 为空直接拒绝建单，避免占位单。
 - 去重：`dedupeKey` 缺省为 `sha1(source + threadID + 归一化 objective)`，建单前在同 thread 找 `open/in_progress` 的同键单，命中则返回原单并标 `reused=true`。
 - authorization：自动取 Router 最近一次被投递的 trigger（`triggerID` + 原文摘要 ≤300 字），所以每张单都能追溯「用户当时怎么说的」。
 - 存储：`ticket:<id>` 存全量记录；`ticketidx:status:<state>`、`ticketidx:thread:<threadID>`、`ticketidx:all` 是按 createdAt 倒序的派生索引（各截断 200 项）。hydrate 扫 `ticket:` 前缀重建内存与索引，索引丢失不会丢单；历史 Worker 不回填工单。
-- 联动：`dispatch({ ticketID })` 校验单据为 `open/in_progress`，写入 `workerSessionID`/`attempts` 并把单置 `in_progress`，Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 与 watchdog 置 `failed`（note=aborted / stalled）。
+- 强制：`dispatch` 的 `ticketID` 必填（工具与 RPC 同一实现）。缺失、单据不存在、单据已关闭（非 `open/in_progress`）、`threadID` 与单据不符、或单据已绑定运行中的 Worker，一律拒绝并给出可操作提示；RPC 直达同样被拦。
+- 联动：派发成功即原子绑定——写入 `workerSessionID`、`attempts` 追加一条、`state → in_progress`；绑定失败会回滚新建的 Worker 会话（不会出现「Worker 起来了但单没绑上」）。Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 与 watchdog 置 `failed`（note=aborted / stalled）。
 
 ## 单网关多目录（Router 自管，用户无需暴露映射表）
 
