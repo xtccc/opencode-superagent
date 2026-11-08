@@ -4,8 +4,15 @@ import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
 import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
-import { encodeThread, saveWorker, store, threadKey, toSessionID } from "./state.js"
-import { activeTicketSummary, getTicket, isActive, linkTicketToWorker, ticketStats, type Ticket } from "./ticket.js"
+import { encodeThread, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
+import {
+  activeTicketSummary,
+  currentTrigger,
+  linkTicketToWorker,
+  requireDispatchTicket,
+  ticketStats,
+  type Ticket,
+} from "./ticket.js"
 import { specFor } from "./tools.js"
 
 const WORKER_AGENT = "superagent-worker"
@@ -16,7 +23,7 @@ export const DispatchInput = Schema.Struct({
   threadID: Schema.optionalKey(Schema.String),
   agent: Schema.optionalKey(Schema.String),
   directory: Schema.optionalKey(Schema.String),
-  ticketID: Schema.optionalKey(Schema.String),
+  ticketID: Schema.String,
 })
 
 const StatusOutput = Schema.Struct({ text: Schema.String })
@@ -28,7 +35,7 @@ interface DispatchInput {
   readonly threadID?: string
   readonly agent?: string
   readonly directory?: string
-  readonly ticketID?: string
+  readonly ticketID: string
 }
 
 /** The ticket header a worker sees first: objective and acceptance, verbatim. */
@@ -37,11 +44,9 @@ function ticketHeader(ticket: Ticket): string {
   return `工单 ${ticket.id}: ${ticket.objective}\n验收:\n${acceptance}\n`
 }
 
-function workerPrompt(threadID: string | undefined, title: string | undefined, task: string, ticket?: Ticket): string {
-  const header = threadID === undefined ? "" : `Thread: ${threadID}\n`
+function workerPrompt(threadID: string, title: string | undefined, task: string, ticket: Ticket): string {
   const subject = title === undefined ? "" : `Title: ${title}\n`
-  const ticketLine = ticket === undefined ? "" : ticketHeader(ticket)
-  return `${ticketLine}${header}${subject}Task:\n${task}\n\nEnd with a short report: what changed, how it was verified, remaining risks.`
+  return `${ticketHeader(ticket)}Thread: ${threadID}\n${subject}Task:\n${task}\n\nEnd with a short report: what changed, how it was verified, remaining risks.`
 }
 
 function statusText(): string {
@@ -62,7 +67,37 @@ function statusText(): string {
   return lines.join("\n")
 }
 
-const runDispatch = Effect.fn("superagent.dispatch")(function* (
+/** Undo a half-created dispatch: forget the worker record and stop its session. */
+const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (ctx: Plugin.Context, sessionID: string) {
+  store.workers.delete(sessionID)
+  yield* ctx.storage
+    .remove(workerKey(sessionID))
+    .pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to remove rolled-back worker", { sessionID, cause }),
+      ),
+    )
+  yield* ctx.session
+    .interrupt({ sessionID: toSessionID(sessionID) })
+    .pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to interrupt rolled-back worker", { sessionID, cause }),
+      ),
+    )
+})
+
+/**
+ * The one dispatch implementation, shared by the `dispatch` tool and the
+ * `dispatch` RPC. Both paths pass the same ticket gate: `ticketID` is required
+ * by the schema and re-checked here, so a direct RPC call cannot skip the
+ * work order either.
+ *
+ * There is deliberately no `internal` bypass: no watchdog/resume path calls
+ * dispatch today (the watchdog reports to the Router and resume prompts an
+ * existing worker session), so every caller of this function is a real task
+ * dispatch and must be backed by a ticket.
+ */
+export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   ctx: Plugin.Context,
   input: DispatchInput,
   caller: string,
@@ -77,19 +112,13 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
   if (input.directory !== undefined && normalizeDirectory(input.directory) === undefined) {
     return yield* new Tool.Error({ message: "dispatch directory must be an absolute path, e.g. /opt/ai-gw" })
   }
-  // A dispatch may carry a ticket: it must exist and still be workable, and
-  // the ticket directory is the fallback when the call omits one.
-  const ticket = input.ticketID === undefined ? undefined : getTicket(input.ticketID)
-  if (input.ticketID !== undefined) {
-    if (ticket === undefined) {
-      return yield* new Tool.Error({ message: `unknown ticket ${input.ticketID}; create it with ticket_create first` })
-    }
-    if (!isActive(ticket)) {
-      return yield* new Tool.Error({
-        message: `ticket ${ticket.id} is ${ticket.state}; only open/in_progress tickets can be dispatched`,
-      })
-    }
-  }
+  // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
+  // an unknown/closed one, a thread mismatch and a ticket whose worker is
+  // still running, so no dispatch can bypass the work-order record.
+  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID)
+  // The ticket carries its thread; the dispatch must agree with it and
+  // inherits it when the call omits one.
+  const threadID = input.threadID ?? ticket.threadID
   const agentResolved = yield* agents.get({ agentID: Agent.ID.make(requested) }).pipe(
     Effect.map((result) => result.data.id),
     Effect.catch((cause) =>
@@ -117,16 +146,18 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
   // otherwise the ticket's directory, then thread binding / alias match,
   // otherwise follow Router. The gateway process directory itself is irrelevant.
   const requestedDir = input.directory === undefined ? undefined : normalizeDirectory(input.directory)
-  const ticketDir = ticket?.directory === undefined ? undefined : normalizeDirectory(ticket.directory)
+  const ticketDir = ticket.directory === undefined ? undefined : normalizeDirectory(ticket.directory)
   const rememberedDir = resolveDirectory({
-    threadID: input.threadID,
+    threadID,
     task: input.task,
     requested: requestedDir ?? ticketDir,
   })
   const targetDirectory = rememberedDir ?? routerDirectory
-  // A ticket carries its own thread; dispatch inherits it when the call omits one.
-  const threadID = input.threadID ?? ticket?.threadID
-  const threads = threadID === undefined ? [] : [threadID]
+  const threads = [threadID]
+  const current = currentTrigger()
+  const authorizing =
+    current !== undefined && current.threadID === threadID ? current.id : ticket.authorization.triggerID
+  const triggerID = authorizing === "" || authorizing === "unknown" ? undefined : authorizing
   const created = yield* sessions
     .create({
       // The prefix keeps workers recognizable in session lists; metadata, not
@@ -134,7 +165,7 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
       title: workerTitle({
         task: input.task,
         ...(input.title === undefined ? {} : { title: input.title }),
-        ...(threadID === undefined ? {} : { threadID }),
+        threadID,
       }),
       ...(agentResolved === undefined ? {} : { agent: agentResolved }),
       ...(input.agent === undefined && routerModel !== undefined ? { model: routerModel } : {}),
@@ -159,28 +190,31 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
   }
   // Record the worker on its ticket (open → in_progress) before the prompt
   // lands, so the watcher can close it even if the worker fails immediately.
-  if (ticket !== undefined) {
-    yield* linkTicketToWorker(ctx, {
-      ticketID: ticket.id,
-      sessionID: created.id,
-      ...(targetDirectory === undefined ? {} : { note: targetDirectory }),
-    }).pipe(
-      Effect.catch((cause) =>
-        Effect.logWarning("superagent failed to link ticket to worker", { ticketID: ticket.id, cause }),
-      ),
-    )
+  // The binding is part of the dispatch: if it fails, the half-created worker
+  // is rolled back instead of running outside the ticket it was dispatched for.
+  const linkFailure = yield* linkTicketToWorker(ctx, {
+    ticketID: ticket.id,
+    sessionID: created.id,
+    ...(targetDirectory === undefined ? {} : { note: targetDirectory }),
+  }).pipe(
+    Effect.as(undefined),
+    Effect.catchTag("Tool.Error", (error) => Effect.succeed(error.message)),
+  )
+  if (linkFailure !== undefined) {
+    yield* rollbackDispatch(ctx, created.id)
+    return yield* new Tool.Error({
+      message: `dispatch aborted: could not bind ticket ${ticket.id} to the new worker (${linkFailure})`,
+    })
   }
-  if (threadID !== undefined) {
-    const existing = store.threads.get(threadID) ?? []
-    if (!existing.includes(created.id)) existing.push(created.id)
-    // Affinity lists persist after workers end; cap them so long-lived
-    // threads don't grow unbounded in memory and KV.
-    if (existing.length > 20) existing.splice(0, existing.length - 20)
-    store.threads.set(threadID, existing)
-    yield* ctx.storage
-      .set(threadKey(threadID), encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }))
-      .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
-  }
+  const existing = store.threads.get(threadID) ?? []
+  if (!existing.includes(created.id)) existing.push(created.id)
+  // Affinity lists persist after workers end; cap them so long-lived
+  // threads don't grow unbounded in memory and KV.
+  if (existing.length > 20) existing.splice(0, existing.length - 20)
+  store.threads.set(threadID, existing)
+  yield* ctx.storage
+    .set(threadKey(threadID), encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }))
+    .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
   yield* sessions
     .prompt({
       sessionID: created.id,
@@ -189,10 +223,9 @@ const runDispatch = Effect.fn("superagent.dispatch")(function* (
     })
     .pipe(Effect.mapError((cause) => new Tool.Error({ message: `failed to prompt worker session: ${String(cause)}` })))
   const where = targetDirectory === undefined ? "gateway default directory" : targetDirectory
-  const ticketNote = ticket === undefined ? "" : ` Ticket ${ticket.id} is now in_progress.`
   return {
     output: { sessionID: created.id },
-    content: `Worker ${created.id} started in ${where} in the background and will report back. Do not poll; wait for its report.${ticketNote}`,
+    content: `Worker ${created.id} started in ${where} in the background and will report back. Do not poll; wait for its report. Ticket ${ticket.id} is now in_progress.`,
   }
 })
 

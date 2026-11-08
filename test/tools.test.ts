@@ -106,7 +106,8 @@ describe("superagent tool catalog", () => {
       .params.filter((param) => param.required)
       .map((param) => param.name)
     expect(required).toEqual(["threadID", "title", "objective", "acceptance", "directory"])
-    expect(specFor("dispatch").params.some((param) => param.name === "ticketID")).toBe(true)
+    // No dispatch without a ticket: the parameter is mandatory in the catalog.
+    expect(specFor("dispatch").params.find((param) => param.name === "ticketID")?.required).toBe(true)
   })
 
   test("every spec is renderable and documented", () => {

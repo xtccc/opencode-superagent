@@ -3,7 +3,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Effect, type Schema } from "effect"
 import { createHash } from "node:crypto"
 import { normalizeDirectory } from "./dirs.js"
-import type { TriggerInput } from "./state.js"
+import { store, type TriggerInput } from "./state.js"
 import { displayWidth, wrapText } from "./tools.js"
 
 /**
@@ -727,6 +727,50 @@ export function listTickets(input: ListTicketsInput = {}): Array<Ticket> {
     .sort((left, right) => right.updatedAt - left.updatedAt)
     .slice(0, limit)
 }
+
+/**
+ * Gate every dispatch must pass: a dispatch always names a ticket, and that
+ * ticket must be workable right now. The rules are enforced here (not in the
+ * prompt) so a Router cannot dispatch without a ticket, onto a closed ticket,
+ * across threads, or onto a ticket that already has a running worker.
+ */
+export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket")(function* (
+  ticketID: string | undefined,
+  threadID: string | undefined,
+) {
+  if (ticketID === undefined || ticketID.trim() === "") {
+    return yield* new Tool.Error({ message: "dispatch requires ticketID; create a ticket with ticket_create first" })
+  }
+  const ticket = tickets.get(ticketID)
+  if (ticket === undefined) {
+    return yield* new Tool.Error({
+      message: `unknown ticket ${ticketID}; create it with ticket_create first, then dispatch({ ticketID })`,
+    })
+  }
+  if (!ACTIVE_STATES.includes(ticket.state)) {
+    const hint =
+      ticket.state === "blocked"
+        ? 'reopen it with ticket_update({ status: "in_progress" })'
+        : "create a new ticket with ticket_create"
+    return yield* new Tool.Error({
+      message: `ticket ${ticket.id} is ${ticket.state}; only open/in_progress tickets can be dispatched — ${hint}`,
+    })
+  }
+  if (threadID !== undefined && threadID !== ticket.threadID) {
+    return yield* new Tool.Error({
+      message: `ticket ${ticket.id} belongs to thread ${ticket.threadID}, not ${threadID}; dispatch with threadID=${ticket.threadID} or ticket_create a ticket for ${threadID}`,
+    })
+  }
+  // One ticket never runs two workers at once: the previous worker must be
+  // terminal (aborted, failed, done) before anything is dispatched again.
+  const workerID = ticket.workerSessionID
+  if (workerID !== undefined && store.workers.get(workerID)?.state === "running") {
+    return yield* new Tool.Error({
+      message: `ticket ${ticket.id} already has a running worker ${workerID}; wait for it or abort_session it first, then ticket_create a new ticket for the re-dispatch`,
+    })
+  }
+  return ticket
+})
 
 export interface LinkTicketInput {
   readonly ticketID: string

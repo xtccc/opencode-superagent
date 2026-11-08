@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import { registerAbort, runAbort } from "./src/abort.js"
 import { registerContext } from "./src/context.js"
 import { hydrateDirs } from "./src/dirs.js"
-import { registerTools } from "./src/dispatch.js"
+import { registerTools, runDispatch } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { hydrateReports } from "./src/report.js"
@@ -115,6 +115,16 @@ export default Plugin.define({
             }),
           ).pipe(Effect.map((text) => ({ text }))),
         ticket: (input) => Effect.sync(() => ({ text: renderTicketText(input.ticketID) })),
+        // RPC dispatches go through the same implementation as the tool, so
+        // the ticket gate (required ticketID, workable state, thread match, no
+        // running worker) cannot be skipped by calling the RPC directly.
+        dispatch: (input, context) =>
+          runDispatch(ctx, input, store.routerID ?? "").pipe(
+            Effect.map((result) => result.output),
+            Effect.catchTag("Tool.Error", (error) =>
+              Effect.fail(context.error("dispatch.rejected", error.message, {})),
+            ),
+          ),
         trigger: (input) =>
           runTrigger(ctx, input).pipe(
             Effect.catch((cause) =>

@@ -48,6 +48,21 @@ export const Definition = Rpc.define({
       input: Schema.toStandardSchemaV1(Schema.Struct({ ticketID: Schema.String })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),
     },
+    dispatch: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          task: Schema.String,
+          title: Schema.optionalKey(Schema.String),
+          threadID: Schema.optionalKey(Schema.String),
+          agent: Schema.optionalKey(Schema.String),
+          directory: Schema.optionalKey(Schema.String),
+          // Required: the RPC path enforces the same work-order gate as the tool.
+          ticketID: Schema.String,
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ sessionID: Schema.String })),
+      errors: { "dispatch.rejected": Schema.toStandardSchemaV1(Schema.Struct({})) },
+    },
     trigger: {
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
