@@ -12,5 +12,5 @@
     "jsxImportSource": "@opentui/solid",
     "lib": ["ESNext", "DOM", "DOM.Iterable"]
   },
-  "include": ["server.ts", "tui.tsx", "src", "test"]
+  "include": ["server.ts", "tui.tsx", "src", "script", "test"]
 }

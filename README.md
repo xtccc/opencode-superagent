@@ -20,6 +20,28 @@
 
 ## 安装与启用
 
+### 从 npm 安装（发布形态）
+
+发布包名是 `opencode-superagent`，与主仓版本线解耦（独立从 `0.1.0` 起步），`exports` 指向预构建产物，不需要在本地编译 TypeScript 或 TSX：
+
+```sh
+opencode plugin add opencode-superagent
+```
+
+或在 `opencode.jsonc` 里按包名声明（TUI 会把包装进 opencode 自己的插件缓存目录）：
+
+```jsonc
+{
+  "plugins": ["opencode-superagent"],
+}
+```
+
+- `dist/server.js` 由 `tsc` 产出，`dist/tui.js` 由 `bun build` + `@opentui/solid/bun-plugin` 预打包。必须预打包的原因：OpenCode 的运行时 Solid transform 会跳过 `node_modules` 里的文件，直接发 `tui.tsx` 会留下裸 JSX，加载时报 `Cannot find module 'react/jsx-dev-runtime'`。
+- `agent/*.md` 随包内置（见下面第 2 条），agent 定义由插件在 setup 里程序化注册，**不需要复制任何 markdown 文件**。
+- 安装后同样要关闭 Location 空闲回收（见下面本地安装的第 3 条），然后重启 TUI。
+
+### 本地开发安装（仓库内）
+
 1. 在项目或全局 `opencode.jsonc` 中把插件目录加入 `plugins`。注意：相对路径是**相对于配置文件所在目录**解析的（见 `packages/core/src/config/plugin/source.ts` 的 `scan`：以 `path.dirname(entry.path)` 为基准 `resolve` 以 `./` 或 `../` 开头的目标），不是相对仓库根目录：
 
    项目级（配置文件是 `.opencode/opencode.jsonc`，需上一级再进 `packages/`）：
@@ -243,6 +265,11 @@ packages/plugins/superagent/
 ├── agent/
 │   ├── superagent-router.md     # Router agent 模板（mode: primary，可按需定制，非运行必需）
 │   └── superagent-worker.md     # Worker agent 模板（mode: subagent，可按需定制，非运行必需）
+├── script/build.ts              # 构建：tsc（server + d.ts）→ bun build（tui.js）
+├── tsconfig.json                # 类型检查（noEmit，含 test/script）
+├── tsconfig.build.json          # 构建：server.ts + src → dist/*.js + *.d.ts
+├── tsconfig.build.tui.json      # 构建：只为 tui.tsx 产出 dist/tui.d.ts
+├── LICENSE                      # MIT（版权人占位，见「发布与构建」）
 └── README.md
 ```
 
@@ -274,6 +301,25 @@ bun run --cwd packages/plugins/superagent typecheck:tsc  # tsc --noEmit，CI 口
 ```
 
 不要在仓库根目录直接运行测试（仓库有 `do-not-run-tests-from-root` 保护）；需要跑测试时进入对应包目录。
+
+## 发布与构建
+
+```sh
+cd packages/plugins/superagent
+bun run build          # 清空 dist/，tsc 产出 server + d.ts，bun build 产出 tui.js
+npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build）
+```
+
+- **构建产物**：`dist/server.js` + `dist/server.d.ts` + `dist/src/*.js|.d.ts`（`tsc -p tsconfig.build.json`）；`dist/tui.js`（`Bun.build`，插件 `@opentui/solid/bun-plugin`，内联 `src/` 里 TUI 用到的纯函数）；`dist/tui.d.ts`（`tsc -p tsconfig.build.tui.json`，`emitDeclarationOnly`）。`dist/` 里没有任何 `.ts`/`.tsx` 入口，也没有指向源码的导入。
+- **外置模块**：两份产物都把 `effect`、`@opencode/plugin`、`@opencode/client`、`@opentui/*`、`solid-js` 保持为裸导入。OpenCode 宿主提供这些单例，并会拒绝从插件 `node_modules` 加载 `effect`/`@opencode/plugin` 的副本。
+- **依赖划分**：`@opencode/schema`（`Tool`、`AbsolutePath` 等运行时用的 schema 助手）是真正的 `dependencies`，宿主不提供它；`@opencode/plugin`、`effect`、`@opentui/solid`、`solid-js` 挂在 `peerDependencies` 且标 `optional`，因为它们只由宿主提供、npm 不该再装一份（`optional` 是为了避免裸 `npm install` 时的噪声告警）。
+- **包字段**：`exports` 指向 `./dist/server.js` 与 `./dist/tui.js`（类型由同名 `.d.ts` 解析）；`files` 为 `dist`、`agent`、`README.md`、`LICENSE`；`publishConfig.access: public`。
+- **待用户确认的占位**：`repository`/`homepage`/`bugs` 用的是 `xtccc/opencode-superagent`（发布前请确认这个 GitHub 仓库就是目标仓库，不行就整体替换）；`LICENSE` 的版权人现为 `<COPYRIGHT HOLDER>`，需确认署名。两处都只影响元数据，不影响加载。
+- **已知限制**：
+  - `tui.d.ts` 只声明默认导出的 `Plugin.Definition`，不描述 `setup` 内部类型；TUI 插件是动态加载的，消费方通常只需要包名。
+  - `dist/tui.js` 约 41 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。
+  - `@opencode/schema` 会带上自己的一份 `effect`（其 manifest 的 dependency）。运行时所有 `effect` 导入都被宿主接管，这份副本不会被求值，只是多占几 MB 磁盘。
+  - 包版本 `0.1.0` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
 
 ## Watchdog
 

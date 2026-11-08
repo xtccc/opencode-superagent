@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig.json",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Types only: `script/build.ts` bundles `tui.tsx` into `dist/tui.js` with
+    // OpenTUI's solid transform, so the emitted declaration describes the
+    // bundle's entry shape without a matching `dist/tui.js` from tsc.
+    "allowImportingTsExtensions": false,
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "rootDir": ".",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": false
+  },
+  "include": ["tui.tsx"],
+  "exclude": ["test", "server.ts"]
+}

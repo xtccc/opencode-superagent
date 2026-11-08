@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig.json",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The server half is plain ESM: tsc emits it beside its declarations and
+    // leaves `effect` / `@opencode/*` as bare specifiers, because the OpenCode
+    // host owns those modules at runtime.
+    "allowImportingTsExtensions": false,
+    "noEmit": false,
+    "rootDir": ".",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["server.ts", "src"],
+  "exclude": ["test", "tui.tsx"]
+}

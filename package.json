@@ -1,40 +1,75 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "@opencode/plugin-superagent",
-  "version": "2.2.5",
-  "description": "Superagent P0 prototype: a resident router session with background worker sessions",
+  "name": "opencode-superagent",
+  "version": "0.1.0",
+  "description": "Superagent: a resident router agent that dispatches background worker agents in OpenCode",
   "type": "module",
   "license": "MIT",
+  "private": false,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xtccc/opencode-superagent.git",
-    "directory": "packages/plugins/superagent"
+    "url": "git+https://github.com/xtccc/opencode-superagent.git"
   },
   "homepage": "https://github.com/xtccc/opencode-superagent#readme",
   "bugs": {
     "url": "https://github.com/xtccc/opencode-superagent/issues"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
-    ".": "./server.ts",
-    "./server": "./server.ts",
-    "./tui": "./tui.tsx"
+    ".": "./dist/server.js",
+    "./server": "./dist/server.js",
+    "./tui": "./dist/tui.js"
   },
   "files": [
-    "server.ts",
-    "tui.tsx",
-    "src",
-    "agent"
+    "dist",
+    "agent",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agent",
+    "orchestration"
   ],
   "scripts": {
+    "build": "bun run script/build.ts",
+    "prepare": "bun run build",
+    "prepack": "bun run build",
     "test": "bun test",
     "typecheck": "bun check --no-script",
     "typecheck:tsc": "tsc --noEmit"
   },
+  "dependencies": {
+    "@opencode/schema": "^2.2.5"
+  },
   "peerDependencies": {
     "@opencode/plugin": "^2.0.27 || ^0.0.0-dev",
-    "effect": "^4.1.0 || ^0.0.0-dev"
+    "@opentui/solid": ">=0.8.1",
+    "effect": "^4.1.0 || ^0.0.0-dev",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "effect": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@opencode/client": "workspace:*",
     "@opencode/plugin": "workspace:*",
     "@opencode/schema": "workspace:*",
     "@opentui/solid": "catalog:",
