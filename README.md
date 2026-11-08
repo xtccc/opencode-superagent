@@ -217,7 +217,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 - 批量结果返回数量与逐条清单（`aborted N, already ended M, session missing K`）。
 - 已知限制：`aborted` 记录不会自动回收，只在下次进程启动 `hydrate` 时按会话是否存在清理；`stale` 会解除 thread 亲和，等于放弃该 thread 的“追问回到原 Worker”。
 
-## 会话区分（title 前缀 / metadata / 列表角标）
+## 会话区分（title 前缀 / metadata）
 
 - **判定以 metadata 为准**：Router 建会话写 `metadata.superagent = { role: "router" }`，Worker 写
   `{ role: "worker", threads }`（`src/session-meta.ts` 的 `superagentMetadata`）。title 用户可改，
@@ -226,11 +226,12 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
   `superagentRole(metadata)`、`isSuperagentSession(session)`、`isRouterSession(session)`、`isWorkerSession(session)`。
 - **幂等回填**：`hydrateSessionMeta` 在进程启动 `hydrate` 之后，对 Router id 与 KV 里已知的 Worker 记录补写
   `metadata.superagent`（role 已匹配则跳过，其余 metadata 合并而非覆盖）。老会话因此跨重启也能被识别。
-- **title 前缀**：Worker 标题为 `🔧 worker-<thread 简写>-<任务摘要>`（`workerTitle`），Router 为
-  `🧭 router-main`。前缀只用于列表里肉眼可辨；用户改名不影响识别。
-- **TUI 角标**：Sessions 列表（`packages/tui/src/component/dialog-session-list.tsx`）用
-  `sessionRoleBadge`（`packages/tui/src/util/session.ts`）在行右侧显示 `[worker]` / `[router]`：
-  metadata 优先，绑定 agent（`superagent-worker` / `superagent-router`）兜底，手动会话无角标。
+- **title 前缀就是 TUI 里的区分手段**：Worker 标题为 `🔧 worker-<thread 简写>-<任务摘要>`（`workerTitle`），
+  Router 为 `🧭 router-main`。TUI 不做插件专有的渲染/装饰，用户靠会话列表里的这两个前缀辨认：`🔧 worker-…`
+  是后台 Worker，`🧭 router-main` 是 Router。
+- **metadata 只做持久化判定**：`metadata.superagent` 是身份判定的**权威**来源（过滤、统计、`hydrate` 回填、
+  `abort_session` 校验都读它），但**不在 TUI 展示**——它不进 title，也不派生角标/列。title 前缀纯粹给人看，
+  用户改名不影响任何判定。
 
 ## 文件结构
 
@@ -259,7 +260,7 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 - **反向派活与接管**：Worker 不能创建子任务，Router 也不能在多轮后重新接管 thread。
 - **Watchdog**：检测长时间无进展的 Worker，超时后取消、重试或交还 Router。
 - **真实信道**：把 TUI 演示事件换成 IM、GitHub issue/comment、Webhook 等来源，并补上签名与去重。
-- **隐藏 Worker**：让 Worker 会话不出现在普通会话列表，只通过 Router 暴露进度（当前只做 title 前缀 + `[worker]` 角标，未做过滤/分组）。
+- **隐藏 Worker**：让 Worker 会话不出现在普通会话列表，只通过 Router 暴露进度（当前只做 title 前缀，未做过滤/分组）。
 - **持久化与并发**：事件去重、断线重放、跨进程 thread 租约，以及多 TUI 实例的一致性。
 - **工单 P1**：内存只保留最近 500 张单（更早的仍在 KV，重启后回到内存），跨进程/多实例的工单索引尚未同步；被中断但未 `abort_session` 的 Worker 会让工单停在 `in_progress`，需要 Router 手动推进。
 - **工单 P2**：工单与验收标准的自动核验、按工单聚合的用量/成本统计、工单看板与通知推送。
