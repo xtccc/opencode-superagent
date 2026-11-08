@@ -242,7 +242,9 @@ export function getTicket(ticketID: string): Ticket | undefined {
 /** Same-thread, same-dedupe-key ticket still open or in progress, if any. */
 export function findDuplicate(threadID: string, dedupeKey: string): Ticket | undefined {
   const ids = byThread.get(threadID)
-  const candidates = ids === undefined ? [...tickets.values()] : [...ids].flatMap((id) => tickets.get(id) ?? [])
+  // No ids means this thread owns no in-memory ticket, so there is nothing to reuse.
+  if (ids === undefined) return undefined
+  const candidates = [...ids].flatMap((id) => tickets.get(id) ?? [])
   return candidates.find((ticket) => ticket.dedupeKey === dedupeKey && ACTIVE_STATES.includes(ticket.state))
 }
 
