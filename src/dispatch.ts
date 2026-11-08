@@ -7,7 +7,9 @@ import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
 import {
+  activeTicketForWorker,
   activeTicketSummary,
+  closeTicket,
   currentTrigger,
   linkTicketToWorker,
   requireDispatchTicket,
@@ -66,8 +68,54 @@ function statusText(): string {
   return lines.join("\n")
 }
 
-/** Undo a half-created dispatch: forget the worker record and stop its session. */
-const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (ctx: Plugin.Context, sessionID: string) {
+/**
+ * Undo a half-created dispatch: fail the ticket bound to the worker, detach
+ * the worker from its thread affinity lists, forget the worker record and stop
+ * its session. Every step is best-effort after the first failure, so one
+ * storage problem cannot leave the whole dispatch half-rolled-back.
+ */
+const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (
+  ctx: Plugin.Context,
+  sessionID: string,
+  reason: string,
+) {
+  // Fail the ticket while the worker → ticket edge still exists, so the
+  // Router sees why the dispatch never started instead of a stuck in_progress.
+  const ticket = activeTicketForWorker(sessionID)
+  if (ticket !== undefined) {
+    yield* closeTicket(ctx, {
+      ticketID: ticket.id,
+      outcome: "failed",
+      summary: `dispatch rollback: ${reason}`,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to fail ticket for rolled-back worker", {
+          sessionID,
+          ticketID: ticket.id,
+          cause,
+        }),
+      ),
+    )
+  }
+  // Thread affinity is written before the prompt; drop the worker from every
+  // list it was added to so the thread falls back to the Router.
+  const worker = store.workers.get(sessionID)
+  if (worker !== undefined) {
+    for (const threadID of worker.threads) {
+      const current = store.threads.get(threadID)
+      if (current === undefined || !current.includes(sessionID)) continue
+      const next = current.filter((id) => id !== sessionID)
+      if (next.length === 0) {
+        store.threads.delete(threadID)
+        yield* ctx.storage.remove(threadKey(threadID)).pipe(Effect.catch(() => Effect.void))
+      } else {
+        store.threads.set(threadID, next)
+        yield* ctx.storage
+          .set(threadKey(threadID), encodeThread({ threadID, workers: next, updatedAt: Date.now() }))
+          .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
+      }
+    }
+  }
   store.workers.delete(sessionID)
   yield* ctx.storage
     .remove(workerKey(sessionID))
@@ -214,7 +262,7 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
     Effect.catchTag("Tool.Error", (error) => Effect.succeed(error.message)),
   )
   if (linkFailure !== undefined) {
-    yield* rollbackDispatch(ctx, created.id)
+    yield* rollbackDispatch(ctx, created.id, `could not bind ticket ${ticket.id} to the new worker (${linkFailure})`)
     return yield* new Tool.Error({
       message: `dispatch aborted: could not bind ticket ${ticket.id} to the new worker (${linkFailure})`,
     })
@@ -228,13 +276,24 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   yield* ctx.storage
     .set(threadKey(threadID), encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }))
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
-  yield* sessions
+  // Prompt delivery is part of the dispatch: if the worker never receives its
+  // task, the ticket, thread affinity and worker record must not stay behind.
+  const promptFailure = yield* sessions
     .prompt({
       sessionID: created.id,
       text: workerPrompt(threadID, input.title, input.task, ticket),
       delivery: "queue",
     })
-    .pipe(Effect.mapError((cause) => new Tool.Error({ message: `failed to prompt worker session: ${String(cause)}` })))
+    .pipe(
+      Effect.as(undefined),
+      Effect.catch((cause) => Effect.succeed(String(cause))),
+    )
+  if (promptFailure !== undefined) {
+    yield* rollbackDispatch(ctx, created.id, `failed to prompt worker session: ${promptFailure}`)
+    return yield* new Tool.Error({
+      message: `dispatch aborted: failed to prompt worker session: ${promptFailure}`,
+    })
+  }
   const where = targetDirectory === undefined ? "gateway default directory" : targetDirectory
   return {
     output: { sessionID: created.id },
