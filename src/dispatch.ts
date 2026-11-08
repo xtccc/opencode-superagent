@@ -7,7 +7,9 @@ import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
 import {
+  activeTicketForWorker,
   activeTicketSummary,
+  closeTicket,
   currentTrigger,
   linkTicketToWorker,
   requireDispatchTicket,
@@ -35,6 +37,26 @@ interface DispatchInput {
   readonly agent?: string
   readonly directory?: string
   readonly ticketID: string
+}
+
+/**
+ * Tickets with a dispatch currently in flight in this process. `runDispatch`
+ * checks and inserts in one synchronous block, so two concurrent dispatches of
+ * the same ticket cannot both pass: the loser fails with an explicit error
+ * instead of creating a second worker session. The claim is released on
+ * success, failure and interruption via `Effect.ensuring`.
+ */
+const inFlightTickets = new Set<string>()
+
+/** Synchronous check-and-claim: only the first caller for a ticket gets `true`. */
+function claimDispatch(ticketID: string): boolean {
+  if (inFlightTickets.has(ticketID)) return false
+  inFlightTickets.add(ticketID)
+  return true
+}
+
+function releaseDispatch(ticketID: string): void {
+  inFlightTickets.delete(ticketID)
 }
 
 /** The ticket header a worker sees first: objective and acceptance, verbatim. */
@@ -66,8 +88,54 @@ function statusText(): string {
   return lines.join("\n")
 }
 
-/** Undo a half-created dispatch: forget the worker record and stop its session. */
-const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (ctx: Plugin.Context, sessionID: string) {
+/**
+ * Undo a half-created dispatch: fail the ticket bound to the worker, detach
+ * the worker from its thread affinity lists, forget the worker record and stop
+ * its session. Every step is best-effort after the first failure, so one
+ * storage problem cannot leave the whole dispatch half-rolled-back.
+ */
+const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (
+  ctx: Plugin.Context,
+  sessionID: string,
+  reason: string,
+) {
+  // Fail the ticket while the worker → ticket edge still exists, so the
+  // Router sees why the dispatch never started instead of a stuck in_progress.
+  const ticket = activeTicketForWorker(sessionID)
+  if (ticket !== undefined) {
+    yield* closeTicket(ctx, {
+      ticketID: ticket.id,
+      outcome: "failed",
+      summary: `dispatch rollback: ${reason}`,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to fail ticket for rolled-back worker", {
+          sessionID,
+          ticketID: ticket.id,
+          cause,
+        }),
+      ),
+    )
+  }
+  // Thread affinity is written before the prompt; drop the worker from every
+  // list it was added to so the thread falls back to the Router.
+  const worker = store.workers.get(sessionID)
+  if (worker !== undefined) {
+    for (const threadID of worker.threads) {
+      const current = store.threads.get(threadID)
+      if (current === undefined || !current.includes(sessionID)) continue
+      const next = current.filter((id) => id !== sessionID)
+      if (next.length === 0) {
+        store.threads.delete(threadID)
+        yield* ctx.storage.remove(threadKey(threadID)).pipe(Effect.catch(() => Effect.void))
+      } else {
+        store.threads.set(threadID, next)
+        yield* ctx.storage
+          .set(threadKey(threadID), encodeThread({ threadID, workers: next, updatedAt: Date.now() }))
+          .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
+      }
+    }
+  }
   store.workers.delete(sessionID)
   yield* ctx.storage
     .remove(workerKey(sessionID))
@@ -105,16 +173,39 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
     return yield* new Tool.Error({ message: "dispatch is only available to the router session" })
   }
   const routerID = store.routerID
+  // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
+  // an unknown/closed one, a thread mismatch and a ticket whose worker is
+  // still running, so no dispatch can bypass the work-order record.
+  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID)
+  // Claim the ticket synchronously before any further dispatch step. Check
+  // and insert happen in one uninterrupted block, so two concurrent calls can
+  // never both see the ticket as free and race into `sessions.create`; the
+  // loser gets an explicit error instead of a second worker.
+  if (!claimDispatch(ticket.id)) {
+    return yield* new Tool.Error({ message: `dispatch already in progress for ticket ${ticket.id}` })
+  }
+  return yield* completeDispatch(ctx, input, routerID, ticket).pipe(
+    // Success, failure and interruption all release the claim.
+    Effect.ensuring(Effect.sync(() => releaseDispatch(ticket.id))),
+  )
+})
+
+/**
+ * Body of a dispatch that already owns the ticket claim. `runDispatch` is the
+ * only caller and releases the claim on every exit path.
+ */
+const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
+  ctx: Plugin.Context,
+  input: DispatchInput,
+  routerID: string,
+  ticket: Ticket,
+) {
   const agents = ctx.agent
   const sessions = ctx.session
   const requested = input.agent ?? WORKER_AGENT
   if (input.directory !== undefined && normalizeDirectory(input.directory) === undefined) {
     return yield* new Tool.Error({ message: "dispatch directory must be an absolute path, e.g. /opt/ai-gw" })
   }
-  // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
-  // an unknown/closed one, a thread mismatch and a ticket whose worker is
-  // still running, so no dispatch can bypass the work-order record.
-  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID)
   // The ticket carries its thread; the dispatch must agree with it and
   // inherits it when the call omits one.
   const threadID = input.threadID ?? ticket.threadID
@@ -214,7 +305,7 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
     Effect.catchTag("Tool.Error", (error) => Effect.succeed(error.message)),
   )
   if (linkFailure !== undefined) {
-    yield* rollbackDispatch(ctx, created.id)
+    yield* rollbackDispatch(ctx, created.id, `could not bind ticket ${ticket.id} to the new worker (${linkFailure})`)
     return yield* new Tool.Error({
       message: `dispatch aborted: could not bind ticket ${ticket.id} to the new worker (${linkFailure})`,
     })
@@ -228,13 +319,24 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   yield* ctx.storage
     .set(threadKey(threadID), encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }))
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
-  yield* sessions
+  // Prompt delivery is part of the dispatch: if the worker never receives its
+  // task, the ticket, thread affinity and worker record must not stay behind.
+  const promptFailure = yield* sessions
     .prompt({
       sessionID: created.id,
       text: workerPrompt(threadID, input.title, input.task, ticket),
       delivery: "queue",
     })
-    .pipe(Effect.mapError((cause) => new Tool.Error({ message: `failed to prompt worker session: ${String(cause)}` })))
+    .pipe(
+      Effect.as(undefined),
+      Effect.catch((cause) => Effect.succeed(String(cause))),
+    )
+  if (promptFailure !== undefined) {
+    yield* rollbackDispatch(ctx, created.id, `failed to prompt worker session: ${promptFailure}`)
+    return yield* new Tool.Error({
+      message: `dispatch aborted: failed to prompt worker session: ${promptFailure}`,
+    })
+  }
   const where = targetDirectory === undefined ? "gateway default directory" : targetDirectory
   return {
     output: { sessionID: created.id },
