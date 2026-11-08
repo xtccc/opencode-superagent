@@ -42,12 +42,10 @@
 
    如果已有 `plugins`，追加该项，不要覆盖其他插件。
 
-2. 放置 agent 定义：
-   - 项目级：把 `agent/superagent-router.md` 和 `agent/superagent-worker.md` 复制到 `.opencode/agent/`。
-   - 全局：复制到 `~/.config/opencode/agents/`。
-
-   两个文件的 frontmatter 都只有 `description` 和 `mode`：
-   `superagent-router.md` 是 `mode: primary`，`superagent-worker.md` 是 `mode: subagent`。
+2. agent 定义由插件在 setup 里程序化注册（`src/agents.ts` 的 `registerAgents`），**不需要手工复制任何 agent 文件**。项目里已有的 `.opencode/agent/superagent-*.md` 仍然优先（文件覆盖注册的同名字段），可用于定制；想回到纯插件定义就删掉这些副本。
+   - `agent/*.md` 只是模板：随包发布，用于定制参考，以及在旧内核（`editor.update` 不会为未知 id 兜底创建）上手工兜底。注册失败时插件会打一条 warn 日志并列出没注册上的 id。
+   - 模板与代码里的定义由 `test/agent-definition.test.ts` 逐字段比对，改一边会立刻报错。
+   - `superagent-router` 是 `mode: primary` + `hidden: true`，`superagent-worker` 是 `mode: subagent`。
 
 3. 关闭 Location 空闲回收，避免后台 Worker 会话被当作空闲会话清理：
 
@@ -240,10 +238,11 @@ packages/plugins/superagent/
 ├── tui.tsx                      # TUI 入口：keymap、slash 命令、RPC 调用、侧栏工单面板
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
 ├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
+├── src/agents.ts                # Router/Worker agent 的程序化注册（插件 setup 调用）
 ├── src/                          # 服务端 Router/Worker/批处理实现
 ├── agent/
-│   ├── superagent-router.md     # Router agent 模板（mode: primary）
-│   └── superagent-worker.md     # Worker agent 模板（mode: subagent）
+│   ├── superagent-router.md     # Router agent 模板（mode: primary，可按需定制，非运行必需）
+│   └── superagent-worker.md     # Worker agent 模板（mode: subagent，可按需定制，非运行必需）
 └── README.md
 ```
 

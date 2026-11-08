@@ -1,6 +1,7 @@
 import { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
 import { registerAbort, runAbort } from "./src/abort.js"
+import { registerAgents } from "./src/agents.js"
 import { registerContext } from "./src/context.js"
 import { hydrateDirs } from "./src/dirs.js"
 import { registerTools, runDispatch } from "./src/dispatch.js"
@@ -68,6 +69,8 @@ export default Plugin.define({
   id: "opencode.superagent",
   effect: Effect.fn(function* (ctx) {
     yield* hydrate(ctx)
+    // Before any session work: the Router and Worker sessions resolve their agent by id.
+    yield* registerAgents(ctx)
     yield* hydratePending(ctx)
     yield* hydrateDirs(ctx)
     yield* hydrateSessionMeta(ctx)

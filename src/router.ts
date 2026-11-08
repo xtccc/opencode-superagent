@@ -1,5 +1,6 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
 import { Effect, Option, type Schema } from "effect"
+import { ROUTER_AGENT } from "./agents.js"
 import { threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
@@ -7,7 +8,6 @@ import { ROUTER_KEY, store, toSessionID, type PendingTrigger, type TriggerInput 
 import { noteRouterTrigger } from "./ticket.js"
 import { ROUTER_PERMISSIONS } from "./tools.js"
 
-const ROUTER_AGENT = "superagent-router"
 const MAX_FLUSH = 20
 
 /** KV prefix for crash-safe pending triggers. Owned by the router; `state.ts` stays untouched. */

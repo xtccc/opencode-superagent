@@ -2,6 +2,7 @@ import { Agent, type Plugin } from "@opencode/plugin/effect"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
+import { WORKER_AGENT } from "./agents.js"
 import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
@@ -14,8 +15,6 @@ import {
   type Ticket,
 } from "./ticket.js"
 import { specFor } from "./tools.js"
-
-const WORKER_AGENT = "superagent-worker"
 
 export const DispatchInput = Schema.Struct({
   task: Schema.String,
