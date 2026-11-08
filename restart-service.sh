@@ -11,16 +11,10 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-# Token 只判空、不打印。正式环境 Token 来自登录 shell 的 ~/.zshrc 导出。
-if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  echo "WARN: 当前 shell 没有 TELEGRAM_BOT_TOKEN，重启后 Telegram 适配器会停用" >&2
-  echo "      先执行：export TELEGRAM_BOT_TOKEN='<BotFather token>'（不要回显到聊天里）" >&2
-fi
-
 echo "restarting opencode background service..."
 "$BIN" service restart
 sleep 3
 echo "--- service status ---"
 "$BIN" service status
-echo "--- 验证：应有一行 telegram polling enabled（token 正常）或 telegram disabled（无 token）---"
-echo "tail -n 50 ~/.local/share/opencode/log/opencode.log | grep -i 'superagent telegram'"
+echo "--- 验证：日志应只有 superagent 的 router/worker 行 ---"
+echo "tail -n 50 ~/.local/share/opencode/log/opencode.log | grep -i 'superagent'"

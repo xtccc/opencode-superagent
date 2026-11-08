@@ -5,7 +5,6 @@ import { registerTools } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
-import { registerTelegram } from "./src/telegram.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
@@ -20,16 +19,14 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
   // workers get everything; otherwise the most recent idle/done worker is
   // resumed (prompting a finished session starts a new execution in it, and
   // the watcher flips it back to running). Failed workers are skipped so the
-  // next message gets a fresh dispatch through the Router. Truly new tasks
-  // start with /new, which clears the thread affinity.
+  // next message gets a fresh dispatch through the Router. A genuinely new
+  // thread (no affinity record) starts with the Router.
   const subscribed = store.threads.get(input.threadID) ?? []
   const running = subscribed.filter((sessionID) => store.workers.get(sessionID)?.state === "running")
-  const resumed = [...subscribed]
-    .reverse()
-    .find((sessionID) => {
-      const state = store.workers.get(sessionID)?.state
-      return state === "idle" || state === "done"
-    })
+  const resumed = [...subscribed].reverse().find((sessionID) => {
+    const state = store.workers.get(sessionID)?.state
+    return state === "idle" || state === "done"
+  })
   const targets = running.length > 0 ? running : resumed === undefined ? [] : [resumed]
   if (targets.length > 0) {
     const sessions = ctx.session
@@ -71,7 +68,6 @@ export default Plugin.define({
     yield* registerRouterIdle(ctx)
     yield* registerWatcher(ctx)
     yield* registerWatchdog(ctx)
-    yield* registerTelegram(ctx, (input) => runTrigger(ctx, input))
     yield* ctx.rpc
       .register(Definition, {
         router: () =>

@@ -2,7 +2,6 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Option, Stream } from "effect"
 import { ensureRouter } from "./router.js"
 import { saveWorker, store, toSessionID } from "./state.js"
-import { reportWorkerToTelegram } from "./telegram.js"
 
 const REPORT_LIMIT = 1200
 
@@ -71,11 +70,8 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   yield* saveWorker(ctx, worker)
   // Keep the thread subscriptions after the worker ends: follow-ups on the
   // same thread resume this worker (prompting a finished session starts a new
-  // execution in it) instead of spawning a fresh session per message. The
-  // user starts a genuinely new task with /new, which clears the affinity.
-  yield* reportWorkerToTelegram(ctx, sessionID).pipe(
-    Effect.catch((cause) => Effect.logWarning("superagent telegram report failed", { sessionID, cause })),
-  )
+  // execution in it) instead of spawning a fresh session per message. A
+  // genuinely new task clears the affinity.
   const info = yield* sessions.get({ sessionID: toSessionID(sessionID) }).pipe(
     Effect.map((session) => session as { outcome?: unknown }),
     Effect.catch(() => Effect.succeed(undefined)),
