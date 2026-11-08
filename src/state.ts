@@ -7,6 +7,15 @@ export type WorkerState = "running" | "idle" | "failed" | "done" | "aborted"
 export interface WorkerRecord {
   readonly sessionID: string
   readonly title?: string
+  /**
+   * Primary thread this worker was dispatched for. Legacy records decode to
+   * `""` and `hydrate` backfills it from `thread.workers`, so every live record
+   * carries a forward link to its thread without losing the multi-thread
+   * `threads` list.
+   */
+  threadID: string
+  /** Trigger that authorized the dispatch, when the record knows it. */
+  triggerID?: string
   readonly threads: Array<string>
   state: WorkerState
   readonly createdAt: number
@@ -49,6 +58,8 @@ export interface TriggerRecord {
   readonly createdAt: number
   route?: TriggerRoute
   sessionID?: string
+  /** Workers dispatched from this trigger (reverse of `WorkerRecord.triggerID`). */
+  workerIDs?: Array<string>
 }
 
 export interface DirectTriggerInput {
@@ -226,9 +237,14 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
   const threads = stringArray(value["threads"])
   if (threads === undefined) return undefined
   const createdAt = optionalNumber(value, "createdAt") ?? 0
+  const triggerID = optionalString(value, "triggerID")
   return {
     sessionID: value["sessionID"],
     title: optionalString(value, "title"),
+    // Legacy records have no `threadID`; hydrate backfills it from the thread
+    // record (or `threads[0]`) and persists the result.
+    threadID: optionalString(value, "threadID") ?? "",
+    ...(triggerID === undefined ? {} : { triggerID }),
     threads,
     state: value["state"] as WorkerState,
     createdAt,
@@ -259,6 +275,7 @@ export function decodeTrigger(value: Schema.Json | undefined): TriggerRecord | u
   const route = value["route"]
   if (route !== undefined && (typeof route !== "string" || !ROUTES.includes(route as TriggerRoute))) return undefined
   const sessionID = optionalString(value, "sessionID")
+  const workerIDs = stringArray(value["workerIDs"])
   return {
     id: value["id"],
     source: value["source"],
@@ -269,6 +286,7 @@ export function decodeTrigger(value: Schema.Json | undefined): TriggerRecord | u
     createdAt: optionalNumber(value, "createdAt") ?? 0,
     ...(route === undefined ? {} : { route: route as TriggerRoute }),
     ...(sessionID === undefined ? {} : { sessionID }),
+    ...(workerIDs === undefined || workerIDs.length === 0 ? {} : { workerIDs }),
   }
 }
 
@@ -276,6 +294,8 @@ export function encodeWorker(record: WorkerRecord): Schema.Json {
   return {
     sessionID: record.sessionID,
     ...(record.title === undefined ? {} : { title: record.title }),
+    ...(record.threadID === "" ? {} : { threadID: record.threadID }),
+    ...(record.triggerID === undefined ? {} : { triggerID: record.triggerID }),
     threads: [...record.threads],
     state: record.state,
     createdAt: record.createdAt,
@@ -304,6 +324,7 @@ export function encodeTrigger(record: TriggerRecord): Schema.Json {
     createdAt: record.createdAt,
     ...(record.route === undefined ? {} : { route: record.route }),
     ...(record.sessionID === undefined ? {} : { sessionID: record.sessionID }),
+    ...(record.workerIDs === undefined || record.workerIDs.length === 0 ? {} : { workerIDs: [...record.workerIDs] }),
   } as unknown as Schema.Json
 }
 
@@ -411,6 +432,56 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
   for (const record of collected.slice(0, RECENT_TRIGGER_LIMIT)) {
     if (!store.triggers.has(record.id)) store.triggers.set(record.id, record)
   }
+  // ── reference graph backfill (idempotent) ──────────────────────────────────
+  // New records carry `threadID`/`triggerID`/`workerIDs`; legacy records only
+  // have `threads`. Rebuild a missing edge from what is still authoritative
+  // (the thread affinity list, or the opposite edge) and persist only changed
+  // records, so a second hydrate writes nothing and only a stat line is logged.
+  let backfilledWorkers = 0
+  let backfilledTriggers = 0
+  for (const [threadID, workerIDs] of store.threads) {
+    for (const sessionID of workerIDs) {
+      const worker = store.workers.get(sessionID)
+      if (worker === undefined || worker.threadID !== "") continue
+      worker.threadID = threadID
+      backfilledWorkers += 1
+      yield* persistWorker(ctx, worker)
+    }
+  }
+  for (const worker of store.workers.values()) {
+    if (worker.threadID !== "") continue
+    const primary = worker.threads[0]
+    if (primary === undefined) continue
+    worker.threadID = primary
+    backfilledWorkers += 1
+    yield* persistWorker(ctx, worker)
+  }
+  for (const worker of store.workers.values()) {
+    const triggerID = worker.triggerID
+    if (triggerID === undefined) continue
+    const trigger = store.triggers.get(triggerID)
+    if (trigger === undefined) continue
+    const ids = trigger.workerIDs ?? []
+    if (ids.includes(worker.sessionID)) continue
+    trigger.workerIDs = [...ids, worker.sessionID]
+    backfilledTriggers += 1
+    yield* persistTrigger(ctx, trigger)
+  }
+  for (const trigger of store.triggers.values()) {
+    for (const sessionID of trigger.workerIDs ?? []) {
+      const worker = store.workers.get(sessionID)
+      if (worker === undefined || worker.triggerID !== undefined) continue
+      worker.triggerID = trigger.id
+      backfilledWorkers += 1
+      yield* persistWorker(ctx, worker)
+    }
+  }
+  if (backfilledWorkers > 0 || backfilledTriggers > 0) {
+    yield* Effect.logInfo("superagent reference graph backfilled", {
+      workers: backfilledWorkers,
+      triggers: backfilledTriggers,
+    })
+  }
 })
 
 /** Every worker write refreshes `updatedAt`, so an aborted record keeps a traceable timestamp. */
@@ -420,6 +491,29 @@ export const saveWorker = Effect.fn("superagent.saveWorker")(function* (ctx: Plu
 })
 
 export const saveTrigger = persistTrigger
+
+/**
+ * Record the worker on the trigger that authorized it (`trigger.workerIDs`),
+ * completing the reverse edge of `WorkerRecord.triggerID`. Memory holds only
+ * the newest triggers, so an older trigger is read from KV once; a missing
+ * trigger is not invented. Repeating the call is a no-op.
+ */
+export const linkTriggerToWorker = Effect.fn("superagent.linkTriggerToWorker")(function* (
+  ctx: Plugin.Context,
+  triggerID: string,
+  sessionID: string,
+) {
+  const existing = store.triggers.get(triggerID)
+  const record =
+    existing ??
+    decodeTrigger(yield* ctx.storage.get(triggerKey(triggerID)).pipe(Effect.catch(() => Effect.succeed(undefined))))
+  if (record === undefined) return false
+  const workerIDs = record.workerIDs ?? []
+  if (workerIDs.includes(sessionID)) return false
+  record.workerIDs = [...workerIDs, sessionID]
+  yield* persistTrigger(ctx, record)
+  return true
+})
 
 export const saveThread = Effect.fn("superagent.saveThread")(function* (ctx: Plugin.Context, record: ThreadRecord) {
   yield* ctx.storage

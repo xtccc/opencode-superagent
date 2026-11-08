@@ -55,6 +55,7 @@ const ROUTER = "ses_router"
 function worker(sessionID: string, overrides: Partial<WorkerRecord> = {}): WorkerRecord {
   return {
     sessionID,
+    threadID: "thread:1",
     threads: ["thread:1"],
     state: "done",
     createdAt: 1_000,

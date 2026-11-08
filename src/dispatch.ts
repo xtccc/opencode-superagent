@@ -4,7 +4,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
 import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
-import { encodeThread, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
+import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
 import {
   activeTicketSummary,
   currentTrigger,
@@ -176,6 +176,12 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   const record = {
     sessionID: created.id,
     title: created.title ?? input.title,
+    // Forward edges: worker → primary thread and worker → authorizing trigger.
+    // The ticket's authorization is the trigger that created the work order;
+    // a newer router trigger on the same thread wins because it is the one
+    // that actually asked for this dispatch.
+    threadID,
+    ...(triggerID === undefined ? {} : { triggerID }),
     threads,
     state: "running" as const,
     createdAt: Date.now(),
@@ -183,6 +189,14 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   }
   store.workers.set(created.id, record)
   yield* saveWorker(ctx, record)
+  // Complete the reverse edge (trigger → worker) so the dispatch can be traced
+  // from the message that caused it. A missing trigger is not an error: the
+  // ticket remains the durable record in that case.
+  if (triggerID !== undefined) {
+    yield* linkTriggerToWorker(ctx, triggerID, created.id).pipe(
+      Effect.catch((cause) => Effect.logWarning("superagent failed to link trigger to worker", { cause })),
+    )
+  }
   if (targetDirectory !== undefined) {
     yield* rememberDirectory(ctx, { threadID, directory: targetDirectory }).pipe(
       Effect.catch((cause) => Effect.logWarning("superagent failed to remember directory", { cause })),

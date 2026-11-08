@@ -123,6 +123,7 @@ describe("dispatch requires a work ticket", () => {
     await succeed(linkTicketToWorker(ctx, { ticketID: created.ticket.id, sessionID: "ses_worker_1" }))
     store.workers.set("ses_worker_1", {
       sessionID: "ses_worker_1",
+      threadID: THREAD,
       threads: [THREAD],
       state: "running",
       createdAt: 1,
