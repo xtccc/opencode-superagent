@@ -1,6 +1,8 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import type { Session } from "@opencode/schema/session"
-import { Effect, type Schema } from "effect"
+import { DateTime, Effect, type Schema } from "effect"
+import { buildReport, lastAssistantText, reportSummary, saveReport } from "./report.js"
+import { closeTicketsForWorker } from "./ticket.js"
 
 export type WorkerState = "running" | "idle" | "failed" | "done" | "aborted"
 
@@ -208,6 +210,14 @@ export const triggerKey = (id: string) => `${TRIGGER_PREFIX}${id}`
 /** Brands are compile-time only, so a validated session id string converts freely. */
 export const toSessionID = (id: string) => id as Session.ID
 
+/** A Session is running while `time.busy` is newer than the last completed execution's `time.idle`. */
+export function isRunning(info: Session.Info): boolean {
+  const busy = info.time.busy
+  if (busy === undefined) return false
+  const idle = info.time.idle
+  return idle === undefined || DateTime.toEpochMillis(busy) > DateTime.toEpochMillis(idle)
+}
+
 const STATES: ReadonlyArray<WorkerState> = ["running", "idle", "failed", "done", "aborted"]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -348,6 +358,53 @@ const removeWorker = Effect.fn("superagent.removeWorker")(function* (ctx: Plugin
 })
 
 /**
+ * Reconcile one hydrated `running` record with the live session. A session
+ * that is still executing keeps `running`; one that finished while the plugin
+ * was down is backfilled the same way the watcher would have handled it:
+ * capture the last assistant report, persist the terminal/interrupted state,
+ * and close its ticket for `done`/`failed`.
+ */
+const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(function* (
+  ctx: Plugin.Context,
+  record: WorkerRecord,
+  info: Session.Info,
+) {
+  if (isRunning(info)) return
+  const state: WorkerState =
+    info.outcome === "succeeded" ? "done" : info.outcome === "failed" ? "failed" : "idle"
+  record.state = state
+  const sessions = ctx.session
+  const messages =
+    typeof sessions.context === "function"
+      ? yield* sessions
+          .context({ sessionID: toSessionID(record.sessionID) })
+          .pipe(Effect.catch(() => Effect.succeed([] as ReadonlyArray<unknown>)))
+      : ([] as ReadonlyArray<unknown>)
+  const report = lastAssistantText(messages)
+  if (report !== undefined) {
+    const captured = buildReport(record.sessionID, report)
+    yield* saveReport(ctx, captured)
+    record.lastReport = reportSummary(captured)
+  }
+  yield* saveWorker(ctx, record)
+  if (state === "done" || state === "failed") {
+    yield* closeTicketsForWorker(ctx, {
+      sessionID: record.sessionID,
+      outcome: state,
+      summary: record.lastReport ?? report ?? `${state} (worker ${record.sessionID})`,
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to close ticket for rehydrated worker", {
+          sessionID: record.sessionID,
+          cause,
+        }),
+      ),
+    )
+  }
+  yield* Effect.logInfo("superagent rehydrated ended worker", { sessionID: record.sessionID, state })
+})
+
+/**
  * Load KV state into the in-memory maps. Storage is the unique source of
  * truth; every loaded session is validated with `session.get` and stale
  * entries are cleaned from both memory and KV.
@@ -388,6 +445,7 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
         continue
       }
       store.workers.set(record.sessionID, record)
+      if (record.state === "running") yield* reconcileRunningWorker(ctx, record, info)
     }
     after = page.next
   } while (after !== undefined)

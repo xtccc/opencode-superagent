@@ -84,6 +84,31 @@ export function reportNotice(record: ReportRecord): string {
   return `全文长度 ${record.length}${clip}，可用 report_read 读取（sessionID: ${record.sessionID}）`
 }
 
+/**
+ * Last non-empty assistant text in a session-context snapshot. Shared by the
+ * live watcher and startup hydration so a crash-recovered worker gets the
+ * same report extraction as one that ended while the plugin was running.
+ */
+export function lastAssistantText(messages: ReadonlyArray<unknown>): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (typeof message !== "object" || message === null) continue
+    const typed = message as { type?: unknown; content?: unknown }
+    if (typed.type !== "assistant") continue
+    if (!Array.isArray(typed.content)) continue
+    const text = typed.content
+      .flatMap((part) => {
+        if (typeof part !== "object" || part === null) return []
+        const candidate = part as { type?: unknown; text?: unknown }
+        return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : []
+      })
+      .join("\n")
+      .trim()
+    if (text !== "") return text
+  }
+  return undefined
+}
+
 /** Page through a stored report; the caller validates offset against `stored`. */
 export function sliceReport(record: ReportRecord, offset: number, limit: number): ReportSlice {
   const stored = record.text.length

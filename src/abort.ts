@@ -1,9 +1,8 @@
 import type { Plugin } from "@opencode/plugin/effect"
-import type { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
-import { DateTime, Effect, Option, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { requireRouter } from "./guard.js"
-import { encodeThread, saveWorker, store, threadKey, toSessionID } from "./state.js"
+import { encodeThread, isRunning, saveWorker, store, threadKey, toSessionID } from "./state.js"
 import { closeTicketsForWorker } from "./ticket.js"
 import { specFor, toolPermission } from "./tools.js"
 
@@ -34,14 +33,6 @@ interface AbortResult {
   readonly interrupted: boolean
   readonly timedOut: boolean
   readonly threads: ReadonlyArray<string>
-}
-
-/** A Session is running while `time.busy` is newer than the last completed execution's `time.idle`. */
-function isRunning(info: Session.Info): boolean {
-  const busy = info.time.busy
-  if (busy === undefined) return false
-  const idle = info.time.idle
-  return idle === undefined || DateTime.toEpochMillis(busy) > DateTime.toEpochMillis(idle)
 }
 
 function abortNote(reason: string | undefined, detail: string, previous: string | undefined): string {
@@ -110,17 +101,24 @@ const abortWorker = Effect.fn("superagent.abortWorker")(function* (
     yield* saveWorker(ctx, worker)
     return { sessionID, status: "missing" as const, interrupted: false, timedOut: false, threads }
   }
-  if (!running) {
-    worker.lastReport = abortNote(reason, "already ended", previous)
-    yield* saveWorker(ctx, worker)
-    return { sessionID, status: "already-ended" as const, interrupted: false, timedOut: false, threads }
-  }
+  // Interrupt unconditionally: when the session is not executing this is a
+  // harmless no-op, but it still clears a prompt queued behind the previous
+  // execution so it cannot start after abort returned.
   const interrupted = yield* ctx.session.interrupt({ sessionID: toSessionID(sessionID) }).pipe(
     Effect.map((result) => result.interrupted),
     Effect.catch((cause) =>
       Effect.logWarning("superagent abort interrupt failed", { sessionID, cause }).pipe(Effect.as(false)),
     ),
   )
+  if (!running) {
+    worker.lastReport = abortNote(
+      reason,
+      interrupted ? "interrupted queued prompt" : "already ended",
+      previous,
+    )
+    yield* saveWorker(ctx, worker)
+    return { sessionID, status: "already-ended" as const, interrupted, timedOut: false, threads }
+  }
   const settled = yield* ctx.session.wait({ sessionID: toSessionID(sessionID) }).pipe(
     Effect.timeoutOption(ABORT_TIMEOUT_MS),
     Effect.catch((cause) =>

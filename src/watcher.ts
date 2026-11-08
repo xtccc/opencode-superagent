@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Stream } from "effect"
-import { buildReport, reportNotice, reportSummary, saveReport } from "./report.js"
+import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport } from "./report.js"
 import { ensureRouter } from "./router.js"
 import { saveWorker, store, toSessionID, type WorkerRecord } from "./state.js"
 import { closeTicketsForWorker } from "./ticket.js"
@@ -21,26 +21,6 @@ export const captureReport = Effect.fn("superagent.captureReport")(function* (
   worker.lastReport = reportSummary(record)
   return record
 })
-
-function lastAssistantText(messages: ReadonlyArray<unknown>): string | undefined {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]
-    if (typeof message !== "object" || message === null) continue
-    const typed = message as { type?: unknown; content?: unknown }
-    if (typed.type !== "assistant") continue
-    if (!Array.isArray(typed.content)) continue
-    const text = typed.content
-      .flatMap((part) => {
-        if (typeof part !== "object" || part === null) return []
-        const candidate = part as { type?: unknown; text?: unknown }
-        return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : []
-      })
-      .join("\n")
-      .trim()
-    if (text !== "") return text
-  }
-  return undefined
-}
 
 function errorDetail(data: unknown): string | undefined {
   if (typeof data !== "object" || data === null) return undefined
@@ -63,6 +43,21 @@ function interruptDetail(data: unknown): string | undefined {
   const reason = (data as { reason?: unknown }).reason
   return typeof reason === "string" && reason !== "" ? `interrupted (${reason})` : "interrupted"
 }
+
+/**
+ * Apply a `session.idle` notification. Only a running worker may become idle:
+ * `done`, `failed` and `aborted` are terminal for the lifecycle, and an idle
+ * event must never resurrect or overwrite them.
+ */
+export const handleIdle = Effect.fn("superagent.workerIdle")(function* (
+  ctx: Plugin.Context,
+  sessionID: string,
+) {
+  const worker = store.workers.get(sessionID)
+  if (worker === undefined || worker.state !== "running") return
+  worker.state = "idle"
+  yield* saveWorker(ctx, worker)
+})
 
 const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   ctx: Plugin.Context,
@@ -181,10 +176,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
               return
             }
             case "session.idle": {
-              const worker = store.workers.get(sessionID)
-              if (worker === undefined || worker.state === "idle" || worker.state === "aborted") return
-              worker.state = "idle"
-              yield* saveWorker(ctx, worker)
+              yield* handleIdle(ctx, sessionID)
               return
             }
             default:
