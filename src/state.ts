@@ -167,15 +167,37 @@ export interface Store {
   triggerTotal: number
 }
 
-export const store: Store = {
-  routerID: undefined,
-  routerBusy: false,
-  workers,
-  threads: new Map(),
-  pending: new PendingQueue(),
-  triggers: new Map(),
-  triggerTotal: 0,
+/**
+ * Process-wide symbol for the store object. A module-level store is safe while
+ * the host reuses one module instance, but a duplicate plugin copy (two install
+ * paths for the same version, or a re-reconciliation) would hydrate its own
+ * maps. `sleep` could then poll a store that the watcher never writes and
+ * silently sleep the full time. Sharing the object on `globalThis` keeps the
+ * tool, the watcher and the RPC surface on the same state.
+ *
+ * Cross-version copies cannot share (older code has no such symbol), so the
+ * upgrade path still requires a gateway restart; `versionNotice` says so.
+ */
+const STORE_KEY = Symbol.for("opencode-superagent.store.v1")
+
+type GlobalWithStore = typeof globalThis & { [STORE_KEY]?: Store }
+
+const globals = globalThis as GlobalWithStore
+
+function createStore(): Store {
+  return {
+    routerID: undefined,
+    routerBusy: false,
+    workers,
+    threads: new Map(),
+    pending: new PendingQueue(),
+    triggers: new Map(),
+    triggerTotal: 0,
+  }
 }
+
+export const store: Store = globals[STORE_KEY] ?? createStore()
+globals[STORE_KEY] = store
 
 export const ROUTER_KEY = "router"
 export const WORKER_PREFIX = "worker:"

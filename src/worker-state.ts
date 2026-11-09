@@ -48,8 +48,23 @@ export interface WorkerRecord {
   notified?: Array<WorkerState>
 }
 
+/**
+ * Process-wide symbol for the worker registry. The host may instantiate one
+ * plugin module per workspace (and may even load a second copy of the same
+ * version from another install path); a module-level map would then diverge
+ * and `sleep` could watch a registry the watcher never writes. Keeping the
+ * registry on `globalThis` makes every in-process copy of this plugin share
+ * one registry, so a completion is never silently missed.
+ */
+const WORKERS_KEY = Symbol.for("opencode-superagent.workers.v1")
+
+type GlobalWithWorkers = typeof globalThis & { [WORKERS_KEY]?: Map<string, WorkerRecord> }
+
+const globals = globalThis as GlobalWithWorkers
+
 /** Canonical in-memory worker registry; `store.workers` points at this map. */
-export const workers = new Map<string, WorkerRecord>()
+export const workers: Map<string, WorkerRecord> = globals[WORKERS_KEY] ?? new Map<string, WorkerRecord>()
+globals[WORKERS_KEY] = workers
 
 /**
  * Worker states after which the ticket may be dispatched again. `idle` is not

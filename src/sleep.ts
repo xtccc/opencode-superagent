@@ -63,17 +63,10 @@ export interface SleepDeps {
 }
 
 interface WorkSnapshot {
-  readonly pending: number
-  readonly terminal: number
-}
-
-/** Current plugin state the loop watches: queued triggers and terminal workers. */
-function snapshotWork(): WorkSnapshot {
-  let terminal = 0
-  for (const worker of store.workers.values()) {
-    if (isWorkerTerminal(worker.state)) terminal += 1
-  }
-  return { pending: store.pending.length, terminal }
+  /** Pending trigger identities, so a queue that is drained and refilled still wakes. */
+  readonly pending: ReadonlySet<string>
+  /** Terminal workers by session id; the value changes when the record is rewritten. */
+  readonly terminal: ReadonlyMap<string, string>
 }
 
 interface Wake {
@@ -83,19 +76,63 @@ interface Wake {
   readonly flush: boolean
 }
 
+interface TriggerIdentityInput {
+  readonly id?: string
+  readonly source: string
+  readonly threadID: string
+  readonly createdAt?: number
+}
+
+function triggerIdentity(trigger: TriggerIdentityInput, arrivedAt: number): string {
+  return trigger.id ?? `${trigger.source}:${trigger.threadID}:${trigger.createdAt ?? arrivedAt}`
+}
+
+/**
+ * Current plugin state the loop watches: queued triggers and terminal workers.
+ *
+ * Identity-based snapshots (not plain counters) matter: a counter misses a
+ * completion when a terminal worker is resumed in the same interval, and a
+ * queue length misses a trigger when an idle flush drains one while a new one
+ * arrives. Both are real concurrent paths (watcher resumes workers; the idle
+ * hook flushes the queue), and either would silently sleep the full time.
+ */
+function snapshotWork(): WorkSnapshot {
+  const terminal = new Map<string, string>()
+  for (const worker of store.workers.values()) {
+    if (isWorkerTerminal(worker.state)) {
+      terminal.set(worker.sessionID, `${worker.state}@${worker.updatedAt ?? 0}`)
+    }
+  }
+  const pending = new Set<string>()
+  for (const item of store.pending) pending.add(triggerIdentity(item.trigger, item.arrivedAt))
+  return { pending, terminal }
+}
+
 /** Compare the live state against the baseline sampled before waiting. */
 function wakeFor(baseline: WorkSnapshot, current: WorkSnapshot): Wake | undefined {
-  const completed = current.terminal - baseline.terminal
-  const queued = current.pending - baseline.pending
+  let arrived = 0
+  for (const id of current.pending) if (!baseline.pending.has(id)) arrived += 1
+  let drained = 0
+  for (const id of baseline.pending) if (!current.pending.has(id)) drained += 1
+  let completed = 0
+  let changed = 0
+  for (const [sessionID, signature] of current.terminal) {
+    const previous = baseline.terminal.get(sessionID)
+    if (previous === undefined) completed += 1
+    else if (previous !== signature) changed += 1
+  }
+  // A terminal worker that left the terminal set was resumed/deleted: the
+  // state moved even though the terminal count may have stayed the same.
+  for (const sessionID of baseline.terminal.keys()) if (!current.terminal.has(sessionID)) changed += 1
   const parts: Array<string> = []
   // Pending is listed first: when new triggers arrive they must be flushed,
   // even if a worker also finished in the same interval.
-  if (queued > 0) parts.push(`${queued} new event(s)`)
-  else if (queued < 0) parts.push("pending queue changed")
+  if (arrived > 0) parts.push(`${arrived} new event(s)`)
+  else if (drained > 0) parts.push("pending queue changed")
   if (completed > 0) parts.push(completed === 1 ? "worker completed" : `${completed} workers completed`)
-  else if (completed < 0) parts.push("worker state changed")
+  else if (changed > 0) parts.push("worker state changed")
   if (parts.length === 0) return undefined
-  return { reason: parts.join(", "), flush: queued > 0 }
+  return { reason: parts.join(", "), flush: arrived > 0 }
 }
 
 export const runSleep = Effect.fn("superagent.sleep")(function* (
