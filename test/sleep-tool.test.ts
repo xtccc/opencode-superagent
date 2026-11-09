@@ -2,18 +2,37 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { beforeEach, describe, expect, test } from "bun:test"
 import { Duration, Effect, Exit, Fiber } from "effect"
 import { filterSessionTools, registerContext } from "../src/context.js"
-import { registerSleep, runSleep, SLEEP_DEFAULT_SECONDS } from "../src/sleep.js"
+import {
+  registerSleep,
+  runSleep,
+  SLEEP_DEFAULT_SECONDS,
+  SLEEP_MAX_SECONDS,
+  SLEEP_POLL_MS,
+} from "../src/sleep.js"
 import { store } from "../src/state.js"
 import { ROUTER_PERMISSIONS, ROUTER_TOOLS, specFor, toolPermission } from "../src/tools.js"
 
 const ROUTER = "ses_router"
 const WORKER = "ses_worker"
 
-/** Records the seconds each call would have slept; no timer ever runs. */
-function recorder() {
-  const calls: Array<number> = []
-  const sleeper = (seconds: number) => Effect.sync(() => void calls.push(seconds))
-  return { calls, sleeper }
+/**
+ * Virtual clock: every poll advances the clock instead of waiting, so a 60s
+ * sleep finishes in microseconds and the interval sequence is observable.
+ */
+function virtualClock() {
+  let current = 0
+  const polls: Array<number> = []
+  return {
+    polls,
+    deps: {
+      now: () => current,
+      poll: (millis: number) =>
+        Effect.sync(() => {
+          polls.push(millis)
+          current += millis
+        }),
+    },
+  }
 }
 
 async function succeed<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
@@ -32,48 +51,53 @@ beforeEach(() => {
   store.routerID = ROUTER
   store.workers.clear()
   store.threads.clear()
+  store.pending.length = 0
 })
 
 describe("sleep tool validation", () => {
   test("defaults to 30 seconds without really sleeping", async () => {
-    const { calls, sleeper } = recorder()
+    const { deps, polls } = virtualClock()
     const started = performance.now()
-    const result = await succeed(runSleep({}, ROUTER, sleeper))
+    const result = await succeed(runSleep({}, ROUTER, deps))
     expect(result.content).toBe("slept 30s")
     expect(result.output).toEqual({ slept: 30, text: "slept 30s" })
     expect(SLEEP_DEFAULT_SECONDS).toBe(30)
-    expect(calls).toEqual([30])
+    // 30s at a 250ms interval: a timer every poll, never a busy loop.
+    expect(polls).toHaveLength(120)
+    expect(polls.every((millis) => millis === SLEEP_POLL_MS)).toBe(true)
     expect(performance.now() - started).toBeLessThan(500)
   })
 
   test("custom seconds are passed through unchanged", async () => {
-    const { calls, sleeper } = recorder()
-    const result = await succeed(runSleep({ seconds: 45 }, ROUTER, sleeper))
+    const { deps, polls } = virtualClock()
+    const result = await succeed(runSleep({ seconds: 45 }, ROUTER, deps))
     expect(result.content).toBe("slept 45s")
     expect(result.output).toEqual({ slept: 45, text: "slept 45s" })
-    expect(calls).toEqual([45])
+    expect(polls).toHaveLength(180)
   })
 
-  test("the 1 and 600 boundaries are accepted", async () => {
-    const { calls, sleeper } = recorder()
-    expect((await succeed(runSleep({ seconds: 1 }, ROUTER, sleeper))).content).toBe("slept 1s")
-    expect((await succeed(runSleep({ seconds: 600 }, ROUTER, sleeper))).content).toBe("slept 600s")
-    expect(calls).toEqual([1, 600])
+  test("the 1 and 60 boundaries are accepted", async () => {
+    const { deps, polls } = virtualClock()
+    expect((await succeed(runSleep({ seconds: 1 }, ROUTER, deps))).content).toBe("slept 1s")
+    // 60 is the new hard ceiling; 600 is no longer reachable.
+    expect((await succeed(runSleep({ seconds: 60 }, ROUTER, deps))).content).toBe("slept 60s")
+    expect(SLEEP_MAX_SECONDS).toBe(60)
+    expect(polls).toHaveLength(4 + 240)
   })
 
-  test("zero, negative, above 600 and non-numbers are rejected", async () => {
-    const { calls, sleeper } = recorder()
-    const outOfRange = [0, -1, 601, Number.NaN, Number.POSITIVE_INFINITY]
+  test("zero, negative, above 60 and non-numbers are rejected", async () => {
+    const { deps, polls } = virtualClock()
+    const outOfRange = [0, -1, 61, 600, Number.NaN, Number.POSITIVE_INFINITY]
     for (const seconds of outOfRange) {
-      const message = await failure(runSleep({ seconds } as never, ROUTER, sleeper))
-      expect(message).toContain("between 1 and 600")
+      const message = await failure(runSleep({ seconds } as never, ROUTER, deps))
+      expect(message).toContain("between 1 and 60")
     }
-    const notNumber = await failure(runSleep({ seconds: "abc" } as never, ROUTER, sleeper))
+    const notNumber = await failure(runSleep({ seconds: "abc" } as never, ROUTER, deps))
     expect(notNumber).toContain("must be a number")
-    const fractional = await failure(runSleep({ seconds: 1.5 } as never, ROUTER, sleeper))
+    const fractional = await failure(runSleep({ seconds: 1.5 } as never, ROUTER, deps))
     expect(fractional).toContain("must be an integer")
-    // No invalid input ever reaches the sleeper.
-    expect(calls).toEqual([])
+    // No invalid input ever reaches the poller.
+    expect(polls).toEqual([])
   })
 })
 
@@ -156,13 +180,13 @@ describe("sleep is router-only", () => {
   })
 
   test("a worker calling sleep directly is refused", async () => {
-    const { calls, sleeper } = recorder()
-    const message = await failure(runSleep({ seconds: 1 }, WORKER, sleeper))
+    const { deps, polls } = virtualClock()
+    const message = await failure(runSleep({ seconds: 1 }, WORKER, deps))
     expect(message).toContain("sleep is only available to the router session")
-    expect(calls).toEqual([])
+    expect(polls).toEqual([])
   })
 
-  test("registration uses the catalog permission action", async () => {
+  test("registration uses the catalog permission action and passes the host context", async () => {
     const registered: Array<{ name: string; description: string; options?: { permission?: string } }> = []
     const editor = { add: (tool: (typeof registered)[number]) => registered.push(tool) }
     const ctx = {

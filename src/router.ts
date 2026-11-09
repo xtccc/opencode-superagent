@@ -14,6 +14,14 @@ import { ROUTER_PERMISSIONS } from "./tools.js"
 const MAX_FLUSH = 20
 
 /**
+ * How a delivered batch enters the router session. `queue` waits for the next
+ * prompt boundary; `steer` is used by the interruptible `sleep` so a trigger
+ * that woke the router is visible at the very next step boundary instead of
+ * after the current turn finishes.
+ */
+export type FlushDelivery = "queue" | "steer"
+
+/**
  * Serialise flushes. A second caller waits for the in-flight flush to finish,
  * then observes the drained queue and only flushes events enqueued meanwhile,
  * so the same batch is never injected twice. Effect releases the permit on
@@ -215,7 +223,10 @@ export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx:
  * id, so replaying the same queue (hydrate after a crash) is deduped by the
  * host instead of appending a second copy.
  */
-const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(function* (ctx: Plugin.Context) {
+const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(function* (
+  ctx: Plugin.Context,
+  delivery: FlushDelivery = "queue",
+) {
   if (store.pending.length === 0) return
   const routerID = yield* ensureRouter(ctx)
   const batch = store.pending.slice(0, MAX_FLUSH)
@@ -244,7 +255,7 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
       id: batchMessageID(batch),
       text,
       description: "superagent triggers",
-      delivery: "queue",
+      delivery,
     })
     .pipe(Effect.option)
   if (Option.isNone(delivered)) {
@@ -272,9 +283,13 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
 /**
  * Serialised entry point for every flush caller (idle hook, RPC, tests).
  * Concurrent calls wait on `flushLock`, so one batch is delivered once.
+ * `delivery` defaults to `queue`; `sleep` passes `steer` for its wake flush.
  */
-export const flushPending = Effect.fn("superagent.flushPending")(function* (ctx: Plugin.Context) {
-  yield* flushLock.withPermit(flushPendingUnlocked(ctx))
+export const flushPending = Effect.fn("superagent.flushPending")(function* (
+  ctx: Plugin.Context,
+  options: { readonly delivery?: FlushDelivery } = {},
+) {
+  yield* flushLock.withPermit(flushPendingUnlocked(ctx, options.delivery ?? "queue"))
 })
 
 /**

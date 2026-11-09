@@ -138,7 +138,7 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 | 工具                                                                                                           | 用途                                                                                                           |
 | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `dispatch`                                                                                                     | 派活给后台 Worker，可并行多次调用                                                                              |
-| `sleep({ seconds? })`                                                                                          | 暂停 Router 指定秒数（默认 30，范围 1..600 的整数），Goal 模式下 dispatch 后给 Worker 执行时间；真实定时器，不忙等 |
+| `sleep({ seconds? })`                                                                                          | 暂停 Router 指定秒数（默认 30，范围 1..60 的整数），每 250ms 检查 Worker 终态与新 trigger，变化即提前返回；Goal 模式下 dispatch 后给 Worker 执行时间；真实定时器，不忙等 |
 | `ticket_create({ threadID, title, objective, acceptance, directory, priority?, parentTicketID?, dedupeKey? })` | 建工单：`objective`/`acceptance`(1-10 条)/`directory` 必填，同 thread 同 dedupeKey 自动复用（reused=true）     |
 | `ticket_list({ threadID?, status?, since?, limit? })`                                                          | 按 thread/状态/更新时间列工单（默认 20 条，上限 100），含 id/state/title/priority/更新时间/worker              |
 | `ticket_update({ ticketID, status?, note? })`                                                                  | 按状态机推进工单（open→in_progress→blocked/done/failed/cancelled/superseded），非法迁移报错                    |
@@ -150,7 +150,7 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 | `abort_session({ sessionID?, reason?, all?, stale? })`                                                         | 终止/清理 Worker：中断、等待终态、标记 `aborted`、解除 thread 亲和（见下）                                     |
 
 - 只有 Router 能调这些工具（`dispatch`、`sleep`、`ticket_*`、`thread_detail`/`worker_detail`/`report_read`/`abort_session` 复用 `status` 的权限位，Router 会话已放行；其他会话直调会被拒绝）。
-- `sleep` 是 Goal 模式的节流阀：dispatch 之后暂停 Router（默认 30 秒，1..600 的整数，非法值直接报错），用 `Effect.sleep` 真实定时器等待，期间其他任务照常推进，不会忙等。它是 Router-only 工具：Worker 会话的工具列表里没有它，直调也会被 `guard` 拒绝。
+- `sleep` 是 Goal 模式的节流阀：dispatch 之后暂停 Router（默认 30 秒，范围 1..60 的整数，非法值直接报错），用 `Effect.sleep` 真实定时器等待，期间其他任务照常推进，不会忙等。等待期间每 250ms 轮询插件内存状态：Worker 进入终态或新 trigger 入队会立即提前返回，text 形如 `slept 3s of 30s (woken: worker completed)` / `slept 3s of 30s (woken: 2 new event(s))`，output 带 `woken` 字段；被新 trigger 唤醒时以 `delivery: "steer"` flush pending 队列，下一步即可看到，Worker 完成通知由 watcher 投递、不重复。sleep 开始时已存在的终态/pending 不触发虚假唤醒。它是 Router-only 工具：Worker 会话的工具列表里没有它，直调也会被 `guard` 拒绝。
 - Router 会话的权限位由 `src/tools.ts` 的目录派生（`ROUTER_PERMISSIONS`）：新增工具必须在 spec 里声明 `permission`，`Tool.snapshot` 会按该权限位过滤，漏声明会让工具从模型可见列表里消失。
 - 所有 Spill 输出都是紧凑文本，`thread_detail`/`worker_detail` 单次总长度控制在 6000 字内，超出截断并注明；`report_read` 按页返回（默认 4000 字/页）。
 - trigger 历史持久化在 KV（`trigger:<id>`，含全文、route、sessionID）：排队事件入队即记（全文，内存同步+KV 异步），flush 后补 `route=router`；直投 Worker 的事件由 prompt 钩子补记（文本与 Worker 可见格式一致）。hydrate 只加载最近 200 条（按 createdAt 倒序），`triggerTotal` 记总数。
@@ -339,7 +339,7 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
   - `tui.d.ts` 只声明默认导出的 `Plugin.Definition`，不描述 `setup` 内部类型；TUI 插件是动态加载的，消费方通常只需要包名。
   - `dist/tui.js` 约 41 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。
   - `@opencode/schema` 会带上自己的一份 `effect`（其 manifest 的 dependency）。运行时所有 `effect` 导入都被宿主接管，这份副本不会被求值，只是多占几 MB 磁盘。
-  - 包版本 `0.3.0` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
+  - 包版本 `0.3.1` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
 
 ## Watchdog
 
