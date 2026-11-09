@@ -1,6 +1,6 @@
 /**
  * End-to-end: boot a real OpenCode host in an isolated HOME and let it load the
- * published `opencode-superagent@0.3.1` package.
+ * published `opencode-superagent@0.3.2` package.
  *
  * This file is deliberately NOT a `*.test.ts` and does NOT live under `test/`,
  * so a bare `bun test` never discovers it. It boots a real host, downloads a
@@ -18,7 +18,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-const PLUGIN_SPEC = "opencode-superagent@0.3.1"
+const PLUGIN_SPEC = "opencode-superagent@0.3.2"
 const PLUGIN_ID = "opencode.superagent"
 const STARTUP_TIMEOUT_MS = 90_000
 const COMMAND_TIMEOUT_MS = 120_000
@@ -349,7 +349,7 @@ async function main(): Promise<void> {
       entry.source?.target?.startsWith("opencode-superagent") === true,
       `plugin package spec: ${String(entry.source?.target)}`,
     )
-    assertEqual(entry.source?.version, "0.3.1", "resolved plugin version")
+    assertEqual(entry.source?.version, "0.3.2", "resolved plugin version")
 
     // 4. Ask the running host through its own CLI: the plugin's agents and
     //    RPC surface must be live. This is stronger than a log line alone and

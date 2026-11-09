@@ -2,7 +2,7 @@
 
 `e2e/plugin-load.e2e.ts` boots the real `opencode serve` process against a
 throw-away `HOME` and a private port, then lets the host install and load the
-published `opencode-superagent@0.3.1` package.
+published `opencode-superagent@0.3.2` package.
 
 It is intentionally **not** part of `bun test` / `bun run test` /
 `.github/workflows/ci.yml`:
@@ -28,12 +28,12 @@ on pull requests that touch `e2e/**`, `.github/workflows/e2e.yml` or
 
 ## What the test proves
 
-1. `opencode plugin add opencode-superagent@0.3.1` writes the temporary
+1. `opencode plugin add opencode-superagent@0.3.2` writes the temporary
    `$XDG_CONFIG_HOME/opencode/opencode.json`.
 2. `opencode serve --port <ephemeral> --hostname 127.0.0.1` starts with an
    isolated `HOME`/`XDG_*` environment and never touches the user's gateway.
 3. `GET /api/plugin` reports the package as loaded (`id=opencode.superagent`,
-   `source.version=0.3.1`, `state.status=active`); a plugin that throws during
+   `source.version=0.3.2`, `state.status=active`); a plugin that throws during
    initialization shows up as `failed` instead.
 4. The live host reports `superagent-router` and `superagent-worker` through
    `GET /api/agent`, and the plugin RPC answers
