@@ -32,6 +32,20 @@ export interface WorkerRecord {
   updatedAt?: number
   lastReport?: string
   directory?: string
+  /**
+   * Durable sequence of the current execution's `session.execution.started`
+   * event. A replay of the same start event keeps it; a real follow-up prompt
+   * starts a new execution with a newer sequence. Persisted, so completion
+   * dedupe still works after `hydrate`.
+   */
+  execution?: number
+  /**
+   * Terminal states already announced to the Router for `execution`. The
+   * watcher appends exactly once per state, so repeated/replayed completion
+   * events cannot inject duplicate notifications. Cleared when a new execution
+   * starts.
+   */
+  notified?: Array<WorkerState>
 }
 
 /** Canonical in-memory worker registry; `store.workers` points at this map. */

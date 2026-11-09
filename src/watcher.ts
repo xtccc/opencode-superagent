@@ -1,5 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
+import type { SessionMessage } from "@opencode/schema/session-message"
 import { Effect, Stream } from "effect"
+import { createHash } from "node:crypto"
 import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport } from "./report.js"
 import { ensureRouter } from "./router.js"
 import { saveWorker, store, toSessionID, type WorkerRecord } from "./state.js"
@@ -45,6 +47,72 @@ function interruptDetail(data: unknown): string | undefined {
   return typeof reason === "string" && reason !== "" ? `interrupted (${reason})` : "interrupted"
 }
 
+/** Relative position of an event's execution before/after the worker's current one. */
+type ExecutionRelation = "same" | "newer" | "older" | "unknown"
+
+/**
+ * `session.execution.started` carries a durable sequence per session. The same
+ * event replayed (host reconnect, `hydrate`) keeps its sequence; a genuine
+ * follow-up prompt opens a new execution with a newer one. Comparing them is
+ * what lets the watcher tell "duplicate delivery" from "worker ran again".
+ */
+function executionRelation(worker: WorkerRecord, execution: number | undefined): ExecutionRelation {
+  if (execution === undefined || worker.execution === undefined) return "unknown"
+  if (execution === worker.execution) return "same"
+  return execution > worker.execution ? "newer" : "older"
+}
+
+/**
+ * Stable id for one worker terminal notification. Identity is
+ * `(sessionID, execution, terminal state)`, so a notification replayed after
+ * a crash computes the same id and the host can drop the duplicate even if
+ * `notified` was not persisted in time. The 12-hex time prefix mirrors the
+ * host's `msg_` layout (see `router.ts` batch ids).
+ */
+function completionMessageID(worker: WorkerRecord, state: string): SessionMessage.ID {
+  const identity = `superagent.completion\n${worker.sessionID}\n${worker.execution ?? "legacy"}\n${state}`
+  const suffix = createHash("sha1").update(identity).digest("hex").slice(0, 14)
+  const at = BigInt(Math.max(0, Math.trunc(worker.execution ?? worker.createdAt)))
+  const stamp = ((at * 4096n) & 0xffffffffffffn).toString(16).padStart(12, "0")
+  return `msg_${stamp}${suffix}` as SessionMessage.ID
+}
+
+/**
+ * Apply a `session.execution.started` notification. A replayed start for an
+ * execution that already finished must not resurrect a terminal worker, while
+ * a real follow-up prompt (newer durable sequence) starts a fresh execution
+ * and clears the completion journal so its result is announced again.
+ */
+export const handleStarted = Effect.fn("superagent.workerStarted")(function* (
+  ctx: Plugin.Context,
+  sessionID: string,
+  execution?: number,
+) {
+  const worker = store.workers.get(sessionID)
+  if (worker === undefined) return
+  const relation = executionRelation(worker, execution)
+  // A stale start (older execution) or a replay for an execution that already
+  // reached a terminal state must leave the worker record alone.
+  if (relation === "older") return
+  if (relation === "same" && worker.state !== "running") return
+  let changed = false
+  if (relation === "newer") {
+    worker.execution = execution
+    worker.notified = []
+    changed = true
+  } else if (execution !== undefined && worker.execution === undefined) {
+    // First start seen for this record (legacy/just dispatched): adopt the
+    // epoch without clearing anything.
+    worker.execution = execution
+    changed = true
+  }
+  if (worker.state !== "running") {
+    worker.state = "running"
+    changed = true
+  }
+  if (changed) yield* saveWorker(ctx, worker)
+})
+
 /**
  * Apply a `session.idle` notification. Only a running worker may become idle:
  * `done`, `failed` and `aborted` are terminal for the lifecycle, and an idle
@@ -60,11 +128,20 @@ export const handleIdle = Effect.fn("superagent.workerIdle")(function* (
   yield* saveWorker(ctx, worker)
 })
 
-const handleEnded = Effect.fn("superagent.workerEnded")(function* (
+/**
+ * Announce one terminal state to the Router exactly once per execution.
+ * Duplicate sources are all collapsed by `worker.notified`: the watcher seeing
+ * the same event twice, the host re-delivering a durable event after a
+ * reconnect, and `hydrate` replaying state from KV. The marker is persisted
+ * with the worker record *before* the synthetic is sent, so a restart does not
+ * re-inject an already-delivered notification.
+ */
+export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   ctx: Plugin.Context,
   sessionID: string,
   state: "done" | "failed" | "idle",
   detail?: string,
+  execution?: number,
 ) {
   const sessions = ctx.session
   const worker = store.workers.get(sessionID)
@@ -72,7 +149,21 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   // A terminated worker keeps `aborted`; the abort tool already reported the
   // outcome to whoever asked, so do not re-announce it as finished.
   if (worker.state === "aborted") return
+  const relation = executionRelation(worker, execution)
+  // A completion for an execution older than the current one is a replay from
+  // before the worker was resumed; it must not reopen the journal.
+  if (relation === "older") return
+  // Only a `started` event opens a new execution epoch. Completion events
+  // carry their own (larger) sequence, so adopting them here or clearing the
+  // journal on "newer" would let distinct duplicate deliveries each notify.
+  if (execution !== undefined && worker.execution === undefined) worker.execution = execution
+  const announced = worker.notified ?? []
+  // Deterministic key: same worker + same execution + same terminal state.
+  // Checked before any report/ticket work so a duplicate cannot re-close a
+  // ticket or overwrite a newer report either.
+  if (announced.includes(state)) return
   worker.state = state
+  worker.notified = [...announced, state]
   const messages = yield* sessions
     .context({ sessionID: toSessionID(sessionID) })
     .pipe(Effect.catch(() => Effect.succeed([])))
@@ -123,10 +214,33 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
       Effect.logWarning("superagent cannot report without a router", { cause }).pipe(Effect.as(undefined)),
     ),
   )
-  if (routerID === undefined) return
-  yield* sessions
-    .synthetic({ sessionID: toSessionID(routerID), text, delivery: "steer" })
-    .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to report to router", { cause })))
+  if (routerID === undefined) {
+    // Nothing was delivered: release the marker so a replayed completion can
+    // retry instead of being suppressed forever.
+    worker.notified = (worker.notified ?? []).filter((notified) => notified !== state)
+    yield* saveWorker(ctx, worker)
+    return
+  }
+  const delivered = yield* sessions
+    .synthetic({
+      sessionID: toSessionID(routerID),
+      // Deterministic id is the last line of defence: if the process crashes
+      // after sending but before this marker is persisted, a replay sends the
+      // same id and the host drops the duplicate.
+      id: completionMessageID(worker, state),
+      text,
+      delivery: "steer",
+    })
+    .pipe(
+      Effect.as(true),
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to report to router", { cause }).pipe(Effect.as(false)),
+      ),
+    )
+  if (!delivered) {
+    worker.notified = (worker.notified ?? []).filter((notified) => notified !== state)
+    yield* saveWorker(ctx, worker)
+  }
 })
 
 export const registerWatcher = Effect.fn("superagent.registerWatcher")(function* (ctx: Plugin.Context) {
@@ -144,13 +258,13 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           const sessionID = event.data.sessionID as string
+          // Every `session.execution.*` event is durable and carries a per
+          // session sequence number; `session.idle` is ephemeral and has none.
+          const execution = (event as { durable?: { seq?: number } }).durable?.seq
           switch (event.type) {
             case "session.execution.started": {
               if (store.routerID !== undefined && event.data.sessionID === store.routerID) store.routerBusy = true
-              const worker = store.workers.get(sessionID)
-              if (worker === undefined) return
-              worker.state = "running"
-              yield* saveWorker(ctx, worker)
+              yield* handleStarted(ctx, sessionID, execution)
               return
             }
             case "session.execution.succeeded": {
@@ -158,7 +272,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
                 store.routerBusy = false
                 return
               }
-              yield* handleEnded(ctx, sessionID, "done")
+              yield* handleEnded(ctx, sessionID, "done", undefined, execution)
               return
             }
             case "session.execution.failed": {
@@ -166,7 +280,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
                 store.routerBusy = false
                 return
               }
-              yield* handleEnded(ctx, sessionID, "failed", errorDetail(event.data as unknown))
+              yield* handleEnded(ctx, sessionID, "failed", errorDetail(event.data as unknown), execution)
               return
             }
             case "session.execution.interrupted": {
@@ -174,7 +288,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
                 store.routerBusy = false
                 return
               }
-              yield* handleEnded(ctx, sessionID, "idle", interruptDetail(event.data as unknown))
+              yield* handleEnded(ctx, sessionID, "idle", interruptDetail(event.data as unknown), execution)
               return
             }
             case "session.idle": {

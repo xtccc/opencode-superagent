@@ -219,6 +219,13 @@ function stringArray(value: unknown): Array<string> | undefined {
   return [...value]
 }
 
+/** Only known worker states are kept; unknown legacy values are dropped. */
+function stateArray(value: unknown): Array<WorkerState> | undefined {
+  const states = stringArray(value)
+  if (states === undefined) return undefined
+  return states.filter((state): state is WorkerState => WORKER_STATES.includes(state as WorkerState))
+}
+
 export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | undefined {
   if (!isRecord(value)) return undefined
   if (typeof value["sessionID"] !== "string") return undefined
@@ -227,6 +234,8 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
   if (threads === undefined) return undefined
   const createdAt = optionalNumber(value, "createdAt") ?? 0
   const triggerID = optionalString(value, "triggerID")
+  const execution = optionalNumber(value, "execution")
+  const notified = stateArray(value["notified"])
   return {
     sessionID: value["sessionID"],
     title: optionalString(value, "title"),
@@ -240,6 +249,8 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
     updatedAt: optionalNumber(value, "updatedAt") ?? createdAt,
     lastReport: optionalString(value, "lastReport"),
     ...(optionalString(value, "directory") === undefined ? {} : { directory: optionalString(value, "directory") }),
+    ...(execution === undefined ? {} : { execution }),
+    ...(notified === undefined || notified.length === 0 ? {} : { notified }),
   }
 }
 
@@ -291,6 +302,8 @@ export function encodeWorker(record: WorkerRecord): Schema.Json {
     ...(record.updatedAt === undefined ? {} : { updatedAt: record.updatedAt }),
     ...(record.lastReport === undefined ? {} : { lastReport: record.lastReport }),
     ...(record.directory === undefined ? {} : { directory: record.directory }),
+    ...(record.execution === undefined ? {} : { execution: record.execution }),
+    ...(record.notified === undefined || record.notified.length === 0 ? {} : { notified: [...record.notified] }),
   } as unknown as Schema.Json
 }
 

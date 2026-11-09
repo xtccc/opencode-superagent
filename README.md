@@ -232,6 +232,11 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
   完整报告先写入 `report:<sessionID>`（KV，全文，上限 20 万字），Worker 记录只留 2000 字摘要
   `lastReport` 供 `status`/`worker_detail` 使用；注入 Router 的事件带上
   「全文长度 N，可用 report_read 读取」句柄，用 `report_read({ sessionID, offset?, limit? })` 翻页读全文。
+- 终态通知按 `worker sessionID + 执行轮次 + 终态` 去重：Worker 记录里的 `notified`（随
+  `worker:<sessionID>` 落 KV）在通知前写入，同一执行的重复投递（watcher 抖动、host 重投
+  durable 事件、`hydrate` 重放）不会再注入第二条；`execution` 记录当前执行的
+  `session.execution.started` 序号，真正的续聊（新执行）会清空 `notified` 并再次通知。
+  注入使用由该身份派生的稳定 `msg_` id，作为 host 侧重投时的最后一道防线。
 
 ## 终止会话（abort_session）
 
