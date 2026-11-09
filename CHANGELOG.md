@@ -3,6 +3,19 @@
 All notable changes to `opencode-superagent` are documented here. The package
 version is independent of the main OpenCode line (see README, "发布与构建").
 
+## Unreleased
+
+- **`sleep` baseline compares identities, not counters.** A terminal worker
+  that is resumed while another worker completes (terminal count unchanged), or
+  a pending queue drained by the idle hook while a new trigger arrives (length
+  unchanged), no longer swallows the wake-up. Wake reasons and result shape are
+  unchanged.
+- **The store is process-wide.** `store` and the worker registry live on stable
+  `globalThis` symbols, so a duplicate in-process plugin copy (same version, a
+  second install path, or a re-reconciliation) shares the registry the watcher
+  writes instead of silently polling a private copy. Different plugin versions
+  still require a gateway restart to share state.
+
 ## 0.3.1
 
 The `sleep` tool becomes interruptible and its ceiling drops from 600s to 60s;
