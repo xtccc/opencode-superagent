@@ -1,6 +1,9 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
+import type { SessionMessage } from "@opencode/schema/session-message"
 import { Effect, Option, Semaphore, type Schema } from "effect"
+import { createHash } from "node:crypto"
 import { ROUTER_AGENT } from "./agents.js"
+import { buildStatusInjection } from "./context.js"
 import { threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
@@ -30,6 +33,24 @@ function pendingID(trigger: TriggerInput, arrivedAt: number): string {
 
 function keyOf(item: PendingTrigger): string {
   return pendingKey(pendingID(item.trigger, item.arrivedAt))
+}
+
+/**
+ * Stable identity for one delivered batch: the queued ids, sorted, hashed into
+ * a `msg_` id with the same layout as the host's (`12 hex time chars + 14
+ * suffix`). A re-delivery of the same batch (e.g. `hydratePending` replaying
+ * KV after a crash) carries the same id, so the host dedupes it instead of
+ * appending the batch — and its status line — twice.
+ */
+function batchMessageID(batch: ReadonlyArray<PendingTrigger>): SessionMessage.ID {
+  const ids = batch.map((item) => pendingID(item.trigger, item.arrivedAt)).sort().join("\n")
+  const suffix = createHash("sha1").update(ids).digest("hex").slice(0, 14)
+  // `createdAt` is fixed when the trigger is enqueued and persisted in KV, so a
+  // hydrated replay yields the same time prefix; `arrivedAt` is the fallback.
+  const newest = batch[batch.length - 1]
+  const at = BigInt(newest?.trigger.createdAt ?? newest?.arrivedAt ?? 0)
+  const stamp = ((at * 4096n) & 0xffffffffffffn).toString(16).padStart(12, "0")
+  return `msg_${stamp}${suffix}` as SessionMessage.ID
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -186,6 +207,13 @@ export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx:
  * Merge queued triggers into one synthetic prompt for the router. Items
  * leave the queue (memory and KV) only after the injection succeeds; on
  * failure they stay queued for the next attempt.
+ *
+ * The message is the only place live state enters the prompt: the trigger
+ * listing is followed by `buildStatusInjection`, so the counters, tickets and
+ * recall land at the tail of the history and the system prefix stays
+ * byte-stable (prompt-cache friendly). The synthetic carries a batch-derived
+ * id, so replaying the same queue (hydrate after a crash) is deduped by the
+ * host instead of appending a second copy.
  */
 const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(function* (ctx: Plugin.Context) {
   if (store.pending.length === 0) return
@@ -195,7 +223,10 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
   // instead of the queue prefix, so events enqueued while the injection is
   // in flight survive.
   const batchIDs = new Set(batch.map((item) => pendingID(item.trigger, item.arrivedAt)))
-  const text = [
+  const newest = batch[batch.length - 1]
+  // `pending` counts what is still waiting: this batch is being delivered now.
+  const pendingAfter = store.pending.filter((item) => !batchIDs.has(pendingID(item.trigger, item.arrivedAt))).length
+  const events = [
     `${batch.length} new event(s) for the router:`,
     ...batch.map((item) => {
       const base = formatTrigger(item.trigger)
@@ -203,8 +234,18 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
       return hint === undefined ? base : `${base}\n${hint}`
     }),
   ].join("\n\n")
+  // Status sits at the very end of the injected message: it is the only part
+  // that changes between turns, so keeping it here (and out of `system`)
+  // leaves every earlier byte of the request cacheable.
+  const text = `${events}\n\n${buildStatusInjection(newest?.trigger.threadID, pendingAfter)}`
   const delivered = yield* ctx.session
-    .synthetic({ sessionID: toSessionID(routerID), text, description: "superagent triggers", delivery: "queue" })
+    .synthetic({
+      sessionID: toSessionID(routerID),
+      id: batchMessageID(batch),
+      text,
+      description: "superagent triggers",
+      delivery: "queue",
+    })
     .pipe(Effect.option)
   if (Option.isNone(delivered)) {
     yield* Effect.logWarning("superagent failed to flush pending triggers, keeping them queued", {
@@ -222,7 +263,6 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
   }
   // Remember what the Router was just told: `ticket_create` copies this
   // trigger into the ticket's authorization (id + quote).
-  const newest = batch[batch.length - 1]
   if (newest !== undefined) noteRouterTrigger(newest.trigger)
   for (const item of batch) {
     yield* ctx.storage.remove(keyOf(item)).pipe(Effect.catch(() => Effect.void))

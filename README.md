@@ -133,7 +133,7 @@ trigger(threadID, source, author, text)
 
 ## 链式召回（Inline / Spill）
 
-Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pending 数量、trigger 总数，以及 `status` 的紧凑列表。完整信息按需取（Spill），不要猜：
+Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt cache 前缀）。动态摘要（worker 数量、pending 数量、trigger 总数、`status` 紧凑列表、当前 thread 工单与链式召回）改为每批事件 flush 时追加在消息历史末尾的 synthetic 消息里，system 前缀不随计数器变化。完整信息按需取（Spill），不要猜：
 
 | 工具                                                                                                           | 用途                                                                                                           |
 | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |

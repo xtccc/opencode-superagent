@@ -4,7 +4,7 @@ import { directorySummary } from "./dirs.js"
 import { ROUTER_PROMPT } from "./prompts.js"
 import { registerRecall } from "./recall.js"
 import { store, type WorkerRecord } from "./state.js"
-import { activeTicketSummary, currentTrigger, ticketStats } from "./ticket.js"
+import { activeTicketSummary, ticketStats } from "./ticket.js"
 import { displayWidth, ROUTER_TOOLS } from "./tools.js"
 
 /** How many recent workers the recall block names; their full text stays behind tools. */
@@ -66,6 +66,28 @@ export function buildRecallInjection(threadID: string | undefined): string {
 }
 
 /**
+ * Live status line the Router reads at the end of its message history:
+ * worker/queue/ticket counters, the directory memory, the current thread's
+ * active tickets and its chain-recall block.
+ *
+ * Every counter here changes while the gateway runs (`triggerTotal` only ever
+ * grows), so this text must never reach the system prefix. `flushPending`
+ * appends it to the synthetic batch message, i.e. after the cached history,
+ * where a changing tail cannot invalidate the prefix. `threadID` scopes the
+ * ticket/recall part to the batch's target thread; `pending` is the queue size
+ * *after* the delivered batch so the number matches what is still waiting.
+ */
+export function buildStatusInjection(threadID: string | undefined, pending: number = store.pending.length): string {
+  const stats = ticketStats()
+  const active = activeTicketSummary(threadID)
+  const tickets = `tickets=open${stats.open}/in_progress${stats.inProgress}/blocked${stats.blocked}/closed${stats.closed}`
+  const focus = active === "" ? "" : `\n进行中工单（当前 thread）：${active}`
+  const recall = buildRecallInjection(threadID)
+  const chain = recall === "" ? "" : `\n\n${recall}`
+  return `Status: workers=${store.workers.size} pending=${pending} triggers=${store.triggerTotal} ${tickets}. ${directorySummary()}.${focus}${chain}`
+}
+
+/**
  * Narrow one request's toolset by session role. The Router keeps only the
  * catalog tools; a tracked Worker loses every router-only tool (dispatch,
  * sleep, tickets, recall, abort_session), so those tools are not listed to
@@ -83,11 +105,13 @@ export function filterSessionTools(sessionID: string, tools: Record<string, unkn
 /**
  * Context hook: strip each session's toolset to what that role may see
  * (Router: catalog only; Worker: catalog tools removed), then append the
- * router prompt plus a short live status line for the Router.
+ * router prompt for the Router.
  *
- * The status line carries the ticket counters and the current thread's
- * in-progress ticket ids/titles, so a follow-up can be linked back to an
- * existing ticket without a tool call.
+ * The system block must stay byte-stable for prompt caching: it carries only
+ * `ROUTER_PROMPT`, never live counters or recall. Dynamic state would change
+ * on every trigger and invalidate the cached prefix for the whole history
+ * after it. Live status is delivered by `router.flushPending` as the tail of the
+ * synthetic batch message instead (see `buildStatusInjection`).
  */
 export const registerContext = Effect.fn("superagent.registerContext")(function* (ctx: Plugin.Context) {
   yield* ctx.session.hook("context", (event) =>
@@ -96,17 +120,7 @@ export const registerContext = Effect.fn("superagent.registerContext")(function*
       if (!router && !store.workers.has(event.sessionID)) return
       filterSessionTools(event.sessionID, event.tools)
       if (!router) return
-      const stats = ticketStats()
-      const threadID = currentTrigger()?.threadID
-      const active = activeTicketSummary(threadID)
-      const tickets = `tickets=open${stats.open}/in_progress${stats.inProgress}/blocked${stats.blocked}/closed${stats.closed}`
-      const focus = active === "" ? "" : `\n进行中工单（当前 thread）：${active}`
-      const recall = buildRecallInjection(threadID)
-      const chain = recall === "" ? "" : `\n\n${recall}`
-      event.system.push({
-        type: "text",
-        text: `${ROUTER_PROMPT}\n\nStatus: workers=${store.workers.size} pending=${store.pending.length} triggers=${store.triggerTotal} ${tickets}. ${directorySummary()}.${focus}${chain}`,
-      })
+      event.system.push({ type: "text", text: ROUTER_PROMPT })
     }),
   )
   yield* registerRecall(ctx)
