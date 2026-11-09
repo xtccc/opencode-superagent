@@ -194,13 +194,18 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
   {
     name: "status",
     group: "query",
-    description: "Show a compact summary of the router, pending triggers and worker sessions.",
-    summary: "查看插件版本、Router、pending 触发器数量与全部 Worker 的 thread/状态/最近报告。",
-    params: [],
+    description:
+      "Show a compact status summary: plugin version, router, pending triggers, worker and ticket counts. Only active (non-terminal) workers are listed and no lastReport is included by default. Pass includeFinished=true to also list up to 20 finished workers (newest first) with reports shortened to 120 characters. The reply is hard-capped at 2000 characters. Only the router may call it.",
+    summary: "查看版本、Router、pending 与活跃 Worker；已结束的需 includeFinished。",
+    params: [
+      { name: "includeFinished", required: false, type: "boolean", note: "默认 false，最多 20 条" },
+    ],
     risk: "read",
     confirmation: "只读，自动执行（permission: status）。",
     usage: [
       "首行是插件版本与「升级后需重启网关」提示，用来判断网关是否还在跑旧代码。",
+      "默认只列活跃（非终态）Worker 且不带 lastReport，输出不超过 2000 字符，避免撑爆 Router 历史。",
+      "要回看已结束 Worker 才传 includeFinished=true：最多 20 条、报告截断到 120 字符。",
       "system 状态行只给计数，细节用 status / thread_detail。",
     ],
   },

@@ -18,6 +18,7 @@ import {
 } from "./ticket.js"
 import { specFor } from "./tools.js"
 import { pluginVersion } from "./version.js"
+import { isWorkerTerminal, type WorkerRecord } from "./worker-state.js"
 
 export const DispatchInput = Schema.Struct({
   task: Schema.String,
@@ -26,6 +27,10 @@ export const DispatchInput = Schema.Struct({
   agent: Schema.optionalKey(Schema.String),
   directory: Schema.optionalKey(Schema.String),
   ticketID: Schema.String,
+})
+
+export const StatusInput = Schema.Struct({
+  includeFinished: Schema.optionalKey(Schema.Boolean),
 })
 
 const StatusOutput = Schema.Struct({ text: Schema.String })
@@ -38,6 +43,28 @@ interface DispatchInput {
   readonly agent?: string
   readonly directory?: string
   readonly ticketID: string
+}
+
+interface StatusInput {
+  readonly includeFinished?: boolean
+}
+
+/**
+ * Bounds for the `status` tool text. The reply becomes a permanent tool result
+ * in the Router history, so it must stay small no matter how many workers the
+ * gateway has accumulated: list only live workers by default, cap the optional
+ * finished tail, truncate reports, and finally clamp the whole text.
+ */
+const STATUS_TEXT_LIMIT = 2000
+const STATUS_FINISHED_LIMIT = 20
+const STATUS_REPORT_LIMIT = 120
+const STATUS_LINE_LIMIT = 240
+/** Finished rows keep the title short so the report snippet survives the row budget. */
+const STATUS_TITLE_LIMIT = 24
+
+export interface StatusOptions {
+  /** Also list finished workers (max 20, newest first, reports shortened). */
+  readonly includeFinished?: boolean
 }
 
 /**
@@ -75,24 +102,91 @@ function workerPrompt(threadID: string, title: string | undefined, task: string,
  * Compact status text for the `status` tool and its diagnostics readers.
  * Starts with the plugin version so a stale gateway (code upgraded but not
  * restarted) is visible from the first line instead of guessed from behavior.
+ *
+ * Only live workers are listed by default: finished records keep their
+ * `lastReport`, and emitting all of them used to produce >12k characters that
+ * stayed in the Router history forever. `includeFinished` opts into a bounded
+ * tail of finished workers with shortened reports.
  */
-export function statusText(): string {
+export function statusText(options: StatusOptions = {}): string {
   const stats = ticketStats()
-  const active = activeTicketSummary(undefined, 5)
+  const activeTickets = activeTicketSummary(undefined, 5)
+  const workers = [...store.workers.values()]
+  const live = workers.filter((worker) => !isWorkerTerminal(worker.state))
+  const finished = workers.filter((worker) => isWorkerTerminal(worker.state))
   const lines = [
     `superagent ${pluginVersion()} — restart the gateway after upgrading (no hot reload)`,
-    `router: ${store.routerID ?? "none"} pending: ${store.pending.length} workers: ${store.workers.size} tickets: open=${stats.open} in_progress=${stats.inProgress} blocked=${stats.blocked} closed=${stats.closed}`,
+    `router: ${store.routerID ?? "none"} pending: ${store.pending.length} workers=${workers.length} active=${live.length} tickets: open=${stats.open} in_progress=${stats.inProgress} blocked=${stats.blocked} closed=${stats.closed}`,
   ]
-  if (active !== "") lines.push(`active tickets: ${active}`)
-  for (const worker of store.workers.values()) {
-    const id = worker.sessionID
-    const title = worker.title ?? "-"
-    const threads = worker.threads.length === 0 ? "-" : worker.threads.join(",")
-    const report = worker.lastReport ?? "-"
-    const dir = worker.directory ?? "-"
-    lines.push(`- ${id} ${title} [${threads}] ${worker.state} dir=${dir} ${report}`.slice(0, 220))
+  if (activeTickets !== "") lines.push(`active tickets: ${activeTickets}`)
+  if (live.length === 0) lines.push("- (no active workers)")
+  for (const worker of live) lines.push(liveWorkerLine(worker))
+  if (options.includeFinished === true) {
+    const recent = [...finished].sort((a, b) => lastSeen(b) - lastSeen(a))
+    const shown = recent.slice(0, STATUS_FINISHED_LIMIT)
+    const hidden = recent.length - shown.length
+    // Share what the header leaves over between the rows that will be shown, so
+    // the 20-row window survives the overall char cap instead of being cut by it.
+    const reserved = hidden > 0 ? 40 : 0
+    const available = STATUS_TEXT_LIMIT - lines.join("\n").length - reserved
+    const perRow = Math.max(
+      40,
+      Math.min(STATUS_LINE_LIMIT, Math.floor(available / Math.max(1, shown.length)) - 1),
+    )
+    for (const worker of shown) lines.push(finishedWorkerLine(worker, perRow))
+    if (hidden > 0) lines.push(`... ${hidden} more finished worker(s)`)
+  } else if (finished.length > 0) {
+    lines.push(`... ${finished.length} finished worker(s) hidden (pass includeFinished=true to list up to ${STATUS_FINISHED_LIMIT})`)
   }
-  return lines.join("\n")
+  return clampStatus(lines)
+}
+
+/** Live worker row: where it runs and which threads it serves; never its report. */
+function liveWorkerLine(worker: WorkerRecord): string {
+  const id = worker.sessionID
+  const title = worker.title ?? "-"
+  const threads = worker.threads.length === 0 ? "-" : worker.threads.join(",")
+  const dir = worker.directory ?? "-"
+  return clip(`- ${id} ${title} [${threads}] ${worker.state} dir=${dir}`, STATUS_LINE_LIMIT)
+}
+
+/**
+ * Finished worker row: no threads/directory, so the report snippet gets the
+ * space instead. Reports sit at the end, so a tight per-row budget cuts the
+ * report, never the identity of the row.
+ */
+function finishedWorkerLine(worker: WorkerRecord, limit: number): string {
+  const id = worker.sessionID
+  const title = clip(worker.title ?? "-", STATUS_TITLE_LIMIT)
+  const report = clip((worker.lastReport ?? "-").replace(/\s+/g, " "), STATUS_REPORT_LIMIT)
+  return clip(`- ${id} ${worker.state} ${title} report=${report}`, limit)
+}
+
+/** Slice by code point, so a tightened budget never splits an emoji or surrogate pair. */
+function clip(text: string, limit: number): string {
+  return text.length <= limit ? text : [...text].slice(0, limit).join("")
+}
+
+/** Timestamp used to show the newest finished workers first. */
+function lastSeen(worker: WorkerRecord): number {
+  return worker.updatedAt ?? worker.createdAt
+}
+
+/** Hard cap on the whole reply; the marker line is reserved before it is needed. */
+function clampStatus(lines: ReadonlyArray<string>): string {
+  const text = lines.join("\n")
+  if (text.length <= STATUS_TEXT_LIMIT) return text
+  const marker = "... truncated"
+  const kept: Array<string> = []
+  let used = 0
+  for (const line of lines) {
+    const cost = (kept.length === 0 ? 0 : 1) + line.length
+    if (used + cost + 1 + marker.length > STATUS_TEXT_LIMIT) break
+    kept.push(line)
+    used += cost
+  }
+  kept.push(marker)
+  return kept.join("\n")
 }
 
 /**
@@ -363,10 +457,10 @@ export const registerTools = Effect.fn("superagent.registerTools")(function* (ct
     editor.add({
       name: "status",
       description: specFor("status").description,
-      input: Schema.Struct({}),
+      input: StatusInput,
       output: StatusOutput,
-      execute: () => {
-        const text = statusText()
+      execute: (input) => {
+        const text = statusText({ includeFinished: input.includeFinished === true })
         return Effect.succeed({ output: { text }, content: text })
       },
     })

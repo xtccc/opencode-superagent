@@ -143,7 +143,7 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 | `ticket_list({ threadID?, status?, since?, limit? })`                                                          | 按 thread/状态/更新时间列工单（默认 20 条，上限 100），含 id/state/title/priority/更新时间/worker              |
 | `ticket_update({ ticketID, status?, note? })`                                                                  | 按状态机推进工单（open→in_progress→blocked/done/failed/cancelled/superseded），非法迁移报错                    |
 | `ticket_close({ ticketID, outcome, summary })`                                                                 | 结单：写 `closeReason`/`closedAt` 与 history                                                                   |
-| `status`                                                                                                       | Router、pending、Worker、工单计数的紧凑摘要                                                                    |
+| `status({ includeFinished? })`                                                                                 | Router/pending/Worker/工单计数的紧凑摘要：默认只列活跃 Worker、不带 lastReport，整体 ≤2000 字符；`includeFinished=true` 附最近 20 条已结束 Worker（报告截断） |
 | `thread_detail({ threadID, limit? })`                                                                          | 该 thread 的 trigger 列表（时间+作者+截断 300 字/条，默认 20 条）+ 订阅 workers 及其 state/lastReport          |
 | `worker_detail({ sessionID, messages? })`                                                                      | Worker 的标题/threads/state/lastReport + 最近 N 条（默认 5，上限 10）assistant 消息文本（默认截断 1500 字/条） |
 | `report_read({ sessionID, offset?, limit? })`                                                                  | 按字符区间读取 Worker 结束报告的**完整全文**（默认 4000 字/页，上限 20000），返回总长度与 nextOffset           |
