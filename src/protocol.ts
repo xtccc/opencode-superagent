@@ -6,12 +6,14 @@ import { Schema } from "effect"
 import { TICKET_STATES } from "./ticket-view.js"
 
 /**
- * Server-side RPC contract for the Super-agent P0 prototype.
+ * The single RPC contract shared by the server and the TUI.
  *
  * The TUI (`tui.tsx`) calls these methods through `client.rpc(Definition)`,
- * so the id, method names and field names are fixed. Schemas are wrapped
- * with `Schema.toStandardSchemaV1` exactly like `Goal.Definition`, which is
- * what makes the same definition usable from both the Effect server
+ * and `server.ts` registers the very same object (`ServerDefinition =
+ * Definition`), so method names, input/output schemas and declared errors
+ * cannot drift between the two halves. Schemas are wrapped with
+ * `Schema.toStandardSchemaV1` exactly like `Goal.Definition`, which is what
+ * makes the same definition usable from both the Effect server
  * (`ctx.rpc.register`) and the Promise TUI client.
  */
 export const Definition = Rpc.define({
@@ -25,6 +27,9 @@ export const Definition = Rpc.define({
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
       output: Schema.toStandardSchemaV1(
         Schema.Struct({
+          // Optional so an older server that predates the version notice still
+          // satisfies the contract; the current server always sends it.
+          version: Schema.optionalKey(Schema.String),
           router: Schema.optionalKey(Schema.String),
           pending: Schema.Number,
           workers: Schema.Array(
@@ -63,7 +68,9 @@ export const Definition = Rpc.define({
           threadID: Schema.optionalKey(Schema.String),
           agent: Schema.optionalKey(Schema.String),
           directory: Schema.optionalKey(Schema.String),
-          // Required: the RPC path enforces the same work-order gate as the tool.
+          // Required by the shape, but the RPC handler never runs it: RPC
+          // cannot prove router identity, so `dispatch` fails closed with
+          // `dispatch.rejected` and the router uses its tool instead.
           ticketID: Schema.String,
         }),
       ),
@@ -92,6 +99,10 @@ export const Definition = Rpc.define({
     stop: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ sessionID: Schema.String })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ interrupted: Schema.Boolean })),
+      // Declared in the shared contract, not only on the server: the TUI and
+      // the server register the same `Definition`, so a client can tell that
+      // `stop` is router-only without importing server internals.
+      errors: { "stop.rejected": Schema.toStandardSchemaV1(Schema.Struct({})) },
     },
     abort: {
       input: Schema.toStandardSchemaV1(

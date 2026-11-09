@@ -17,6 +17,7 @@ import {
   type Ticket,
 } from "./ticket.js"
 import { specFor } from "./tools.js"
+import { pluginVersion } from "./version.js"
 
 export const DispatchInput = Schema.Struct({
   task: Schema.String,
@@ -70,10 +71,16 @@ function workerPrompt(threadID: string, title: string | undefined, task: string,
   return `${ticketHeader(ticket)}Thread: ${threadID}\n${subject}Task:\n${task}\n\nEnd with a short report: what changed, how it was verified, remaining risks.`
 }
 
-function statusText(): string {
+/**
+ * Compact status text for the `status` tool and its diagnostics readers.
+ * Starts with the plugin version so a stale gateway (code upgraded but not
+ * restarted) is visible from the first line instead of guessed from behavior.
+ */
+export function statusText(): string {
   const stats = ticketStats()
   const active = activeTicketSummary(undefined, 5)
   const lines = [
+    `superagent ${pluginVersion()} — restart the gateway after upgrading (no hot reload)`,
     `router: ${store.routerID ?? "none"} pending: ${store.pending.length} workers: ${store.workers.size} tickets: open=${stats.open} in_progress=${stats.inProgress} blocked=${stats.blocked} closed=${stats.closed}`,
   ]
   if (active !== "") lines.push(`active tickets: ${active}`)
