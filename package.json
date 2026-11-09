@@ -43,6 +43,7 @@
     "prepare": "bun run build",
     "prepack": "bun run build",
     "test": "bun test",
+    "test:e2e": "bun run e2e/plugin-load.e2e.ts",
     "typecheck": "bun check --no-script",
     "typecheck:tsc": "tsc --noEmit"
   },

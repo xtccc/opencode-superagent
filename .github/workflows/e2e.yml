@@ -1,0 +1,62 @@
+name: E2E (real OpenCode host)
+
+# This job boots a real OpenCode host, downloads the published
+# `opencode-superagent` package from npm and loads it. It is deliberately kept
+# out of `ci.yml` (fast gate) and runs on demand, or on pull requests that
+# touch the E2E surface itself.
+"on":
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "e2e/**"
+      - ".github/workflows/e2e.yml"
+      - "package.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin-load:
+    name: Load opencode-superagent@0.2.0 in a real host
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # package.json requires bun >= 1.4.0, and `bun run typecheck`
+          # calls `bun check`, which only exists in current 1.4.x releases.
+          bun-version: 1.4.4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install OpenCode CLI
+        run: |
+          # The repo targets the OpenCode v2 API: peer deps are
+          # `@opencode/plugin` ^2.x and the E2E calls `/api/plugin`,
+          # `/api/agent` and `/api/rpc/:id/:method`. The `opencode-ai` package
+          # on npm is still the v1 line (1.19.5), so install the v2 CLI
+          # package instead; its `opencode` binary serves the v2 API.
+          npm view @opencode/cli version --registry=https://registry.npmjs.org/
+          npm install -g @opencode/cli@2.2.6
+          opencode --version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Run real-host E2E
+        run: bun run test:e2e
