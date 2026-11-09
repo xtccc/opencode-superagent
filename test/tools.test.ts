@@ -3,7 +3,7 @@ import type { Schema } from "effect"
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { AbortInput } from "../src/abort.js"
-import { DispatchInput } from "../src/dispatch.js"
+import { DispatchInput, StatusInput } from "../src/dispatch.js"
 import { ReportReadInput, ThreadDetailInput, WorkerDetailInput } from "../src/recall.js"
 import { SleepInput } from "../src/sleep.js"
 import {
@@ -41,6 +41,7 @@ const schemas = {
   report_read: ReportReadInput,
   abort_session: AbortInput,
   sleep: SleepInput,
+  status: StatusInput,
 } as Record<string, Schema.Schema<unknown>>
 
 interface Field {
@@ -63,7 +64,7 @@ describe("superagent tool catalog", () => {
   test("every registered tool has exactly one spec and vice versa", () => {
     const names = ROUTER_TOOL_SPECS.map((spec) => spec.name)
     expect(new Set(names).size).toBe(names.length)
-    expect([...ROUTER_TOOLS].sort()).toEqual(Object.keys(schemas).concat("status").sort())
+    expect([...ROUTER_TOOLS].sort()).toEqual(Object.keys(schemas).sort())
     expect(() => specFor("nope")).toThrow()
   })
 
@@ -88,8 +89,8 @@ describe("superagent tool catalog", () => {
         })
       }
     }
-    // `status` takes no input at all.
-    expect(specFor("status").params).toEqual([])
+    // `status` is optional-only: it takes an optional includeFinished flag.
+    expect(specFor("status").params.map((param) => param.name)).toEqual(["includeFinished"])
   })
 
   test("detail views fit the dialog column on a narrow terminal", () => {
