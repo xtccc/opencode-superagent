@@ -265,6 +265,29 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     ],
   },
   {
+    name: "worker_prompt",
+    group: "control",
+    description:
+      "Append a follow-up prompt to an existing tracked worker session, delivered with queue (default) or steer; interrupt=true first steers the text and then interrupts the worker with resume. Refuses untracked sessions, the router itself, workers whose ticket is closed (done/failed/cancelled/superseded) or missing, and workers not in running/idle state. Only the router may call it.",
+    summary: "给已有 Worker 追加提示词（queue/steer），可先入队再中断并恢复；结单的 Worker 一律拒绝。",
+    params: [
+      { name: "sessionID", required: true, type: "string", note: "必须是已跟踪的 Worker" },
+      { name: "text", required: true, type: "string", note: "追加的提示词，非空" },
+      { name: "delivery", required: false, type: "string", values: ["queue", "steer"], note: "默认 queue" },
+      { name: "interrupt", required: false, type: "boolean", values: ["true"], note: "先 steer 再 interrupt(resume)" },
+    ],
+    risk: "write",
+    permission: "status",
+    confirmation: "仅投递提示词；结单或无工单直接拒绝，不唤醒。",
+    usage: [
+      "只对 store.workers 中 running/idle 的 Worker 生效；Router 自身、未知 session、failed/aborted/done 记录一律拒绝。",
+      "工单为 done/failed/cancelled（以及 superseded）时拒绝：worker <id> ticket <id> is closed (<state>); start a new worker instead。",
+      "没有关联工单同样拒绝（fail-closed），避免唤醒无工单的 Worker。",
+      "queue=排队到当前执行之后；steer=下一个 step 边界插入；interrupt=true 先以 steer 入队，再 interrupt({ resume: true })。",
+      "文本自动加 [router:follow-up] 来源标记。",
+    ],
+  },
+  {
     name: "abort_session",
     group: "control",
     description:

@@ -240,6 +240,21 @@ export function activeTicketForWorker(sessionID: string): Ticket | undefined {
   return findActiveTicketForWorker(tickets.values(), sessionID)
 }
 
+/**
+ * The ticket bound to a worker session, including a closed one. Used by
+ * `worker_prompt` to refuse waking a worker whose work order already ended.
+ * The ticket store is the only worker → ticket mapping; a reused worker
+ * session keeps the newest write (a closed ticket is never reopened).
+ */
+export function ticketForWorker(sessionID: string): Ticket | undefined {
+  let latest: Ticket | undefined
+  for (const ticket of tickets.values()) {
+    if (ticket.workerSessionID !== sessionID) continue
+    if (latest === undefined || ticket.updatedAt > latest.updatedAt) latest = ticket
+  }
+  return latest
+}
+
 // ── validation ────────────────────────────────────────────────────────────────
 
 export function validateCreateInput(input: {

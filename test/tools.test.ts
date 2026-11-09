@@ -6,6 +6,7 @@ import { AbortInput } from "../src/abort.js"
 import { DispatchInput, StatusInput } from "../src/dispatch.js"
 import { ReportReadInput, ThreadDetailInput, WorkerDetailInput } from "../src/recall.js"
 import { SleepInput } from "../src/sleep.js"
+import { WorkerPromptInput } from "../src/worker-prompt.js"
 import {
   registerTicketTools,
   TicketCloseInput,
@@ -40,6 +41,7 @@ const schemas = {
   worker_detail: WorkerDetailInput,
   report_read: ReportReadInput,
   abort_session: AbortInput,
+  worker_prompt: WorkerPromptInput,
   sleep: SleepInput,
   status: StatusInput,
 } as Record<string, Schema.Schema<unknown>>
