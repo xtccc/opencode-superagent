@@ -3,18 +3,30 @@
 All notable changes to `opencode-superagent` are documented here. The package
 version is independent of the main OpenCode line (see README, "发布与构建").
 
-## Unreleased
+## 0.3.2
 
-- **`sleep` baseline compares identities, not counters.** A terminal worker
-  that is resumed while another worker completes (terminal count unchanged), or
-  a pending queue drained by the idle hook while a new trigger arrives (length
-  unchanged), no longer swallows the wake-up. Wake reasons and result shape are
-  unchanged.
+`sleep` no longer silently sleeps the full duration when work changes in a way
+that keeps the old counters net-zero. No config or API changes; upgrade is a
+version bump plus a gateway restart.
+
+- **`sleep` baseline compares identities, not counters.** The wake check now
+  snapshots terminal-worker identities (`sessionID` plus state/`updatedAt`) and
+  pending-trigger ids instead of plain counts and queue length. A terminal
+  worker that is resumed while another worker completes (terminal count
+  unchanged), or a pending queue drained by the idle hook while a new trigger
+  arrives (length unchanged), no longer swallows the wake-up. Wake reasons and
+  the result shape are unchanged.
 - **The store is process-wide.** `store` and the worker registry live on stable
-  `globalThis` symbols, so a duplicate in-process plugin copy (same version, a
-  second install path, or a re-reconciliation) shares the registry the watcher
-  writes instead of silently polling a private copy. Different plugin versions
-  still require a gateway restart to share state.
+  `globalThis` symbols (`opencode-superagent.store.v1`,
+  `opencode-superagent.workers.v1`), so a duplicate in-process plugin copy
+  (same version, a second install path, or a re-reconciliation) shares the
+  registry the watcher writes instead of silently polling a private copy.
+  Different plugin versions still require a gateway restart to share state.
+- **7 new reliability regression tests.** `test/sleep-wake-reliability.test.ts`
+  covers rejected/interrupted/concurrent sleeps leaving no residue, a resumed
+  terminal worker alongside a completion at the same count, a drain-and-refill
+  queue at the same length, and the `globalThis` store/worker registry being
+  shared across a second module evaluation.
 
 ## 0.3.1
 
