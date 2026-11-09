@@ -333,13 +333,13 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 - **构建产物**：`dist/server.js` + `dist/server.d.ts` + `dist/src/*.js|.d.ts`（`tsc -p tsconfig.build.json`）；`dist/tui.js`（`Bun.build`，插件 `@opentui/solid/bun-plugin`，内联 `src/` 里 TUI 用到的纯函数）；`dist/tui.d.ts`（`tsc -p tsconfig.build.tui.json`，`emitDeclarationOnly`）。`dist/` 里没有任何 `.ts`/`.tsx` 入口，也没有指向源码的导入。
 - **外置模块**：两份产物都把 `effect`、`@opencode/plugin`、`@opencode/client`、`@opentui/*`、`solid-js` 保持为裸导入。OpenCode 宿主提供这些单例，并会拒绝从插件 `node_modules` 加载 `effect`/`@opencode/plugin` 的副本。
 - **依赖划分**：`@opencode/schema`（`Tool`、`AbsolutePath` 等运行时用的 schema 助手）是真正的 `dependencies`，宿主不提供它；`@opencode/plugin`、`effect`、`@opentui/solid`、`solid-js` 挂在 `peerDependencies` 且标 `optional`，因为它们只由宿主提供、npm 不该再装一份（`optional` 是为了避免裸 `npm install` 时的噪声告警）。
-- **包字段**：`exports` 指向 `./dist/server.js` 与 `./dist/tui.js`（类型由同名 `.d.ts` 解析）；`files` 为 `dist`、`agent`、`README.md`、`LICENSE`；`publishConfig.access: public`。
+- **包字段**：`exports` 指向 `./dist/server.js` 与 `./dist/tui.js`（类型由同名 `.d.ts` 解析）；`files` 为 `dist`、`agent`、`README.md`、`CHANGELOG.md`、`LICENSE`；`publishConfig.access: public`。
 - **包元数据**：`repository`/`homepage`/`bugs` 均指向 `xtccc/opencode-superagent`，`LICENSE` 版权人为 `xtccc`；这两处只影响元数据，不影响加载。
 - **已知限制**：
   - `tui.d.ts` 只声明默认导出的 `Plugin.Definition`，不描述 `setup` 内部类型；TUI 插件是动态加载的，消费方通常只需要包名。
   - `dist/tui.js` 约 41 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。
   - `@opencode/schema` 会带上自己的一份 `effect`（其 manifest 的 dependency）。运行时所有 `effect` 导入都被宿主接管，这份副本不会被求值，只是多占几 MB 磁盘。
-  - 包版本 `0.1.0` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
+  - 包版本 `0.3.0` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
 
 ## Watchdog
 

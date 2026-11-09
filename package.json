@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-superagent",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Superagent: a resident router agent that dispatches background worker agents in OpenCode",
   "type": "module",
   "license": "MIT",
@@ -27,6 +27,7 @@
     "dist",
     "agent",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
