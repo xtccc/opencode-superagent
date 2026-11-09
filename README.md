@@ -85,6 +85,14 @@ opencode plugin add opencode-superagent
 
 4. 重启 TUI，确认插件加载成功。
 
+### 升级与重启（不支持热加载）
+
+插件没有热加载：改完 `src/` / `server.ts` 或换掉 npm 包版本后，必须**重启 OpenCode 网关**（`opencode service restart`，本仓库可用 `sh restart-service.sh`）才会加载新代码；只重启 TUI 或重开窗口不会更新后台服务。
+
+- 启动日志会打印一行 `superagent <version> loaded; restart the OpenCode gateway after upgrading (no hot reload)`，只含版本号，不含路径、配置、token 或会话信息。
+- `status` 工具输出的首行、以及 `status` RPC 的 `version` 字段，都会给出当前**已加载**的插件版本；升级后这里若还是旧版本，说明网关没重启。
+- 排查顺序：日志里的版本 → `status` 首行 → `opencode service status`。三者一致仍行为异常时，再怀疑代码本身。
+
 ## 使用
 
 - 输入 `/superagent`（或在命令面板执行 `Superagent`）：通过 RPC 创建/获取 Router 会话并跳转过去。
@@ -156,7 +164,7 @@ Router 的 system prompt 里只有短摘要（Inline）：worker 数量、pendin
 - 去重：`dedupeKey` 缺省为 `sha1(source + threadID + 归一化 objective)`，建单前在同 thread 找 `open/in_progress` 的同键单，命中则返回原单并标 `reused=true`。
 - authorization：自动取 Router 最近一次被投递的 trigger（`triggerID` + 原文摘要 ≤300 字），所以每张单都能追溯「用户当时怎么说的」。
 - 存储：`ticket:<id>` 存全量记录；`ticketidx:status:<state>`、`ticketidx:thread:<threadID>`、`ticketidx:all` 是按 createdAt 倒序的派生索引（各截断 200 项）。hydrate 扫 `ticket:` 前缀重建内存与索引，索引丢失不会丢单；历史 Worker 不回填工单。
-- 强制：`dispatch` 的 `ticketID` 必填（工具与 RPC 同一实现）。缺失、单据不存在、单据已关闭（非 `open/in_progress`）、`threadID` 与单据不符、或单据已绑定运行中的 Worker，一律拒绝并给出可操作提示；RPC 直达同样被拦。
+- 强制：`dispatch` 的 `ticketID` 必填，工单门禁只作用于 **Router 的工具调用**——工具拿得到宿主的 `context.sessionID`，能证明调用方就是 Router。RPC 的 `dispatch` / `stop` 属于 fail-closed：RPC 上下文里没有调用方身份，伪造 `caller`/`routerID` 也没用，所以两者一律以 `dispatch.rejected` / `stop.rejected` 拒绝（`dispatch` 不会建会话、`stop` 不会中断 Worker），见下面「RPC 接口」。工具路径上的拒绝规则：缺失单据、单据不存在、单据已关闭（非 `open/in_progress`）、`threadID` 与单据不符、或单据已绑定运行中的 Worker，都会给出可操作提示。
 - 联动：派发成功即原子绑定——写入 `workerSessionID`、`attempts` 追加一条、`state → in_progress`；绑定失败会回滚新建的 Worker 会话（不会出现「Worker 起来了但单没绑上」）。Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 关闭为 `failed`；watchdog 只告警，不改状态也不结单。
 
 ## 侧栏工单面板
@@ -264,6 +272,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 .                              # 仓库根即本包
 ├── tui.tsx                      # TUI 入口：keymap、slash 命令、RPC 调用、侧栏工单面板
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
+├── src/version.ts               # 从 package.json 读插件版本（带 fallback），生成启动/status 的版本提示
 ├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
 ├── src/agents.ts                # Router/Worker agent 的程序化注册（插件 setup 调用）
 ├── src/                          # 服务端 Router/Worker/批处理实现
@@ -278,13 +287,15 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 └── README.md
 ```
 
-TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.superagent"`）与 `src/tools.ts` 的工具目录（`/tools` 直接渲染它，不发 RPC），当前使用六个方法：
+TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.superagent"`）与 `src/tools.ts` 的工具目录（`/tools` 直接渲染它，不发 RPC）。服务端注册的就是同一个 `Definition` 对象（`server.ts` 的 `ServerDefinition = Definition`），所以方法、入参/出参和声明错误两边不会漂移。TUI 实际调用六个方法：
 
 - `router({}) -> { sessionID }`：创建或返回 Router 会话。
-- `status({}) -> { router?, pending, workers }`：查看 Router 与各 Worker 的 thread 归属，演示命令用它等待 `T-1` 的 Worker 就绪。
+- `status({}) -> { version?, router?, pending, workers }`：`version` 是当前网关加载的插件版本（启动日志里也有），Router 尚未创建时不带 `router` 字段；演示命令用它等待 `T-1` 的 Worker 就绪。
 - `trigger({ source, threadID, author?, text, title?, createdAt?, id? }) -> { route, sessionID? }`：注入一条事件，`route` 为 `router` / `worker` / `dropped`。
 - `abort({ sessionID?, reason?, all?, stale? }) -> { text }`：终止/清理 Worker，被拒绝时抛 `abort.rejected`（带可读 message）。TUI 的 `/abort`（或命令面板 “Superagent abort worker”）会列出 Worker 供选择，首项是“清理全部已结束 worker”。
-- `tickets({ threadID?, status?, limit? }) -> { text }` / `ticket({ ticketID }) -> { text }`：渲染工单列表（按状态分组，窄终端友好）与单张工单的详情；对应 `/tickets` 与 `/ticket <id>`。
+- `tickets({ threadID?, status?, limit? }) -> { text }` / `ticket({ ticketID }) -> { text }`：渲染工单列表（按状态分组，窄终端友好）与单张工单的详情；对应 `/tickets` 与 `/ticket <id>`。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成“不过滤的完整列表”；服务端另有 `tickets.invalid_status` 作为第二道防线。
+
+契约里还声明了 `dispatch` 与 `stop`：两者只给 Router 的工具使用，**RPC 调用一律 fail-closed**。RPC 传输层不提供调用方 session（`RpcCallContext` 只有 `error`），入参里的 `caller`/`routerID` 可伪造（router id 在 `status` 里公开），因此 `dispatch` 固定返回 `dispatch.rejected`、`stop` 固定返回 `stop.rejected`，既不会建 Worker 也不会中断 Worker。这两个错误与其他方法一样声明在共享 `Definition` 里，server 与 TUI 读同一份定义；真正的 Router 通过工具干活，工具的 `context.sessionID` 由宿主提供，是唯一被信任的身份来源。
 
 ## 已知限制与下一步
 
@@ -334,4 +345,4 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 - **只告警不自动杀**：停滞后向 Router 注入一条 delivery `queue` 的提示（`Worker <sid>（<title>）已停滞 <N> 分钟，建议：stop 后重派或人工介入`）。不修改 Worker 的 `state`/`lastReport`，不结单，也不 interrupt；同一繁忙窗口只告警一次，避免误杀长任务和重复刷屏。
 - **单轮错误隔离**：单个 Worker 检查失败只 `logWarning` 并继续下一个；整轮失败也只告警，循环永不退出。
 - **pending 队列崩溃恢复**：入队时同步写 KV（键前缀 `pending:`，纯 JSON），flush 成功后删除该键；setup 时从 KV 读回未 flush 的 trigger 重新入内存队列（不自动建 Router，等下一次 `router` RPC 或新 trigger 时再 flush）。同一 id 重复入队会被去重。
-- **status 无 Router**：Router 尚未创建时 `status` 返回 `{pending, workers}` 且不含 `router` 字段（显式 `undefined` 会导致输出校验失败，故直接省略该键）。
+- **status 无 Router**：Router 尚未创建时 `status` 返回 `{version, pending, workers}` 且不含 `router` 字段（显式 `undefined` 会导致输出校验失败，故直接省略该键）。`version` 始终存在，是当前网关加载的插件版本。

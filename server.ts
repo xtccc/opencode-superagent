@@ -1,6 +1,6 @@
 import { Plugin, Rpc } from "@opencode/plugin/effect"
 import type { RpcHandlers } from "@opencode/plugin/effect/rpc"
-import { Effect, Schema } from "effect"
+import { Effect } from "effect"
 import { registerAbort, runAbort } from "./src/abort.js"
 import { registerAgents } from "./src/agents.js"
 import { registerContext } from "./src/context.js"
@@ -17,6 +17,7 @@ import { hydrateTickets, TICKET_STATES, type TicketState } from "./src/ticket.js
 import { registerTicketTools, renderTicketText, renderTicketsText } from "./src/ticket-tools.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
+import { pluginVersion, versionNotice } from "./src/version.js"
 
 const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Context, input: TriggerInput) {
   const sources = ctx.options.sources as ReadonlyArray<string> | undefined
@@ -60,20 +61,12 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
 })
 
 /**
- * The RPC surface this server registers. `stop` gains its rejection error here
- * rather than in the shared TUI contract: only the server refuses router-only
- * calls, and the TUI never calls `stop`.
+ * The RPC surface this server registers. It is the shared `Definition` object
+ * itself, not a copy: `stop.rejected` and `dispatch.rejected` live in
+ * `src/protocol.ts`, which is also what the TUI imports, so the server and the
+ * TUI can never advertise different errors.
  */
-export const ServerDefinition = {
-  ...Definition,
-  methods: {
-    ...Definition.methods,
-    stop: {
-      ...Definition.methods.stop,
-      errors: { "stop.rejected": Schema.toStandardSchemaV1(Schema.Struct({})) },
-    },
-  },
-} as const satisfies Rpc.Definition
+export const ServerDefinition = Definition satisfies Rpc.Definition
 
 type ServerRpcHandlers = RpcHandlers<typeof ServerDefinition>
 
@@ -112,6 +105,9 @@ export const rejectedRouterRpc: Pick<ServerRpcHandlers, "dispatch" | "stop"> = {
 export default Plugin.define({
   id: "opencode.superagent",
   effect: Effect.fn(function* (ctx) {
+    // Version only: no paths, options or tokens. Makes a stale gateway obvious
+    // in the log right after an upgrade (the plugin has no hot reload).
+    yield* Effect.logInfo(versionNotice())
     // Tickets first: hydrating workers reconciles finished `running` records
     // and closes their tickets, so the ticket store must already be loaded.
     yield* hydrateTickets(ctx)
@@ -143,6 +139,9 @@ export default Plugin.define({
           ),
         status: () =>
           Effect.sync(() => ({
+            // Reported alongside the runtime state so the TUI/diagnostics can
+            // show which plugin build the gateway actually loaded.
+            version: pluginVersion(),
             // Omit the key entirely when no router exists: an explicit
             // `undefined` value fails output validation.
             ...(store.routerID === undefined ? {} : { router: store.routerID }),

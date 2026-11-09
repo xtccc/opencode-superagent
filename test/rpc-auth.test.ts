@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test"
 import { Effect, Exit, type Schema } from "effect"
 import { rejectedRouterRpc, ServerDefinition } from "../server.js"
 import { registerTools } from "../src/dispatch.js"
+import { Definition } from "../src/protocol.js"
 import { store } from "../src/state.js"
 import { createTicket, getTicket, resetTickets } from "../src/ticket.js"
 
@@ -179,8 +180,14 @@ describe("router-only RPC methods reject forged callers", () => {
     expect(store.workers.get(WORKER)?.state).toBe("running")
   })
 
-  test("the server RPC contract declares the stop rejection error", () => {
+  test("the shared contract declares the stop rejection, server and TUI included", () => {
+    // One definition object for both halves: `server.ts` registers exactly what
+    // `tui.tsx` calls, so `stop.rejected` cannot exist on only one side.
+    expect(ServerDefinition).toBe(Definition)
+    expect(Object.keys(Definition.methods.stop.errors ?? {})).toContain("stop.rejected")
     expect(Object.keys(ServerDefinition.methods.stop.errors ?? {})).toContain("stop.rejected")
+    // `dispatch` keeps its own rejection declaration.
+    expect(Object.keys(Definition.methods.dispatch.errors ?? {})).toContain("dispatch.rejected")
   })
 })
 

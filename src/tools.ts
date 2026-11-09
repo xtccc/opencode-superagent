@@ -195,11 +195,14 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     name: "status",
     group: "query",
     description: "Show a compact summary of the router, pending triggers and worker sessions.",
-    summary: "查看 Router、pending 触发器数量与全部 Worker 的 thread/状态/最近报告。",
+    summary: "查看插件版本、Router、pending 触发器数量与全部 Worker 的 thread/状态/最近报告。",
     params: [],
     risk: "read",
     confirmation: "只读，自动执行（permission: status）。",
-    usage: ["system 状态行只给计数，细节用 status / thread_detail。"],
+    usage: [
+      "首行是插件版本与「升级后需重启网关」提示，用来判断网关是否还在跑旧代码。",
+      "system 状态行只给计数，细节用 status / thread_detail。",
+    ],
   },
   {
     name: "thread_detail",
