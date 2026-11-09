@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   plugin-load:
-    name: Load opencode-superagent@0.2.1 in a real host
+    name: Load opencode-superagent@0.3.0 in a real host
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
