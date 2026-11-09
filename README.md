@@ -190,9 +190,11 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 | `thread_detail({ threadID, limit? })` | 该 thread 的 trigger 列表（时间+作者+截断 300 字/条，默认 20 条）+ 订阅 workers 及其 state/lastReport。 |
 | `worker_detail({ sessionID, messages? })` | Worker 的标题/threads/state/lastReport + 最近 N 条（默认 5，上限 10）assistant 消息文本（默认截断 1500 字/条）。 |
 | `report_read({ sessionID, offset?, limit? })` | 按字符区间读取 Worker 结束报告的**完整全文**（默认 4000 字/页，上限 20000），返回总长度与 nextOffset。 |
+| `worker_prompt({ sessionID, text, delivery?, interrupt? })` | 给已跟踪的 Worker 追加 `[router:follow-up]` 提示词：`delivery` 默认 `queue`，可选 `steer`；`interrupt=true` 先 steer 入队再 `interrupt({ resume: true })`。工单已结单（done/failed/cancelled/superseded）或找不到工单一律拒绝，不会唤醒 Worker。 |
 | `abort_session({ sessionID?, reason?, all?, stale? })` | 终止/清理 Worker：中断、等待终态、标记 `aborted`、解除 thread 亲和（见[终止会话](#终止会话-abort_session)）。 |
 
-- 只有 Router 能调这些工具（`dispatch`、`sleep`、`ticket_*`、`thread_detail`/`worker_detail`/`report_read`/`abort_session` 复用 `status` 的权限位，Router 会话已放行；其他会话直调会被拒绝）。
+- 只有 Router 能调这些工具（`dispatch`、`sleep`、`ticket_*`、`thread_detail`/`worker_detail`/`report_read`/`worker_prompt`/`abort_session` 复用 `status` 的权限位，Router 会话已放行；其他会话直调会被拒绝）。
+- `worker_prompt` 只接受 `store.workers` 中 `running`/`idle` 的 Worker：Router 自身、未知 session、failed/aborted/done 记录都会被拒绝；工单已结单时错误形如 `worker <id> ticket <id> is closed (<state>); start a new worker instead`，且不会发出任何 prompt/interrupt。
 - `sleep` 是 Goal 模式的节流阀：dispatch 之后暂停 Router（默认 30 秒，范围 1..60 的整数，非法值直接报错），用 `Effect.sleep` 真实定时器等待，期间其他任务照常推进，不会忙等。等待期间每 250ms 轮询插件内存状态：Worker 进入终态或新 trigger 入队会立即提前返回，text 形如 `slept 3s of 30s (woken: worker completed)` / `slept 3s of 30s (woken: 2 new event(s))`，output 带 `woken` 字段；被新 trigger 唤醒时以 `delivery: "steer"` flush pending 队列，下一步即可看到，Worker 完成通知由 watcher 投递、不重复。sleep 开始时已存在的终态/pending 不触发虚假唤醒。它是 Router-only 工具：Worker 会话的工具列表里没有它，直调也会被 `guard` 拒绝。
 - 唤醒基线比较的是**身份**而不是计数器：终态 Worker 按 `sessionID + state/updatedAt` 快照，pending 按 trigger id 快照。这样「一个终态 Worker 被唤起、同时另一个完成」（终态数不变）或「空闲钩子冲掉队列、同时新 trigger 到达」（队列长度不变）都不会被静默吞掉。
 - `store` 与 Worker 注册表挂在 `globalThis` 的稳定 symbol 上（`opencode-superagent.store.v1` / `opencode-superagent.workers.v1`），进程内同一份代码的多个副本（重复安装路径、重新 reconcile）共享同一份状态；不同版本的副本仍需重启网关才能共享。

@@ -3,6 +3,24 @@
 All notable changes to `opencode-superagent` are documented here. The package
 version is independent of the main OpenCode line (see README, "发布与构建").
 
+## Unreleased
+
+Adds a router-only follow-up channel for existing workers; no config changes.
+
+- **`worker_prompt({ sessionID, text, delivery?, interrupt? })`.** Appends a
+  `[router:follow-up]` prompt to a tracked worker with `queue` (default) or
+  `steer` delivery. `interrupt: true` steers the text into the inbox first and
+  then calls `interrupt({ resume: true })`, so the resumed execution always has
+  the new instruction waiting for it.
+- **Closed work orders are never woken.** A worker whose ticket is `done`,
+  `failed`, `cancelled` (or any other terminal state) is rejected with
+  `worker <id> ticket <id> is closed (<state>); start a new worker instead`.
+  A tracked worker with no ticket is rejected too (fail-closed), and no prompt
+  or interrupt call is made in either case.
+- **Only tracked workers in `running`/`idle`.** Unknown sessions, the router
+  itself, and failed/aborted/done records are refused; the tool goes through
+  `requireRouter`, so worker sessions neither see nor may call it.
+
 ## 0.3.2
 
 `sleep` no longer silently sleeps the full duration when work changes in a way

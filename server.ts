@@ -18,6 +18,7 @@ import { registerTicketTools, renderTicketText, renderTicketsText } from "./src/
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
 import { pluginVersion, versionNotice } from "./src/version.js"
+import { registerWorkerPrompt } from "./src/worker-prompt.js"
 
 const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Context, input: TriggerInput) {
   const sources = ctx.options.sources as ReadonlyArray<string> | undefined
@@ -122,6 +123,7 @@ export default Plugin.define({
     yield* registerSleep(ctx)
     yield* registerTicketTools(ctx)
     yield* registerAbort(ctx)
+    yield* registerWorkerPrompt(ctx)
     yield* registerContext(ctx)
     yield* registerRouterIdle(ctx)
     yield* registerWatcher(ctx)
