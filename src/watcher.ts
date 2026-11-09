@@ -4,6 +4,7 @@ import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport
 import { ensureRouter } from "./router.js"
 import { saveWorker, store, toSessionID, type WorkerRecord } from "./state.js"
 import { closeTicketsForWorker } from "./ticket.js"
+import { closeOutcomeForWorkerState } from "./ticket-state.js"
 
 /**
  * Capture one finished report: the complete text goes to `report:<sessionID>`
@@ -83,11 +84,12 @@ const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   // A worker that reached a terminal state closes its in-progress ticket.
   // Interruptions (`idle`) leave it open: the abort tool closes it explicitly
   // and a plain interrupt may still be resumed with a follow-up.
-  if (state === "done" || state === "failed") {
+  const closeOutcome = closeOutcomeForWorkerState(state)
+  if (closeOutcome !== undefined) {
     yield* closeTicketsForWorker(ctx, {
       sessionID,
-      outcome: state,
-      summary: worker.lastReport ?? report ?? detail ?? `${state} (worker ${sessionID})`,
+      outcome: closeOutcome,
+      summary: worker.lastReport ?? report ?? detail ?? `${closeOutcome} (worker ${sessionID})`,
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("superagent failed to close ticket for ended worker", { sessionID, cause }),

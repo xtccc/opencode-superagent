@@ -3,8 +3,60 @@ import { Tool } from "@opencode/schema/tool"
 import { Effect, type Schema } from "effect"
 import { createHash } from "node:crypto"
 import { normalizeDirectory } from "./dirs.js"
-import { store, type TriggerInput, type WorkerState } from "./state.js"
+import {
+  ACTIVE_STATES,
+  findActiveTicketForWorker,
+  isTerminalState,
+  PRIORITIES,
+  TICKET_STATES,
+  transitionError,
+  workerCloseSummary,
+  type Ticket,
+  type TicketAuthorization,
+  type TicketCloseOutcome,
+  type TicketHistoryEntry,
+  type TicketPriority,
+  type TicketState,
+} from "./ticket-state.js"
+import { isWorkerTerminal, workers } from "./worker-state.js"
 import { displayWidth, wrapText } from "./tools.js"
+
+// The ticket domain model is pure and lives in `ticket-state.ts`; keep
+// re-exporting it so every existing `from "./ticket.js"` import still works.
+export type {
+  Ticket,
+  TicketAttempt,
+  TicketAuthorization,
+  TicketCloseOutcome,
+  TicketHistoryEntry,
+  TicketPriority,
+  TicketRequester,
+  TicketState,
+} from "./ticket-state.js"
+export {
+  ACTIVE_STATES,
+  allowedTransitions,
+  canTransition,
+  isTerminalState,
+  TICKET_STATES,
+  transitionError,
+} from "./ticket-state.js"
+export { isWorkerTerminal, TERMINAL_WORKER_STATES } from "./worker-state.js"
+
+/**
+ * Structural copy of the queued trigger input. The ticket layer must not import
+ * `state.ts` (that is the cycle this module just broke), and the shape is all
+ * `noteRouterTrigger` needs.
+ */
+export interface TicketTriggerNoteInput {
+  readonly id?: string
+  readonly source: string
+  readonly threadID: string
+  readonly author?: string
+  readonly text: string
+  readonly title?: string
+  readonly createdAt?: number
+}
 
 /**
  * Ticket (work order) store for the Super-agent P0.
@@ -28,60 +80,6 @@ import { displayWidth, wrapText } from "./tools.js"
  * `done`, `failed`, `cancelled` and `superseded` are terminal.
  */
 
-export type TicketState = "open" | "in_progress" | "blocked" | "done" | "failed" | "cancelled" | "superseded"
-export type TicketPriority = "p0" | "p1" | "p2"
-export type TicketCloseOutcome = "done" | "failed" | "cancelled"
-
-export interface TicketRequester {
-  readonly source: string
-  readonly threadID: string
-  readonly author?: string
-}
-
-/** Which trigger authorized the ticket: the id plus a short quote of what the user said. */
-export interface TicketAuthorization {
-  readonly triggerID: string
-  readonly quote: string
-  readonly at: number
-}
-
-export interface TicketAttempt {
-  readonly at: number
-  readonly sessionID?: string
-  readonly note?: string
-}
-
-export interface TicketHistoryEntry {
-  readonly at: number
-  readonly kind: "created" | "state" | "note" | "dispatch" | "closed"
-  readonly from?: TicketState
-  readonly to?: TicketState
-  readonly note?: string
-}
-
-export interface Ticket {
-  readonly id: string
-  state: TicketState
-  readonly title: string
-  readonly objective: string
-  readonly acceptance: ReadonlyArray<string>
-  readonly requester: TicketRequester
-  readonly authorization: TicketAuthorization
-  readonly threadID: string
-  workerSessionID?: string
-  readonly attempts: Array<TicketAttempt>
-  readonly priority: TicketPriority
-  directory?: string
-  readonly dedupeKey: string
-  readonly parentTicketID?: string
-  readonly tags: Array<string>
-  readonly createdAt: number
-  updatedAt: number
-  closedAt?: number
-  closeReason?: string
-  readonly history: Array<TicketHistoryEntry>
-}
-
 export const TICKET_PREFIX = "ticket:"
 export const TICKET_STATUS_PREFIX = "ticketidx:status:"
 export const TICKET_THREAD_PREFIX = "ticketidx:thread:"
@@ -101,53 +99,6 @@ export const MEMORY_LIMIT = 500
 
 export const LIST_DEFAULT = 20
 export const LIST_MAX = 100
-
-const PRIORITIES: ReadonlyArray<TicketPriority> = ["p0", "p1", "p2"]
-
-export const TICKET_STATES: ReadonlyArray<TicketState> = [
-  "open",
-  "in_progress",
-  "blocked",
-  "done",
-  "failed",
-  "cancelled",
-  "superseded",
-]
-
-/** A ticket can be dispatched while it is one of these. */
-export const ACTIVE_STATES: ReadonlyArray<TicketState> = ["open", "in_progress"]
-
-const TRANSITIONS: Record<TicketState, ReadonlyArray<TicketState>> = {
-  // A ticket can close from any active state: `done`/`failed` also cover work
-  // finished outside the worker (or a dispatch that never started).
-  open: ["in_progress", "blocked", "done", "failed", "cancelled", "superseded"],
-  in_progress: ["blocked", "done", "failed", "cancelled", "superseded"],
-  blocked: ["in_progress", "done", "failed", "cancelled", "superseded"],
-  done: [],
-  failed: [],
-  cancelled: [],
-  superseded: [],
-}
-
-export function isTerminalState(state: TicketState): boolean {
-  return TRANSITIONS[state].length === 0
-}
-
-export function allowedTransitions(state: TicketState): ReadonlyArray<TicketState> {
-  return TRANSITIONS[state]
-}
-
-/** Same-state moves are no-ops, not transitions. */
-export function canTransition(from: TicketState, to: TicketState): boolean {
-  return from === to || TRANSITIONS[from].includes(to)
-}
-
-/** Human-readable reason a move is illegal, or `undefined` when it is allowed. */
-export function transitionError(from: TicketState, to: TicketState): string | undefined {
-  if (canTransition(from, to)) return undefined
-  if (isTerminalState(from)) return `ticket is already closed (${from}); cannot move to ${to}`
-  return `illegal transition ${from} -> ${to}; allowed: ${TRANSITIONS[from].join(", ")}`
-}
 
 /** Lowercased, whitespace-collapsed objective, so wording drift does not defeat dedupe. */
 export function normalizeObjective(text: string): string {
@@ -189,7 +140,7 @@ export interface RouterTriggerNote {
 
 let routerTrigger: RouterTriggerNote | undefined
 
-export function noteRouterTrigger(trigger: TriggerInput): void {
+export function noteRouterTrigger(trigger: TicketTriggerNoteInput): void {
   routerTrigger = {
     id: trigger.id ?? `${trigger.source}:${trigger.threadID}:${trigger.createdAt ?? Date.now()}`,
     source: trigger.source,
@@ -286,18 +237,7 @@ export function activeTicketSummary(threadID: string | undefined, limit = 3): st
 
 /** Active ticket for a worker session, used when a worker ends. */
 export function activeTicketForWorker(sessionID: string): Ticket | undefined {
-  return [...tickets.values()].find((ticket) => ticket.workerSessionID === sessionID && ticket.state === "in_progress")
-}
-
-/**
- * Worker states after which the ticket may be dispatched again. `idle` is not
- * here on purpose: an idle session can still be resumed, so a re-dispatch
- * would race a live worker.
- */
-export const TERMINAL_WORKER_STATES: ReadonlyArray<WorkerState> = ["done", "failed", "aborted"]
-
-export function isWorkerTerminal(state: WorkerState): boolean {
-  return TERMINAL_WORKER_STATES.includes(state)
+  return findActiveTicketForWorker(tickets.values(), sessionID)
 }
 
 // ── validation ────────────────────────────────────────────────────────────────
@@ -780,7 +720,7 @@ export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket
   // a re-dispatch exactly like `running`. A worker record that is gone blocks
   // nothing: there is no live worker left to wait for.
   const workerID = ticket.workerSessionID
-  const worker = workerID === undefined ? undefined : store.workers.get(workerID)
+  const worker = workerID === undefined ? undefined : workers.get(workerID)
   if (workerID !== undefined && worker !== undefined && !isWorkerTerminal(worker.state)) {
     const article = worker.state === "idle" ? "an" : "a"
     return yield* new Tool.Error({
@@ -852,7 +792,7 @@ export const closeTicketsForWorker = Effect.fn("superagent.closeTicketsForWorker
   return yield* closeTicket(ctx, {
     ticketID: ticket.id,
     outcome: input.outcome,
-    summary: input.summary ?? input.note ?? `${input.outcome} (worker ${input.sessionID})`,
+    summary: workerCloseSummary(input),
     ...(input.now === undefined ? {} : { now: input.now }),
   })
 })

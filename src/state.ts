@@ -3,29 +3,10 @@ import type { Session } from "@opencode/schema/session"
 import { DateTime, Effect, type Schema } from "effect"
 import { buildReport, lastAssistantText, reportSummary, saveReport } from "./report.js"
 import { closeTicketsForWorker } from "./ticket.js"
+import { closeOutcomeForWorkerState } from "./ticket-state.js"
+import { WORKER_STATES, workers, type WorkerRecord, type WorkerState } from "./worker-state.js"
 
-export type WorkerState = "running" | "idle" | "failed" | "done" | "aborted"
-
-export interface WorkerRecord {
-  readonly sessionID: string
-  readonly title?: string
-  /**
-   * Primary thread this worker was dispatched for. Legacy records decode to
-   * `""` and `hydrate` backfills it from `thread.workers`, so every live record
-   * carries a forward link to its thread without losing the multi-thread
-   * `threads` list.
-   */
-  threadID: string
-  /** Trigger that authorized the dispatch, when the record knows it. */
-  triggerID?: string
-  readonly threads: Array<string>
-  state: WorkerState
-  readonly createdAt: number
-  /** Last persisted write. Refreshed by `saveWorker`, so an aborted record keeps a traceable timestamp. */
-  updatedAt?: number
-  lastReport?: string
-  directory?: string
-}
+export type { WorkerRecord, WorkerState } from "./worker-state.js"
 
 export interface ThreadRecord {
   readonly threadID: string
@@ -189,7 +170,7 @@ export interface Store {
 export const store: Store = {
   routerID: undefined,
   routerBusy: false,
-  workers: new Map(),
+  workers,
   threads: new Map(),
   pending: new PendingQueue(),
   triggers: new Map(),
@@ -218,8 +199,6 @@ export function isRunning(info: Session.Info): boolean {
   return idle === undefined || DateTime.toEpochMillis(busy) > DateTime.toEpochMillis(idle)
 }
 
-const STATES: ReadonlyArray<WorkerState> = ["running", "idle", "failed", "done", "aborted"]
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -243,7 +222,7 @@ function stringArray(value: unknown): Array<string> | undefined {
 export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | undefined {
   if (!isRecord(value)) return undefined
   if (typeof value["sessionID"] !== "string") return undefined
-  if (typeof value["state"] !== "string" || !STATES.includes(value["state"] as WorkerState)) return undefined
+  if (typeof value["state"] !== "string" || !WORKER_STATES.includes(value["state"] as WorkerState)) return undefined
   const threads = stringArray(value["threads"])
   if (threads === undefined) return undefined
   const createdAt = optionalNumber(value, "createdAt") ?? 0
@@ -387,11 +366,12 @@ const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(fu
     record.lastReport = reportSummary(captured)
   }
   yield* saveWorker(ctx, record)
-  if (state === "done" || state === "failed") {
+  const outcome = closeOutcomeForWorkerState(state)
+  if (outcome !== undefined) {
     yield* closeTicketsForWorker(ctx, {
       sessionID: record.sessionID,
-      outcome: state,
-      summary: record.lastReport ?? report ?? `${state} (worker ${record.sessionID})`,
+      outcome,
+      summary: record.lastReport ?? report ?? `${outcome} (worker ${record.sessionID})`,
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("superagent failed to close ticket for rehydrated worker", {
