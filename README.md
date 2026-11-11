@@ -37,8 +37,8 @@
 - 多个 Worker 会话：各自独立执行任务，结束时把结论作为 report 交回 Router。
 - thread 亲和（粘性续聊）：首次出现的事件进入 Router 建 Worker，后续事件回到同一 Worker 继续（已结束会被唤起，不会每句话建新会话）。
 - 批处理：相邻事件合批，减少重复唤醒。
-- 工单：先登记「要什么 + 怎么算完成」，再派活，Worker 终态自动回写。
-- TUI 入口：`/superagent`、`/task`、`/abort`、`/tools`、`/tickets`、`/ticket <id>`（见[使用](#使用-tui-命令)）。
+- 工单：先登记「要什么 + 怎么算完成」，再派活，Worker 终态自动回写；被中断的 Worker 把工单落到 `blocked`，重开即可原单重派。
+- TUI 入口：`/superagent`、`/task`、`/abort`、`/tools`、`/tickets`、`/ticket <id>`（见[使用](#使用-tui-命令)）；工单可用侧栏显示的 4 位短 ID 搜索。
 
 ### 不做什么 P0 边界
 
@@ -128,11 +128,14 @@ opencode plugin add opencode-superagent
 | 命令 | 命令面板名称 | 作用 |
 | --- | --- | --- |
 | `/superagent` | Superagent | 通过 RPC 创建/获取 Router 会话并跳转过去。 |
-| `/task` | Superagent tasks | 从当前 Worker 列表中选择一个，跳转到它的会话。 |
+| `/task` | Superagent tasks | 从当前 Worker 列表中选择一个，跳转到它的会话。自绘选择器（`src/tui-picker.ts`）按终端尺寸放大：默认占终端高度的 75%（12–30 行可见），窄终端自动收列宽。 |
 | `/abort` | Superagent abort worker | 选择要终止的 Worker，或首项「清理全部已结束 worker」（`stale`）批量清理；结果显示在 toast 里。 |
 | `/tools`（别名 `/superagent-tools`） | Superagent tools | 按调度类/查询类/控制类分组列出 Router 当前可用的全部工具，每行显示风险等级（只读/可写/终止）与必填参数；选中某个工具后弹窗给出参数表（名称、必填、类型、说明）、确认方式与用法，末行「能力边界」列出 Router 不能做什么。清单来自 `src/tools.ts` 的工具注册表，新增工具无需改动该命令。 |
 | `/tickets` | Superagent tickets | 浏览工单清单（按状态分组，窄终端友好）。 |
-| `/ticket <id>` | Superagent ticket detail | 查看单张工单详情。 |
+| `/ticket <id>` | Superagent ticket detail | 查看单张工单详情。`id` 接受全 ID，也接受侧栏显示的 **4 位短 ID**（如 `dc8d`）；前缀/中间片段同样命中，多个候选会列出让你选。 |
+
+- 短 ID 搜索（`src/ticket-search.ts`）的排序：全 ID 精确 > 后缀（短 ID）> 前缀 > 中间片段 > 标题包含；比较时忽略大小写和 `tk`/`_`/`-` 分隔符，所以 `TK_mwbk-ve34`、`dc8d`、`bkve34` 都能找到 `tk_mwbkve34_dc8d`。歧义（多个同级命中）时不猜，列出候选。
+- 选择器是自绘的 `PickerDialog`（`src/tui-picker.ts` 的 `computeDialogSize`），不再受宿主 `dialog.select`「最多 `floor(rows/2)-6` 条、固定 60 列」的限制；键位与内置选择器一致：输入即搜、`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 移动、`⏎` 选择、`esc` 取消。
 
 - TUI 右侧栏（42 列）里有一块「工单」面板，常驻显示工单清单，见[侧栏工单面板](#侧栏工单面板)。
 
@@ -185,6 +188,7 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 - `sleep` 是 Goal 模式的节流阀：dispatch 之后暂停 Router（默认 30 秒，范围 1..60 的整数，非法值直接报错），用 `Effect.sleep` 真实定时器等待，期间其他任务照常推进，不会忙等。等待期间每 250ms 轮询插件内存状态：Worker 进入终态或新 trigger 入队会立即提前返回，text 形如 `slept 3s of 30s (woken: worker completed)` / `slept 3s of 30s (woken: 2 new event(s))`，output 带 `woken` 字段；被新 trigger 唤醒时以 `delivery: "steer"` flush pending 队列，下一步即可看到，Worker 完成通知由 watcher 投递、不重复。sleep 开始时已存在的终态/pending 不触发虚假唤醒。它是 Router-only 工具：Worker 会话的工具列表里没有它，直调也会被 `guard` 拒绝。
 - 唤醒基线比较的是**身份**而不是计数器：终态 Worker 按 `sessionID + state/updatedAt` 快照，pending 按 trigger id 快照。这样「一个终态 Worker 被唤起、同时另一个完成」（终态数不变）或「空闲钩子冲掉队列、同时新 trigger 到达」（队列长度不变）都不会被静默吞掉。
 - `store` 与 Worker 注册表挂在 `globalThis` 的稳定 symbol 上（`opencode-superagent.store.v1` / `opencode-superagent.workers.v1`），进程内同一份代码的多个副本（重复安装路径、重新 reconcile）共享同一份状态；不同版本的副本仍需重启网关才能共享。
+- `ensureRouter` 的「检查 → 建会话 → 落 KV」被一把进程级信号量串起来（同样挂 `globalThis`：`opencode-superagent.router-lock.v1`），并发调用（新 trigger、`router` RPC、flush 同时触发）不会各建一个 Router 再互相覆盖；持锁后重新读一次 `routerID`，抢输的一方直接复用赢家的会话。Effect 在成功/失败/中断时都会释放许可，一次失败的建会话不会堵住下一次。
 - Router 会话的权限位由 `src/tools.ts` 的目录派生（`ROUTER_PERMISSIONS`）：新增工具必须在 spec 里声明 `permission`，`Tool.snapshot` 会按该权限位过滤，漏声明会让工具从模型可见列表里消失。
 - 所有 Spill 输出都是紧凑文本，`thread_detail`/`worker_detail` 单次总长度控制在 6000 字内，超出截断并注明；`report_read` 按页返回（默认 4000 字/页）。
 - trigger 历史持久化在 KV（`trigger:<id>`，含全文、route、sessionID）：排队事件入队即记（全文，内存同步+KV 异步），flush 后补 `route=router`；直投 Worker 的事件由 prompt 钩子补记（文本与 Worker 可见格式一致）。hydrate 只加载最近 200 条（按 createdAt 倒序），`triggerTotal` 记总数。
@@ -207,8 +211,11 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 - 去重：`dedupeKey` 缺省为 `sha1(source + threadID + 归一化 objective)`，建单前在同 thread 找 `open/in_progress` 的同键单，命中则返回原单并标 `reused=true`。
 - authorization：自动取 Router 最近一次被投递的 trigger（`triggerID` + 原文摘要 ≤300 字），所以每张单都能追溯「用户当时怎么说的」。
 - 存储：`ticket:<id>` 存全量记录；`ticketidx:status:<state>`、`ticketidx:thread:<threadID>`、`ticketidx:all` 是按 createdAt 倒序的派生索引（各截断 200 项）。hydrate 扫 `ticket:` 前缀重建内存与索引，索引丢失不会丢单；历史 Worker 不回填工单。
+- 内存与 KV 的一致性：内存只保留最近 500 张（`MEMORY_LIMIT`），查询未命中时**回源 KV 读一次**（`loadTicket`，不扫全表），所以被裁剪掉的老单不会显示成「没有找到工单」；`ticket_list` 在内存页不足时才补扫 KV。KV 写失败不吞：内存已改，写失败的记录进 dirty 队列，下次任意写入/读取时重试（`flushTicketWrites`），否则重启会让旧状态复活。索引写失败同样单独排队重试。
+- 长度与截断按**码点**计数（`src/format.ts` 的 `clipCodePoints`/`codePointLength`）：40 个 emoji 的标题是 40 个字符而不是 80，截断也不会把代理对切成半个字符。
 - 强制：`dispatch` 的 `ticketID` 必填，工单门禁只作用于 **Router 的工具调用**——工具拿得到宿主的 `context.sessionID`，能证明调用方就是 Router。RPC 的 `dispatch` / `stop` 属于 fail-closed：RPC 上下文里没有调用方身份，伪造 `caller`/`routerID` 也没用，所以两者一律以 `dispatch.rejected` / `stop.rejected` 拒绝（`dispatch` 不会建会话、`stop` 不会中断 Worker），见[RPC 接口](#rpc-接口)。工具路径上的拒绝规则：缺失单据、单据不存在、单据已关闭（非 `open/in_progress`）、`threadID` 与单据不符、或单据已绑定运行中的 Worker，都会给出可操作提示。
 - 联动：派发成功即原子绑定——写入 `workerSessionID`、`attempts` 追加一条、`state → in_progress`；绑定失败会回滚新建的 Worker 会话（不会出现「Worker 起来了但单没绑上」）。Worker prompt 头部附「工单 + objective + acceptance」；Worker `done/failed` 由 watcher 结单，`abort_session` 关闭为 `failed`；watchdog 只告警，不改状态也不结单。
+- 中断 → `blocked`，可直接重派：Worker 被中断（watcher 收到 `idle`）时，进行中的工单落到 `blocked` 并记一条 `interrupted: <reason>` 的 history，不再原地停在 `in_progress`。`blocked` 是诚实的中间态（任务没完成、这次尝试也不算失败），Router 用 `ticket_update({ status: "in_progress" })` 重开即可**接着派发**——门禁看到「工单在该 Worker 之后被 park 过」就放行那个 `idle` Worker，不需要先 `abort_session` 再建新单。重启路径同理：`hydrate` 把遗留在 `running` 的记录按会话终态回放，`interrupted` 的分支调用同一个 `blockTicketsForWorker`（`src/state.ts`），否则重启后工单会卡在 `in_progress` 而被 idle 门永久拦住。
 
 ### 侧栏工单面板
 
@@ -244,9 +251,12 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 
 所有目录共用一个网关进程，Router 自主管理目录映射，用户只说自然语言（如「去 ai-gw 修登录」），Router 解析并记住：
 
-- `dispatch` 支持 `directory`（绝对路径），透传给 `sessions.create location`，Worker 落到目标目录干活；网关进程本身的目录只是缺省值，不重要。
+- `dispatch` 支持 `directory`（绝对路径），透传给 `sessions.create location`，Worker 落到目标目录干活；网关进程本身的目录只是缺省值，不重要。路径的合法性统一由 `src/dirs.ts` 的 `normalizeDirectory` 判定，见下一条。
+- **跨平台路径**：接受 POSIX 绝对路径（`/opt/project`）、Windows 盘符路径（`C:\project`、`C:/project`、`c:\project`）和 MSYS/Git-Bash 形式（`/c/project`）。三者都归一化成同一规范形式（`C:\project`，盘符大写、分隔符统一），因此 `C:\x`、`C:/x`、`/c/x` 在别名和 thread 绑定眼里是同一个目录，不会因为写法不同被当成冲突。非法输入（相对路径、纯盘符、空串、超 500 字符、含控制字符）统一报 `directory must be an absolute path: POSIX (/opt/project), Windows (C:\project or C:/project) or MSYS (/c/project)`。
 - 目录推断优先级：消息中的绝对路径 > 历史 thread 绑定（事件文本标注「已知目录」）> 已知别名映射（状态行 `dirs:`）> 网关默认目录。
-- KV 持久化：`dir:thread:<threadID>` 与 `dir:alias:<小写别名>`；`dispatch` 带目录时自动记住 thread 绑定与目录 basename 别名（如 `/opt/ai-gw` 记住 `ai-gw`），重启后 `hydrateDirs` 读回。
+- 别名匹配是**词边界精确匹配**：别名两侧不能紧邻 ASCII 字母/数字/下划线，所以 `app` 不会命中 `appstore` 或 `myapp`，但仍能命中「修复app的问题」和 `app/web`；长别名优先。
+- 别名冲突与上限：同一 basename 落到不同目录时，**先登记的保留**，后到的记进冲突表并从自动匹配中排除（宁可回落到 thread 绑定/默认目录，也不派错目录）；别名表上限 24 条（`ALIAS_LIMIT`），超出淘汰最久未动的。状态行只列最近 5 条（`ALIAS_SUMMARY_LIMIT`，新的在前），被折叠的条数与冲突数分别标注为 `+N older` / `conflicts=N`，避免一行被别名表撑爆。
+- KV 持久化：`dir:thread:<threadID>` 与 `dir:alias:<小写别名>`；`dispatch` 带目录时自动记住 thread 绑定与目录 basename 别名（如 `/opt/ai-gw` 记住 `ai-gw`），重启后 `hydrateDirs` 读回。冲突时不覆盖先登记的映射，且 KV 里写的也是内存实际保留的那条，避免重启后解析结果翻转。
 - 缺失映射时用网关默认目录派发，并在回复中向用户确认正确路径，待用户告知后记住；绝不编造不存在的路径。
 
 全局注册（多目录可用）：在 `~/.config/opencode/opencode.jsonc` 注册一次插件即可，所有目录共用同一网关，无需每个目录单独配置：
@@ -290,7 +300,8 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 - **停滞定义**：`state` 为 `running` 的 Worker，若其会话 `time.busy` 比当前早超过 30 分钟（`STALL_TIMEOUT_MS`，可用 `stallTimeoutMs` 覆盖），且 `time.idle` 没有新于 `busy` 的更新（执行期间 `idle` 只保留上一次执行的结束时间），视为停滞。
 - **只告警不自动杀**：停滞后向 Router 注入一条 delivery `queue` 的提示（`Worker <sid>（<title>）已停滞 <N> 分钟，建议：stop 后重派或人工介入`）。不修改 Worker 的 `state`/`lastReport`，不结单，也不 interrupt；同一繁忙窗口只告警一次，避免误杀长任务和重复刷屏。
 - **单轮错误隔离**：单个 Worker 检查失败只 `logWarning` 并继续下一个；整轮失败也只告警，循环永不退出。
-- **pending 队列崩溃恢复**：入队时同步写 KV（键前缀 `pending:`，纯 JSON），flush 成功后删除该键；setup 时从 KV 读回未 flush 的 trigger 重新入内存队列（不自动建 Router，等下一次 `router` RPC 或新 trigger 时再 flush）。同一 id 重复入队会被去重。
+- **pending 队列崩溃恢复**：入队时同步写 KV（键前缀 `pending:`，纯 JSON），flush 成功后删除该键；setup 时从 KV 读回未 flush 的 trigger 重新入内存队列（不自动建 Router，等下一次 `router` RPC 或新 trigger 时再 flush）。同一 id 重复入队会被去重。回放有 TTL（默认 24 小时，插件选项 `pendingTTLMs`）：比 `arrivedAt` 更旧的条目直接从 KV 删除并计入 `store.pendingDropped`（日志一行 warning，`status` 可见），避免崩溃一天后重启把早已过期的追问重新灌给 Router。
+- **启动并发**：`hydrate` 与 `hydrateSessionMeta` 的 `session.get` 用 `HYDRATE_CONCURRENCY = 8` 并发（原来是每条一次串行的 N+1 往返），但状态迁移与结单仍按记录原顺序应用，行为与串行时一致。
 
 ## RPC 接口
 
@@ -300,8 +311,8 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 - `status({}) -> { version?, router?, pending, workers }`：`version` 是当前网关加载的插件版本（启动日志里也有），演示命令用它等待 `T-1` 的 Worker 就绪。Router 尚未创建时返回 `{ version, pending, workers }`，省略 `router` 键（显式 `undefined` 会导致输出校验失败）。
 - `trigger({ source, threadID, author?, text, title?, createdAt?, id? }) -> { route, sessionID? }`：注入一条事件，`route` 为 `router` / `worker` / `dropped`。
 - `abort({ sessionID?, reason?, all?, stale? }) -> { text }`：终止/清理 Worker，被拒绝时抛 `abort.rejected`（带可读 message）。TUI 的 `/abort`（或命令面板「Superagent abort worker」）会列出 Worker 供选择，首项是「清理全部已结束 worker」。
-- `tickets({ threadID?, status?, limit? }) -> { text }`：渲染工单列表（按状态分组，窄终端友好），对应 `/tickets`。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成「不过滤的完整列表」；服务端另有 `tickets.invalid_status` 作为第二道防线。
-- `ticket({ ticketID }) -> { text }`：渲染单张工单详情，对应 `/ticket <id>`。
+- `tickets({ threadID?, status?, limit? }) -> { text }`：渲染工单列表（按状态分组，窄终端友好），对应 `/tickets`。内存页不足时回源 KV 补齐，被裁剪的老单不会显示成缺失。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成「不过滤的完整列表」；服务端另有 `tickets.invalid_status` 作为第二道防线。
+- `ticket({ ticketID }) -> { text }`：渲染单张工单详情，对应 `/ticket <id>`；内存未命中时从 KV 读一次再渲染，确实不存在才回 `没有找到工单 <id>`。
 
 契约里还声明了 `dispatch` 与 `stop`：两者只给 Router 的工具使用，**RPC 调用一律 fail-closed**。RPC 传输层不提供调用方 session（`RpcCallContext` 只有 `error`），入参里的 `caller`/`routerID` 可伪造（router id 在 `status` 里公开），因此 `dispatch` 固定返回 `dispatch.rejected`、`stop` 固定返回 `stop.rejected`，既不会建 Worker 也不会中断 Worker。这两个错误与其他方法一样声明在共享 `Definition` 里，server 与 TUI 读同一份定义；真正的 Router 通过工具干活，工具的 `context.sessionID` 由宿主提供，是唯一被信任的身份来源。
 
@@ -315,6 +326,7 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 | `worker_detail_message_limit` | `1500` | `worker_detail` 单条消息截断字数，夹在 200–4000 之间。 |
 | `watchdogIntervalMs` | `60000` | Watchdog 检查间隔（毫秒），非正数回退默认。 |
 | `stallTimeoutMs` | `1800000` | Worker 停滞判定阈值（毫秒，默认 30 分钟），非正数回退默认。 |
+| `pendingTTLMs` | `86400000`（24 小时） | 未投递 trigger 的崩溃重放上限：`hydratePending` 只回放 `arrivedAt` 在 TTL 内的条目，更旧的从 KV 删除并在日志/`status` 记 `pendingDropped`。非数值或非正数回退默认。 |
 
 另外两项属于 OpenCode 自身配置，不是插件选项：
 
@@ -326,11 +338,19 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 在插件包（本仓库根）内做类型检查：
 
 ```sh
-bun run typecheck      # bun check（bun 1.4.0 没有该子命令，会报 Script not found）
-bun run typecheck:tsc  # tsc --noEmit，CI 口径，推荐
+bun run typecheck      # bun check --no-script（需要带 `bun check` 子命令的 bun；CI 与发布闸门固定 1.4.4）
+bun run typecheck:tsc  # tsc --noEmit，`bun check` 不可用时的等价兜底
 ```
 
-测试用 `bun test`，在仓库根直接运行即可（本仓库不含上游的 `do-not-run-tests-from-root` 保护）。CI 在 `.github/workflows/ci.yml` 里跑 typecheck、test、build。
+测试用 `bun test`，在仓库根直接运行即可（本仓库不含上游的 `do-not-run-tests-from-root` 保护）。
+
+发布前跑一次完整闸门（CI 与 `prepublishOnly` 用的是同一条命令，避免「PR 绿了、发布红了」）：
+
+```sh
+bun run release:check  # typecheck → test → build → bun pm pack + tarball 内容校验
+```
+
+CI（`.github/workflows/ci.yml`）执行的就是 `bun run release:check`；其中 pack 之后会校验入口文件齐全、打包后的版本号与 `package.json` 一致，并确认 `src/`、`test/`、`e2e/`、`script/`、`.github/` 没有被打进包里。任何一步失败都会以非零退出码中断，`npm publish` 随之被阻断。
 
 ## 发布与构建
 
@@ -345,9 +365,11 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 - **包字段**：`exports` 指向 `./dist/server.js` 与 `./dist/tui.js`（类型由同名 `.d.ts` 解析）；`files` 为 `dist`、`agent`、`README.md`、`CHANGELOG.md`、`LICENSE`；`publishConfig.access: public`。
 - **包元数据**：`repository`/`homepage`/`bugs` 均指向 `xtccc/opencode-superagent`，`LICENSE` 版权人为 `xtccc`；这两处只影响元数据，不影响加载。
 - **发版流程**：改 `package.json` 版本 + `CHANGELOG.md`，跑全量 `test`/`typecheck`/`build`，提交后打 `v<version>` tag 并 push；CI 通过后再 `npm publish`。
+  - 发布闸门：`prepublishOnly` 会执行 `bun run release:check`（等价 `script/release-check.ts`），依次跑 `typecheck` → `test` → `build` → `bun pm pack` 并校验 tarball 内容（入口文件齐全、版本与 `package.json` 一致、没有把 `src/`、`test/`、`e2e/`、`script/`、`.github/` 打进包里）。任一步失败直接阻断 `npm publish`，不需要靠人肉记得先跑测试。
+  - 打包产物验证不再依赖已发布的 npm 包：`e2e/plugin-load.e2e.ts` 现在自己 `bun pm pack` 出 tarball 再装进隔离环境加载，详见 `e2e/README.md`。
 - **已知限制**：
   - `tui.d.ts` 只声明默认导出的 `Plugin.Definition`，不描述 `setup` 内部类型；TUI 插件是动态加载的，消费方通常只需要包名。
-  - `dist/tui.js` 约 41 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。
+  - `dist/tui.js` 约 64 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数 + 自绘选择器），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。
   - `@opencode/schema` 会带上自己的一份 `effect`（其 manifest 的 dependency）。运行时所有 `effect` 导入都被宿主接管，这份副本不会被求值，只是多占几 MB 磁盘。
   - 包版本 `0.4.0` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
 
@@ -357,7 +379,8 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 - **真实信道**：把 TUI 演示事件换成 IM、GitHub issue/comment、Webhook 等来源，并补上签名与去重。
 - **隐藏 Worker**：让 Worker 会话不出现在普通会话列表，只通过 Router 暴露进度（当前只做 title 前缀，未做过滤/分组）。
 - **持久化与并发**：事件去重、断线重放、跨进程 thread 租约，以及多 TUI 实例的一致性。
-- **工单 P1**：内存只保留最近 500 张单（更早的仍在 KV，重启后回到内存），跨进程/多实例的工单索引尚未同步；被中断但未 `abort_session` 的 Worker 会让工单停在 `in_progress`，需要 Router 手动推进。
+- **跨平台路径（Windows）**：`src/dirs.ts` 的 `normalizeDirectory` 现在同时接受 POSIX 绝对路径、Windows 盘符路径（`C:\repo`、`C:/repo`、`c:\repo`）和 MSYS 形式（`/c/repo`），三者归一化成同一规范形式后再参与别名/thread 绑定比较，见[单网关多目录](#单网关多目录-router-自管)。平台支持矩阵因此是 macOS/Linux/Windows（MSYS 与原生）一致；尚未覆盖的是 UNC 路径（`\\host\share`）与 `~` 展开——它们仍会被判为非法，需要调用方先给出绝对路径。
+- **工单 P1**：内存只保留最近 500 张单（更早的仍在 KV，查询时回源读取），跨进程/多实例的工单索引尚未同步；被中断的 Worker 现在会把工单落到 `blocked`（watcher 与重启后的 `hydrate` 都如此），Router 用 `ticket_update({ status: "in_progress" })` 重开即可原单重派，不再需要 `abort_session` 后建新单。仍未自动推进：`blocked` 不会自己变回 `in_progress`，需要 Router 判断。
 - **工单 P2**：工单与验收标准的自动核验、按工单聚合的用量/成本统计、工单看板与通知推送。
 
 ## 文件结构
@@ -369,18 +392,22 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
 ├── src/version.ts               # 从 package.json 读插件版本（带 fallback），生成启动/status 的版本提示
 ├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
+├── src/ticket-search.ts         # 工单搜索：全 ID/前后缀/中间片段/短 ID 排序，TUI 选择器共用
+├── src/tui-picker.ts            # 自绘选择器：对话框尺寸、行布局、可见窗口与帮助行
 ├── src/agents.ts                # Router/Worker agent 的程序化注册（插件 setup 调用）
 ├── src/                          # 服务端 Router/Worker/批处理实现
 ├── test/                        # bun test 测试（含 sleep 唤醒可靠性回归）
-├── e2e/                         # 针对已发布 npm 包的加载 e2e（本机不默认运行）
+├── e2e/                         # 真机 e2e：pack 当前工作树 → 隔离 HOME 里加载（本机不默认运行）
 ├── agent/
 │   ├── superagent-router.md     # Router agent 模板（mode: primary，可按需定制，非运行必需）
 │   └── superagent-worker.md     # Worker agent 模板（mode: subagent，可按需定制，非运行必需）
 ├── script/build.ts              # 构建：tsc（server + d.ts）→ bun build（tui.js）
+├── script/release-check.ts      # 发布闸门：typecheck → test → build → pack 校验（prepublishOnly 调用）
 ├── tsconfig.json                # 类型检查（noEmit，含 test/script）
 ├── tsconfig.build.json          # 构建：server.ts + src → dist/*.js + *.d.ts
 ├── tsconfig.build.tui.json      # 构建：只为 tui.tsx 产出 dist/tui.d.ts
-├── .github/workflows/ci.yml     # CI：typecheck + test + build
+├── .github/workflows/ci.yml     # CI：release:check（typecheck + test + build + pack 校验）
+├── .github/workflows/e2e.yml    # E2E：改 src/ 等代码路径即触发，测本地 pack 出的 tarball
 ├── restart-service.sh           # 本机重启网关的辅助脚本
 ├── LICENSE                      # MIT（版权人占位，见「发布与构建」）
 └── README.md
