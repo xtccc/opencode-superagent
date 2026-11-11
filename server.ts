@@ -14,7 +14,7 @@ import { hydrateSessionMeta } from "./src/session-meta.js"
 import { registerSleep } from "./src/sleep.js"
 import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { hydrateTickets, TICKET_STATES, type TicketState } from "./src/ticket.js"
-import { registerTicketTools, renderTicketText, renderTicketsText } from "./src/ticket-tools.js"
+import { registerTicketTools, renderTicketTextDeep, renderTicketsTextDeep } from "./src/ticket-tools.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
 import { pluginVersion, versionNotice } from "./src/version.js"
@@ -167,15 +167,15 @@ export default Plugin.define({
               }),
             )
           }
-          return Effect.sync(() =>
-            renderTicketsText({
-              ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
-              ...(input.status === undefined ? {} : { status: input.status }),
-              ...(input.limit === undefined ? {} : { limit: input.limit }),
-            }),
-          ).pipe(Effect.map((text) => ({ text })))
+          // Read through the ticket store's KV fallback: memory only keeps the
+          // newest tickets, and a trimmed one must not look missing here.
+          return renderTicketsTextDeep(ctx, {
+            ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+            ...(input.status === undefined ? {} : { status: input.status }),
+            ...(input.limit === undefined ? {} : { limit: input.limit }),
+          }).pipe(Effect.map((text) => ({ text })))
         },
-        ticket: (input) => Effect.sync(() => ({ text: renderTicketText(input.ticketID) })),
+        ticket: (input) => renderTicketTextDeep(ctx, input.ticketID).pipe(Effect.map((text) => ({ text }))),
         ...rejectedRouterRpc,
         trigger: (input) =>
           runTrigger(ctx, input).pipe(

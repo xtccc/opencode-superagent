@@ -6,7 +6,9 @@ import {
   createTicket,
   currentTrigger,
   getTicket,
+  listTicketRecords,
   listTickets,
+  loadTicket,
   renderTicketDetail,
   renderTicketList,
   TICKET_STATES,
@@ -120,10 +122,14 @@ const runTicketCreate = Effect.fn("superagent.ticketCreate")(function* (
   }
 })
 
-const runTicketList = Effect.fn("superagent.ticketList")(function* (input: TicketListInput, caller: string) {
+const runTicketList = Effect.fn("superagent.ticketList")(function* (
+  ctx: Plugin.Context,
+  input: TicketListInput,
+  caller: string,
+) {
   yield* requireRouter(caller, "ticket_list")
   const text = renderTicketList(
-    listTickets({
+    yield* listTicketRecords(ctx, {
       ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
       ...(input.status === undefined ? {} : { status: input.status }),
       ...(input.since === undefined ? {} : { since: input.since }),
@@ -181,6 +187,26 @@ export function renderTicketText(ticketID: string): string {
   return renderTicketDetail(ticket)
 }
 
+/**
+ * RPC helpers that consult KV when memory no longer holds the record (it is
+ * trimmed to the newest `MEMORY_LIMIT` tickets). The TUI reads through these
+ * so a closed ticket that still exists in KV is never reported as missing.
+ */
+export const renderTicketsTextDeep = (ctx: Plugin.Context, input: TicketListInput = {}) =>
+  listTicketRecords(ctx, {
+    ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+    ...(input.status === undefined ? {} : { status: input.status }),
+    ...(input.since === undefined ? {} : { since: input.since }),
+    ...(input.limit === undefined ? {} : { limit: input.limit }),
+  }).pipe(Effect.map(renderTicketList))
+
+export const renderTicketTextDeep = (ctx: Plugin.Context, ticketID: string) =>
+  loadTicket(ctx, ticketID).pipe(
+    Effect.map((ticket) =>
+      ticket === undefined ? `没有找到工单 ${ticketID}` : renderTicketDetail(ticket),
+    ),
+  )
+
 export const registerTicketTools = Effect.fn("superagent.registerTicketTools")(function* (ctx: Plugin.Context) {
   yield* ctx.tool.transform((editor) => {
     editor.add({
@@ -197,7 +223,7 @@ export const registerTicketTools = Effect.fn("superagent.registerTicketTools")(f
       input: TicketListInput,
       output: TicketTextOutput,
       options: { permission: toolPermission(specFor("ticket_list")) },
-      execute: (input, context) => runTicketList(input, context.sessionID),
+      execute: (input, context) => runTicketList(ctx, input, context.sessionID),
     })
     editor.add({
       name: "ticket_update",
