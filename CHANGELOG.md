@@ -5,61 +5,35 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
-Cross-platform directory handling, ticket search/resiliency, a release gate, a
-`dispatch` reasoning `effort`, and a two-level `/tickets` browser. No config
-changes are required to upgrade; `pendingTTLMs` is a new optional option and the
-rest is behaviour. A gateway restart is still needed to load the new code
-(`effort`), and the TUI must be reopened for the new `/tickets` panes.
+Nothing yet — see `0.5.0` below.
 
-### Fixed
+## 0.5.0 — 2026-11-11
 
-- **Windows paths are accepted everywhere a `directory` is.** `normalizeDirectory`
-  now recognises POSIX (`/opt/project`), Windows drive (`C:\project`, `C:/project`,
-  `c:\project`) and MSYS (`/c/project`) forms and canonicalises all of them to one
-  spelling (`C:\project`), so aliases, thread bindings and conflict detection
-  treat the same directory as one directory. Rejected input now reports a single
-  message listing the three accepted shapes instead of "must be an absolute path".
-  UNC paths and `~` are still rejected (see README "已知限制").
-- **Directory aliases match on word boundaries.** `app` no longer matches
-  `appstore`/`myapp`, while `修复app的问题` and `app/web` still hit; longer aliases
-  win. A basename that maps to two directories keeps the first registration and
-  excludes the alias from automatic matching (the conflict is recorded and shown
-  by `dirs:`), the alias table is capped at 24 entries (LRU eviction), and the
-  status line lists only the newest 5 with `+N older` / `conflicts=N`.
-- **An interrupted worker parks its ticket instead of freezing it.** The watcher
-  moves the in-progress ticket to `blocked` with an `interrupted: <reason>`
-  history entry, and the dispatch gate now lets that `idle` worker be replaced
-  once the ticket was parked — `ticket_update({ status: "in_progress" })` is
-  enough to re-dispatch, no `abort_session` + new ticket required.
-- **Restart no longer leaves an interrupted ticket stuck in `in_progress`.**
-  `hydrate` replayed a `running` record whose session ended as `interrupted` into
-  `idle` but only closed tickets for `done`/`failed`, so the ticket stayed
-  `in_progress` behind the idle gate forever. The hydrate path now calls
-  `blockTicketsForWorker`, like the watcher does; `test/lifecycle-regressions.test.ts`
-  covers the restart scenario and the follow-up re-dispatch.
-- **A trimmed ticket is no longer reported missing.** Memory keeps the newest 500
-  tickets; `ticket`, `ticket_update`, `ticket_close`, `linkTicketToWorker`,
-  `tickets` and the TUI now fall back to a single KV `get` (and a paged scan only
-  when memory cannot fill a list page). Hydrate also counts the records in KV so
-  "memory is complete" is answerable.
-- **Failed KV writes are queued, not swallowed.** A ticket or index write that
-  throws stays in a dirty queue and is retried by the next mutation or read, so a
-  restart cannot resurrect the previous state.
-- **Truncation is code-point safe.** Titles/objectives/acceptance are length
-  checked in code points (`40` emoji is 40 characters, not 80) and every clip
-  (`clipCodePoints`/`clipUtf16`) keeps surrogate pairs together, so stored text
-  never ends in half an emoji.
-- **Router creation is serialised.** `ensureRouter`'s check → create → persist ran
-  concurrently, so two callers could each create a router and one KV write would
-  orphan the other. A process-wide semaphore (on `globalThis`, shared like the
-  store) guards it, and the winner's id is re-read under the lock.
-- **Pending replay expires.** `hydratePending` drops entries older than
-  `pendingTTLMs` (default 24h, measured from `arrivedAt`) instead of injecting a
-  day-old follow-up after a restart; the count is logged and kept in
-  `store.pendingDropped` for `status`.
-- **Composition root is covered.** `server.ts` now renders tickets through the
-  KV-fallback helpers, and `test/server-setup.test.ts` / `test/router-ensure.test.ts`
-  pin the setup path and the router lock.
+Breaking: the slash-command surface changed. The plain-text `/tickets` list was
+removed and the two-level browser that used to be `/task` now owns `/tickets`.
+
+Everything else is additive or behavioural: a `dispatch` reasoning `effort`,
+short-id search, cross-platform directories, a release gate, and a batch of
+concurrency/persistence fixes. The only config change is the new optional
+`pendingTTLMs`. A gateway restart is needed to load the new code (`effort`), and
+the TUI must be reopened for the `/tickets` panes.
+
+### 🔥 Breaking
+
+- **The plain-text `/tickets` list command is gone.** Its one-shot
+  `dialog.alert` of the `tickets` RPC text was a narrower version of the
+  browser's list pane, and its slash name is now owned by the browser. Browsing
+  goes through `/tickets` (same rows plus a detail pane); the `tickets` RPC and
+  the sidebar ticket panel are unchanged.
+- **The two-level ticket browser is now `/tickets`; `/task` no longer exists.**
+  The command keeps its panes, keys, size maths and short-id search; only the
+  slash name changed (`/task` → `/tickets`), which is why the old `/tickets`
+  text list could not stay (see above). `/ticket <id>` is unchanged and still
+  opens a single ticket, so the pair now reads as: `/tickets` browses and
+  searches, `/ticket <short id>` opens one. The command table moved to
+  `src/commands.ts` and `tui.tsx` only binds each `run` key to its handler, so
+  `test/commands.test.ts` can pin the registered slash names without loading the
+  Solid renderer.
 
 ### Added
 
@@ -79,39 +53,6 @@ rest is behaviour. A gateway restart is still needed to load the new code
   (`档位：`), per attempt. `src/effort.ts` is the single list shared by the tool
   catalog (`/tools`), the RPC schema (`dispatch` accepts an optional `effort`,
   so older clients keep working) and the dispatcher.
-- **4-character short-id search for `/tickets` and `/ticket`.** The sidebar shows
-  `dc8d` for `tk_mwbkve34_dc8d`; the picker and `/ticket` now accept that short
-  id, a full id, a prefix, a suffix or any middle fragment (case and `tk`/`_`/`-`
-  separators ignored). Ranking is exact > suffix > prefix > middle > title, and an
-  ambiguous query lists candidates instead of guessing (`src/ticket-search.ts`).
-- **A bigger, terminal-aware picker.** The host's `dialog.select` cannot be
-  resized (list capped at `floor(rows/2)-6` rows in a 60-column frame), so
-  `/tickets` and `/ticket` draw their own `PickerDialog` (`src/tui-picker.ts`):
-  75% of the terminal height, 12–30 visible rows, 40–112 columns, keys matching
-  the built-in select. `test/tui-picker.test.ts` pins the layout maths.
-- **A release gate.** `bun run release:check` (`script/release-check.ts`) runs
-  typecheck → test → build → `bun pm pack` and validates the tarball (entry points
-  present, packed version matches `package.json`, no `src/`/`test/`/`e2e/`/
-  `script/`/`.github/` inside). `prepublishOnly` calls it, so a red gate blocks
-  `npm publish`; CI runs the same command instead of three separate steps.
-- **Hydrate does bounded concurrent lookups.** `HYDRATE_CONCURRENCY = 8` for
-  `hydrate` and `hydrateSessionMeta`, replacing one serial `session.get` per
-  record, while state transitions and ticket reconciliation still apply in record
-  order.
-
-### Changed
-
-- **The router prompt now carries an effort allocation policy.** `ROUTER_PROMPT`
-  gained a 「推理档位分配」 section: concrete criteria for `low` / `medium`
-  (default) / `high`, an explicit ban on "just use high to be safe", retry
-  escalation (low→medium→high after a failed or interrupted worker, with a
-  one-line reason), and a `effort=<level>：<reason>` accounting line required on
-  the first line of every dispatch task. It also restates the boundaries the
-  dispatcher enforces — no combination with an explicit `agent` override, the
-  model's `variants` whitelist, and the `(unverified: inherited)` degradation —
-  so the router stops guessing. The worker prompt keeps only a short
-  "the level is fixed at session creation" constraint, never the policy itself.
-
 - **The `/tickets` browser is two-level: the list opens details, not sessions.**
   `⏎` on a row now shows that row's detail (ticket fields parsed from the
   `ticket` RPC text, or a worker summary), `/` searches, `q` closes. Ticket rows
@@ -129,6 +70,55 @@ rest is behaviour. A gateway restart is still needed to load the new code
   (`⏎ 详情 · q 退出 · / 搜索` vs `⏎ 进入会话 · q 返回`). The detail pane reuses
   `computeDialogSize`/`layoutPickerRow` from the existing picker, so there is
   one set of layout constants; `src/picker-nav.ts` holds the pure key map.
+- **4-character short-id search for `/tickets` and `/ticket`.** The sidebar shows
+  `dc8d` for `tk_mwbkve34_dc8d`; the picker and `/ticket` now accept that short
+  id, a full id, a prefix, a suffix or any middle fragment (case and `tk`/`_`/`-`
+  separators ignored). Ranking is exact > suffix > prefix > middle > title, and an
+  ambiguous query lists candidates instead of guessing (`src/ticket-search.ts`).
+- **A release gate.** `bun run release:check` (`script/release-check.ts`) runs
+  typecheck → test → build → `bun pm pack` and validates the tarball (entry points
+  present, packed version matches `package.json`, no `src/`/`test/`/`e2e/`/
+  `script/`/`.github/` inside). `prepublishOnly` calls it, so a red gate blocks
+  `npm publish`; CI runs the same command instead of three separate steps.
+
+### Changed
+
+- **The router prompt now carries an effort allocation policy.** `ROUTER_PROMPT`
+  gained a 「推理档位分配」 section: concrete criteria for `low` / `medium`
+  (default) / `high`, an explicit ban on "just use high to be safe", retry
+  escalation (low→medium→high after a failed or interrupted worker, with a
+  one-line reason), and a `effort=<level>：<reason>` accounting line required on
+  the first line of every dispatch task. It also restates the boundaries the
+  dispatcher enforces — no combination with an explicit `agent` override, the
+  model's `variants` whitelist, and the `(unverified: inherited)` degradation —
+  so the router stops guessing. The worker prompt keeps only a short
+  "the level is fixed at session creation" constraint, never the policy itself.
+- **Windows paths are accepted everywhere a `directory` is.** `normalizeDirectory`
+  now recognises POSIX (`/opt/project`), Windows drive (`C:\project`, `C:/project`,
+  `c:\project`) and MSYS (`/c/project`) forms and canonicalises all of them to one
+  spelling (`C:\project`), so aliases, thread bindings and conflict detection
+  treat the same directory as one directory. Rejected input now reports a single
+  message listing the three accepted shapes instead of "must be an absolute path".
+  UNC paths and `~` are still rejected (see README "已知限制").
+- **Directory aliases match on word boundaries.** `app` no longer matches
+  `appstore`/`myapp`, while `修复app的问题` and `app/web` still hit; longer aliases
+  win. A basename that maps to two directories keeps the first registration and
+  excludes the alias from automatic matching (the conflict is recorded and shown
+  by `dirs:`), the alias table is capped at 24 entries (LRU eviction), and the
+  status line lists only the newest 5 with `+N older` / `conflicts=N`.
+- **An interrupted worker parks its ticket instead of freezing it.** The watcher
+  moves the in-progress ticket to `blocked` with an `interrupted: <reason>`
+  history entry, and the dispatch gate now lets that `idle` worker be replaced
+  once the ticket was parked — `ticket_update({ status: "in_progress" })` is
+  enough to re-dispatch, no `abort_session` + new ticket required.
+- **Hydrate does bounded concurrent lookups.** `HYDRATE_CONCURRENCY = 8` for
+  `hydrate` and `hydrateSessionMeta`, replacing one serial `session.get` per
+  record, while state transitions and ticket reconciliation still apply in record
+  order.
+- **Pending replay expires.** `hydratePending` drops entries older than
+  `pendingTTLMs` (default 24h, measured from `arrivedAt`) instead of injecting a
+  day-old follow-up after a restart; the count is logged and kept in
+  `store.pendingDropped` for `status`.
 - **E2E tests the local tarball.** `e2e/plugin-load.e2e.ts` now runs
   `bun pm pack` on the working tree, installs that tarball into a scratch prefix,
   compares the installed `dist/` with the fresh build, and boots a real host
@@ -136,22 +126,47 @@ rest is behaviour. A gateway restart is still needed to load the new code
   workflow also triggers on `src/**`, `server.ts`, `tui.tsx`, `agent/**`,
   `script/**`, `test/**`, `tsconfig*.json` and `bun.lock`, so a code change can
   reach the E2E instead of silently rotting it.
-- **The two-level browser is `/tickets`.** The command keeps its panes, keys,
-  size maths and short-id search; only the slash name changed (`/task` →
-  `/tickets`), which is why the old `/tickets` text list was deleted (see
-  Removed). `/ticket <id>` is unchanged and still opens a single ticket, so the
-  pair now reads as: `/tickets` browses and searches, `/ticket <short id>` opens
-  one. The command table moved to `src/commands.ts` and `tui.tsx` only binds each
-  `run` key to its handler, so `test/commands.test.ts` can pin the registered
-  slash names without loading the Solid renderer.
 
-### Removed
+### Fixed
 
-- **The plain-text `/tickets` list command is gone.** Its one-shot
-  `dialog.alert` of the `tickets` RPC text was a narrower version of the
-  browser's list pane, and its slash name is now owned by the browser. Browsing
-  goes through `/tickets` (same rows plus a detail pane); the `tickets` RPC and
-  the sidebar ticket panel are unchanged.
+- **Restart no longer leaves an interrupted ticket stuck in `in_progress`.**
+  `hydrate` replayed a `running` record whose session ended as `interrupted` into
+  `idle` but only closed tickets for `done`/`failed`, so the ticket stayed
+  `in_progress` behind the idle gate forever. The hydrate path now calls
+  `blockTicketsForWorker`, like the watcher does; `test/lifecycle-regressions.test.ts`
+  covers the restart scenario and the follow-up re-dispatch.
+- **Two concurrent dispatches of one ticket cannot both create a session.**
+  `inFlightTickets` was a module-level `Set`, so when the host loaded two copies
+  of the plugin (two install paths for one version, or a re-reconciliation) each
+  copy had its own table and both could claim the same ticket. The set now lives
+  on `globalThis` under a `Symbol.for` key, like `store`, so every in-process copy
+  shares one claim table; the claim is still taken in one synchronous
+  check-and-insert and released by `Effect.ensuring` on success, failure and
+  interruption.
+- **A trimmed ticket is no longer reported missing.** Memory keeps the newest 500
+  tickets; `ticket`, `ticket_update`, `ticket_close`, `linkTicketToWorker`,
+  `tickets` and the TUI now fall back to a single KV `get` (and a paged scan only
+  when memory cannot fill a list page). Hydrate also counts the records in KV so
+  "memory is complete" is answerable.
+- **Failed KV writes are queued, not swallowed.** A ticket or index write that
+  throws stays in a dirty queue and is retried by the next mutation or read, so a
+  restart cannot resurrect the previous state.
+- **Truncation is code-point safe.** Titles/objectives/acceptance are length
+  checked in code points (`40` emoji is 40 characters, not 80) and every clip
+  (`clipCodePoints`/`clipUtf16`) keeps surrogate pairs together, so stored text
+  never ends in half an emoji.
+- **Router creation is serialised.** `ensureRouter`'s check → create → persist ran
+  concurrently, so two callers could each create a router and one KV write would
+  orphan the other. A process-wide semaphore (on `globalThis`, shared like the
+  store) guards it, and the winner's id is re-read under the lock.
+- **The ticket picker is big enough to read.** The host's `dialog.select` cannot
+  be resized (list capped at `floor(rows/2)-6` rows in a 60-column frame), so
+  `/tickets` and `/ticket` draw their own `PickerDialog` (`src/tui-picker.ts`):
+  75% of the terminal height, 12–30 visible rows, 40–112 columns, keys matching
+  the built-in select. `test/tui-picker.test.ts` pins the layout maths.
+- **Composition root is covered.** `server.ts` now renders tickets through the
+  KV-fallback helpers, and `test/server-setup.test.ts` / `test/router-ensure.test.ts`
+  pin the setup path and the router lock.
 
 ## 0.4.0
 
