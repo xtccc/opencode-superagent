@@ -1,9 +1,12 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
+import type { Model } from "@opencode/schema/model"
+import { VariantID } from "@opencode/schema/model"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
 import { WORKER_AGENT } from "./agents.js"
 import { directoryError, normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
+import { DISPATCH_EFFORTS, type DispatchEffort } from "./effort.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
 import {
@@ -20,11 +23,20 @@ import { specFor } from "./tools.js"
 import { pluginVersion } from "./version.js"
 import { isWorkerTerminal, type WorkerRecord } from "./worker-state.js"
 
+/**
+ * The effort levels are shared with the tool catalog and the RPC contract
+ * (`./effort.ts`); a model advertises the subset it supports in `variants`
+ * (`ctx.model.list()`), which is the only whitelist — the server stores an
+ * unknown variant instead of rejecting it, so the check happens here.
+ */
+const DispatchEffortSchema = Schema.Literals(DISPATCH_EFFORTS)
+
 export const DispatchInput = Schema.Struct({
   task: Schema.String,
   title: Schema.optionalKey(Schema.String),
   threadID: Schema.optionalKey(Schema.String),
   agent: Schema.optionalKey(Schema.String),
+  effort: Schema.optionalKey(DispatchEffortSchema),
   directory: Schema.optionalKey(Schema.String),
   ticketID: Schema.String,
 })
@@ -41,6 +53,7 @@ interface DispatchInput {
   readonly title?: string
   readonly threadID?: string
   readonly agent?: string
+  readonly effort?: DispatchEffort
   readonly directory?: string
   readonly ticketID: string
 }
@@ -274,6 +287,141 @@ const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (
 })
 
 /**
+ * Structural model reference, taken from the published schema type so the
+ * branded ids of `sessions.get` narrow into it and `sessions.create` accepts it.
+ */
+type ModelRef = Model.Ref
+
+/**
+ * The catalog subset used for effort resolution. Both entry points are
+ * optional on purpose: tests and older hosts may not expose `ctx.model`, and a
+ * missing catalog must degrade, never block a dispatch.
+ */
+interface ModelCatalog {
+  readonly list?: (input?: {
+    readonly location?: { readonly directory?: string }
+  }) => Effect.Effect<{ readonly data: ReadonlyArray<Model.Info> }, unknown>
+  readonly default?: (input?: {
+    readonly location?: { readonly directory?: string }
+  }) => Effect.Effect<{ readonly data: Model.Info | undefined }, unknown>
+}
+
+function catalogOf(ctx: Plugin.Context): ModelCatalog | undefined {
+  return (ctx as unknown as { readonly model?: ModelCatalog }).model
+}
+
+const locationInput = (directory: string | undefined) =>
+  directory === undefined ? undefined : { location: { directory } }
+
+/** Variants the catalog advertises for one model, or `undefined` when it cannot tell. */
+function modelVariants(
+  ctx: Plugin.Context,
+  model: ModelRef,
+  directory: string | undefined,
+): Effect.Effect<ReadonlyArray<string> | undefined> {
+  return Effect.suspend(() => {
+    const list = catalogOf(ctx)?.list
+    if (list === undefined) return Effect.succeed(undefined)
+    return list(locationInput(directory)).pipe(
+      Effect.map((output) =>
+        output.data
+          .find((entry) => entry.providerID === model.providerID && entry.id === model.id)
+          ?.variants.map((variant) => String(variant.id)),
+      ),
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent model catalog unavailable; keeping the inherited effort", {
+          model: `${model.providerID}/${model.id}`,
+          cause,
+        }).pipe(Effect.as(undefined)),
+      ),
+      Effect.catchDefect((defect) =>
+        Effect.logWarning("superagent model catalog threw; keeping the inherited effort", {
+          model: `${model.providerID}/${model.id}`,
+          defect,
+        }).pipe(Effect.as(undefined)),
+      ),
+    )
+  })
+}
+
+/** The catalog's default model for a directory, used when the router has no explicit one. */
+const defaultModelRef = (
+  ctx: Plugin.Context,
+  directory: string | undefined,
+): Effect.Effect<ModelRef | undefined> =>
+  Effect.suspend(() => {
+    const fallback = catalogOf(ctx)?.default
+    if (fallback === undefined) return Effect.succeed(undefined)
+    return fallback(locationInput(directory)).pipe(
+      Effect.map((output) =>
+        output.data === undefined
+          ? undefined
+          : { providerID: output.data.providerID, id: output.data.id },
+      ),
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent default model unavailable; keeping the inherited effort", { cause }).pipe(
+          Effect.as(undefined),
+        ),
+      ),
+      Effect.catchDefect((defect) =>
+        Effect.logWarning("superagent default model threw; keeping the inherited effort", { defect }).pipe(
+          Effect.as(undefined),
+        ),
+      ),
+    )
+  })
+
+interface EffortResolution {
+  /** Model to create the worker with; `undefined` keeps the inherited resolution. */
+  readonly model: ModelRef | undefined
+  /** What the ticket records for this dispatch: the applied effort, or why it was not. */
+  readonly note: string | undefined
+}
+
+/**
+ * Turn the requested effort into the worker's `model.variant`.
+ *
+ * `ctx.model.list()` is the whitelist: every model advertises its `variants`,
+ * and the server silently stores an unknown variant, so a value that is not in
+ * the list is rejected here instead of becoming a broken session model.
+ *
+ * A catalog failure degrades to the inherited model (logged, not fatal): a
+ * dispatch must not be blocked because model discovery hiccuped. The ticket
+ * note keeps that visible as `<effort> (unverified)`, so the history never
+ * claims an effort that was not applied.
+ */
+const resolveEffortModel = Effect.fn("superagent.resolveEffortModel")(function* (
+  ctx: Plugin.Context,
+  input: {
+    readonly effort: DispatchEffort
+    readonly base: ModelRef | undefined
+    readonly directory: string | undefined
+  },
+) {
+  const effort = input.effort
+  const target = input.base ?? (yield* defaultModelRef(ctx, input.directory))
+  if (target === undefined) {
+    yield* Effect.logWarning("superagent cannot resolve a model for the requested effort; inheriting", {
+      effort,
+    })
+    return { model: undefined, note: `${effort} (unresolved: inherited)` }
+  }
+  const variants = yield* modelVariants(ctx, target, input.directory)
+  if (variants === undefined) {
+    // Catalog failure degrades to the inherited model: keep whatever the worker
+    // would have inherited rather than downgrading it to the default resolution.
+    return { model: input.base, note: `${effort} (unverified: inherited)` }
+  }
+  if (!variants.includes(effort)) {
+    const available = variants.length === 0 ? "none (this model has no reasoning variants)" : variants.join(", ")
+    return yield* new Tool.Error({
+      message: `dispatch: effort ${effort} is not available for ${target.providerID}/${target.id}; available: ${available}; omit effort to inherit the router's current effort`,
+    })
+  }
+  return { model: { providerID: target.providerID, id: target.id, variant: VariantID.make(effort) }, note: effort }
+})
+
+/**
  * The one dispatch implementation, shared by the `dispatch` tool and the
  * `dispatch` RPC. Both paths pass the same ticket gate: `ticketID` is required
  * by the schema and re-checked here, so a direct RPC call cannot skip the
@@ -366,6 +514,26 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
     requested: requestedDir ?? ticketDir,
   })
   const targetDirectory = rememberedDir ?? routerDirectory
+  // An explicit agent keeps its own model priority, so there is no model to
+  // attach a variant to: refuse instead of silently dropping the effort.
+  if (input.effort !== undefined && input.agent !== undefined) {
+    return yield* new Tool.Error({
+      message:
+        "dispatch: effort cannot be combined with an explicit agent override — the agent keeps its own model. Omit agent to set effort, or omit effort to run the agent's own effort.",
+    })
+  }
+  const inheritedModel = input.agent === undefined ? routerModel : undefined
+  // No effort: the worker inherits the router model exactly as before. With an
+  // effort: the model reference gains `variant`, after the catalog whitelist
+  // check in `resolveEffortModel`.
+  const resolved: EffortResolution =
+    input.effort === undefined
+      ? { model: inheritedModel, note: undefined }
+      : yield* resolveEffortModel(ctx, {
+          effort: input.effort,
+          base: inheritedModel,
+          directory: targetDirectory,
+        })
   const threads = [threadID]
   const current = currentTrigger()
   const authorizing =
@@ -381,7 +549,7 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
         threadID,
       }),
       ...(agentResolved === undefined ? {} : { agent: agentResolved }),
-      ...(input.agent === undefined && routerModel !== undefined ? { model: routerModel } : {}),
+      ...(resolved.model === undefined ? {} : { model: resolved.model }),
       ...(targetDirectory === undefined ? {} : { location: { directory: AbsolutePath.make(targetDirectory) } }),
       metadata: superagentMetadata("worker", threads),
     })
@@ -423,6 +591,7 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
     ticketID: ticket.id,
     sessionID: created.id,
     ...(targetDirectory === undefined ? {} : { note: targetDirectory }),
+    ...(resolved.note === undefined ? {} : { effort: resolved.note }),
   }).pipe(
     Effect.as(undefined),
     Effect.catchTag("Tool.Error", (error) => Effect.succeed(error.message)),

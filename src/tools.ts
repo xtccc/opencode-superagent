@@ -16,6 +16,8 @@
  * schema in `test/tools.test.ts`, which fails when the two drift apart.
  */
 
+import { DISPATCH_EFFORTS } from "./effort.js"
+
 export type ToolRisk = "read" | "write" | "terminate"
 export type ToolGroup = "dispatch" | "query" | "control"
 
@@ -69,13 +71,14 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     name: "dispatch",
     group: "dispatch",
     description:
-      "Dispatch one independent task to a background worker session in the given directory (absolute path). ticketID is required and must be an open/in_progress ticket for this thread with no running worker: create it with ticket_create first. Only the router may call it.",
+      "Dispatch one independent task to a background worker session in the given directory (absolute path). ticketID is required and must be an open/in_progress ticket for this thread with no running worker: create it with ticket_create first. effort optionally sets the worker's reasoning level (low/medium/high/max) and must be one the worker model advertises; omit it to inherit the router's current level. Only the router may call it.",
     summary: "把独立任务派给后台 Worker 会话，不阻塞 Router。",
     params: [
       { name: "task", required: true, type: "string", note: "任务内容" },
       { name: "title", required: false, type: "string", note: "会话标题" },
       { name: "threadID", required: false, type: "string", note: "thread 绑定" },
       { name: "agent", required: false, type: "string", note: "覆盖默认 agent" },
+      { name: "effort", required: false, type: "string", values: DISPATCH_EFFORTS, note: "推理档位，缺省继承 Router" },
       { name: "directory", required: false, type: "string", note: "绝对路径" },
       { name: "ticketID", required: true, type: "string", note: "必填，先 ticket_create" },
     ],
@@ -84,6 +87,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     usage: [
       "强制：必须先 ticket_create 建单，再 dispatch({ ticketID })；缺 ticketID 直接报错。",
       "工单须为 open/in_progress、属于同一 thread、且没有运行中的 Worker；被拒时按报错补救（补建单 / 等原 Worker 结束或 abort_session 后建新单）再派。",
+      "effort 影响 Worker 推理档位：只能取该模型 variants 里的档位，否则报错并列出可用档位；缺省继承 Router 当前档位，且不能与 agent 覆盖同用。",
       "每次派发都要带 directory（绝对路径）；Router 会复用 thread 绑定与目录别名。",
       "同一 thread 的后续消息直投该 Worker，不要重复 dispatch。",
       "派发成功即绑定工单：workerSessionID 写入、attempts+1、state → in_progress；Worker 结束自动结单。",

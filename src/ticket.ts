@@ -942,6 +942,13 @@ export interface LinkTicketInput {
   readonly ticketID: string
   readonly sessionID: string
   readonly note?: string
+  /**
+   * Reasoning effort this dispatch asked for, already resolved by the
+   * dispatcher (`high`, or `high (unverified: inherited)` when the model
+   * catalog could not confirm it). Recorded per attempt in the history, so a
+   * retry shows its own effort instead of inheriting a stale one.
+   */
+  readonly effort?: string
   readonly now?: number
 }
 
@@ -967,7 +974,11 @@ export const linkTicketToWorker = Effect.fn("superagent.linkTicketToWorker")(fun
     sessionID: input.sessionID,
     ...(input.note === undefined ? {} : { note: input.note }),
   })
-  ticket.history.push({ at: now, kind: "dispatch", note: `worker ${input.sessionID}` })
+  ticket.history.push({
+    at: now,
+    kind: "dispatch",
+    note: input.effort === undefined ? `worker ${input.sessionID}` : `worker ${input.sessionID} effort=${input.effort}`,
+  })
   if (ticket.state === "open") {
     ticket.history.push({ at: now, kind: "state", from: "open", to: "in_progress" })
     ticket.state = "in_progress"
@@ -1090,6 +1101,24 @@ function shortTime(epoch: number): string {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+/**
+ * Reasoning effort recorded on the newest dispatch of this ticket, e.g.
+ * `high`, or `high (unverified: inherited)` when the dispatcher could not
+ * confirm it. `undefined` when the last dispatch asked for nothing (older
+ * dispatches, or a plain inherited dispatch), so the detail view says nothing
+ * rather than inventing a level.
+ */
+export function dispatchEffort(ticket: Ticket): string | undefined {
+  for (let index = ticket.history.length - 1; index >= 0; index--) {
+    const entry = ticket.history[index]
+    if (entry === undefined || entry.kind !== "dispatch") continue
+    if (entry.note === undefined) return undefined
+    const match = /(?:^|\s)effort=(\S+(?:\s+\([^)]*\))?)/.exec(entry.note)
+    return match?.[1]
+  }
+  return undefined
+}
+
 export function renderTicketList(items: ReadonlyArray<Ticket>, width = DETAIL_WIDTH): string {
   if (items.length === 0) return "暂无工单（用户交代新任务时先 ticket_create）"
   const active = items.filter((ticket) => ACTIVE_STATES.includes(ticket.state)).length
@@ -1119,6 +1148,8 @@ export function renderTicketDetail(ticket: Ticket, width = DETAIL_WIDTH): string
   lines.push(...wrapLabel("thread：", ticket.threadID, width))
   lines.push(...wrapLabel("目录：", ticket.directory ?? "-", width))
   lines.push(...wrapLabel("worker：", ticket.workerSessionID ?? "-", width))
+  const effort = dispatchEffort(ticket)
+  if (effort !== undefined) lines.push(...wrapLabel("档位：", effort, width))
   lines.push(...wrapLabel("尝试：", `${ticket.attempts.length}`, width))
   lines.push(...wrapLabel("建档：", shortTime(ticket.createdAt), width))
   lines.push(...wrapLabel("更新：", shortTime(ticket.updatedAt), width))

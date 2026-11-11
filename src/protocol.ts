@@ -1,5 +1,6 @@
 import { Rpc } from "@opencode/plugin/effect"
 import { Schema } from "effect"
+import { DISPATCH_EFFORTS } from "./effort.js"
 // `ticket-view` carries the TUI-safe copy of the state list (it must not import
 // the KV-backed store); `test/ticket-view.test.ts` keeps it in step with
 // `src/ticket.ts`, so reusing it here keeps the RPC enum from drifting.
@@ -67,6 +68,9 @@ export const Definition = Rpc.define({
           title: Schema.optionalKey(Schema.String),
           threadID: Schema.optionalKey(Schema.String),
           agent: Schema.optionalKey(Schema.String),
+          // Optional so older clients keep working; the tool path applies the
+          // `variants` whitelist before it reaches `sessions.create`.
+          effort: Schema.optionalKey(Schema.Literals(DISPATCH_EFFORTS)),
           directory: Schema.optionalKey(Schema.String),
           // Required by the shape, but the RPC handler never runs it: RPC
           // cannot prove router identity, so `dispatch` fails closed with
