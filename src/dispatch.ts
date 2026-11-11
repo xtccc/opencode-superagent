@@ -3,7 +3,7 @@ import { AbsolutePath } from "@opencode/schema/schema"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
 import { WORKER_AGENT } from "./agents.js"
-import { normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
+import { directoryError, normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
 import {
@@ -73,8 +73,22 @@ export interface StatusOptions {
  * the same ticket cannot both pass: the loser fails with an explicit error
  * instead of creating a second worker session. The claim is released on
  * success, failure and interruption via `Effect.ensuring`.
+ *
+ * The set lives on `globalThis` for the same reason `store` does: the host may
+ * load two copies of this plugin (two install paths for one version, or a
+ * re-reconciliation), and a module-level set would let each copy claim the
+ * same ticket, dispatching two workers for one work order. `Symbol.for` gives
+ * both copies the same registry within a process.
  */
-const inFlightTickets = new Set<string>()
+const IN_FLIGHT_KEY = Symbol.for("opencode-superagent.inflight-tickets.v1")
+
+type GlobalWithInFlight = typeof globalThis & { [IN_FLIGHT_KEY]?: Set<string> }
+
+const inflightGlobals = globalThis as GlobalWithInFlight
+
+const inFlightTickets: Set<string> = inflightGlobals[IN_FLIGHT_KEY] ?? new Set<string>()
+
+inflightGlobals[IN_FLIGHT_KEY] = inFlightTickets
 
 /** Synchronous check-and-claim: only the first caller for a ticket gets `true`. */
 function claimDispatch(ticketID: string): boolean {
@@ -119,6 +133,11 @@ export function statusText(options: StatusOptions = {}): string {
     `router: ${store.routerID ?? "none"} pending: ${store.pending.length} workers=${workers.length} active=${live.length} tickets: open=${stats.open} in_progress=${stats.inProgress} blocked=${stats.blocked} closed=${stats.closed}`,
   ]
   if (activeTickets !== "") lines.push(`active tickets: ${activeTickets}`)
+  // Only shown when startup actually dropped something: a replayed trigger that
+  // outlived its TTL is invisible otherwise, and the Router would wonder why the
+  // thread it remembers never got an answer.
+  const dropped = store.pendingDropped ?? 0
+  if (dropped > 0) lines.push(`dropped ${dropped} expired pending trigger(s) at startup`)
   if (live.length === 0) lines.push("- (no active workers)")
   for (const worker of live) lines.push(liveWorkerLine(worker))
   if (options.includeFinished === true) {
@@ -304,8 +323,11 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
   const agents = ctx.agent
   const sessions = ctx.session
   const requested = input.agent ?? WORKER_AGENT
-  if (input.directory !== undefined && normalizeDirectory(input.directory) === undefined) {
-    return yield* new Tool.Error({ message: "dispatch directory must be an absolute path, e.g. /opt/ai-gw" })
+  // Same validation as ticket_create: one rule set, one message, no example
+  // directory that only exists on some machines.
+  const directoryFailure = input.directory === undefined ? undefined : directoryError(input.directory)
+  if (directoryFailure !== undefined) {
+    return yield* new Tool.Error({ message: `dispatch: ${directoryFailure}` })
   }
   // The ticket carries its thread; the dispatch must agree with it and
   // inherits it when the call omits one.

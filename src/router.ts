@@ -14,6 +14,13 @@ import { ROUTER_PERMISSIONS } from "./tools.js"
 const MAX_FLUSH = 20
 
 /**
+ * Default lifetime of an undelivered trigger. A trigger queued before a crash
+ * is replayed on restart only while it is younger than this: replaying a
+ * day-old follow-up asks the Router to act on a world that has moved on.
+ */
+export const DEFAULT_PENDING_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
  * How a delivered batch enters the router session. `queue` waits for the next
  * prompt boundary; `steer` is used by the interruptible `sleep` so a trigger
  * that woke the router is visible at the very next step boundary instead of
@@ -28,6 +35,30 @@ export type FlushDelivery = "queue" | "steer"
  * success, failure and interruption.
  */
 const flushLock = Semaphore.makeUnsafe(1)
+
+/**
+ * Serialise router creation. `ensureRouter` has several concurrent callers (a
+ * trigger, the `router` RPC, a flush), and its check → create → persist
+ * sequence is not atomic: two callers could both see "no router" and create a
+ * session each, with the KV write of one silently orphaning the other.
+ *
+ * The permit is process-wide (shared on `globalThis` like the store), because
+ * a duplicate plugin copy would otherwise hold its own semaphore and race the
+ * first copy. Effect releases the permit on success, failure and
+ * interruption, so a failed create never blocks the next attempt.
+ */
+const ROUTER_LOCK_KEY = Symbol.for("opencode-superagent.router-lock.v1")
+
+type GlobalWithRouterLock = typeof globalThis & {
+  [ROUTER_LOCK_KEY]?: ReturnType<typeof Semaphore.makeUnsafe>
+}
+
+const routerGlobals = globalThis as GlobalWithRouterLock
+
+const routerLock: ReturnType<typeof Semaphore.makeUnsafe> =
+  routerGlobals[ROUTER_LOCK_KEY] ?? Semaphore.makeUnsafe(1)
+
+routerGlobals[ROUTER_LOCK_KEY] = routerLock
 
 /** KV prefix for crash-safe pending triggers. Owned by the router; `state.ts` stays untouched. */
 export const PENDING_PREFIX = "pending:"
@@ -135,11 +166,40 @@ export const enqueuePending = Effect.fn("superagent.enqueuePending")(function* (
 })
 
 /**
+ * Replay TTL from plugin options (`pendingTTLMs`). A non-numeric or
+ * non-positive value falls back to the default, so a typo can never turn the
+ * pending queue into an unbounded replay.
+ */
+export function pendingTTLMs(ctx: Plugin.Context): number {
+  const configured = ctx.options["pendingTTLMs"]
+  return typeof configured === "number" && Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_PENDING_TTL_MS
+}
+
+/**
+ * Staleness is measured from `arrivedAt` (when this process accepted the
+ * trigger), not `createdAt`: a source timestamp may legitimately be old by the
+ * time a bot relays it, while the arrival time is what a crash interrupted.
+ */
+function isExpiredPending(item: PendingTrigger, now: number, ttl: number): boolean {
+  return now - item.arrivedAt > ttl
+}
+
+/**
  * Reload unflushed triggers left in KV by a crashed process back into the
  * memory queue. Never creates a router session: the queue waits until the
  * next `router` RPC or trigger asks for a flush.
+ *
+ * Entries older than the replay TTL are dropped from KV instead of replayed:
+ * a restart days later must not inject a follow-up the thread has moved past.
+ * The count is logged and kept on the store so `status` can show it.
  */
 export const hydratePending = Effect.fn("superagent.hydratePending")(function* (ctx: Plugin.Context) {
+  const ttl = pendingTTLMs(ctx)
+  const now = Date.now()
+  let dropped = 0
+  let oldestDroppedAge = 0
   let after: string | undefined
   do {
     const page = yield* ctx.storage
@@ -151,6 +211,12 @@ export const hydratePending = Effect.fn("superagent.hydratePending")(function* (
         yield* ctx.storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
         continue
       }
+      if (isExpiredPending(item, now, ttl)) {
+        dropped += 1
+        oldestDroppedAge = Math.max(oldestDroppedAge, now - item.arrivedAt)
+        yield* ctx.storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
+        continue
+      }
       const id = pendingID(item.trigger, item.arrivedAt)
       if (store.pending.some((existing) => pendingID(existing.trigger, existing.arrivedAt) === id)) continue
       store.pending.push(
@@ -159,14 +225,34 @@ export const hydratePending = Effect.fn("superagent.hydratePending")(function* (
     }
     after = page.next
   } while (after !== undefined)
+  if (dropped > 0) {
+    store.pendingDropped += dropped
+    yield* Effect.logWarning("superagent dropped expired pending triggers on hydrate", {
+      dropped,
+      ttlMs: ttl,
+      oldestAgeMs: oldestDroppedAge,
+    })
+  }
 })
 
 /**
  * Return the live router session, creating it when missing. A router id
  * whose session no longer exists is forgotten before creating a new one,
  * so a user-deleted router is recovered automatically.
+ *
+ * Every caller goes through `routerLock` (see `ensureRouterUnlocked`), so the
+ * check → create → persist sequence below is never executed concurrently.
  */
 export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx: Plugin.Context) {
+  return yield* routerLock.withPermit(ensureRouterUnlocked(ctx))
+})
+
+/**
+ * Body of `ensureRouter`, run while the router permit is held. Re-reading
+ * `store.routerID` and the KV id here is what makes the loser of a race adopt
+ * the winner's session instead of creating an orphan.
+ */
+const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(function* (ctx: Plugin.Context) {
   const sessions = ctx.session
   const storage = ctx.storage
   if (store.routerID !== undefined) {

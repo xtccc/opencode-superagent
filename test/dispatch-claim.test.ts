@@ -238,3 +238,79 @@ describe("a ticket is claimed before dispatch", () => {
     expect(String(retried.output.sessionID)).toBe("ses_worker_2")
   })
 })
+
+// ── process-wide claim ───────────────────────────────────────────────────────
+
+/**
+ * The registry key both copies agree on. A duplicate plugin module shares
+ * nothing module-level with this one, so this symbol is the contract.
+ */
+const SHARED_CLAIMS = Symbol.for("opencode-superagent.inflight-tickets.v1")
+
+function sharedClaims(): Set<string> {
+  return (globalThis as unknown as Record<symbol, Set<string>>)[SHARED_CLAIMS] as Set<string>
+}
+
+/**
+ * A second plugin module instance: bun loads a query-suffixed specifier as a
+ * fresh module, exactly like a duplicate install path. Its module-level state
+ * is new, while `globalThis` and the KV-backed stores stay shared.
+ *
+ * The specifier is held in a variable so the type checker does not try to
+ * resolve the query suffix as a file path; the cast restates the real surface.
+ */
+async function duplicateCopy(): Promise<typeof import("../src/dispatch.js")> {
+  const specifier = "../src/dispatch.js?copy=duplicate"
+  return (await import(specifier)) as typeof import("../src/dispatch.js")
+}
+
+describe("the dispatch claim is shared by every plugin copy", () => {
+  test("the claim registry lives on globalThis, next to the store", () => {
+    expect(sharedClaims()).toBeInstanceOf(Set)
+    expect(sharedClaims().size).toBe(0)
+  })
+
+  test("a second plugin copy cannot dispatch a ticket that is already in flight", async () => {
+    const ctx = claimContext()
+    const created = await succeed(createTicket(ctx, base))
+    const { gate, started } = ctx.installGate()
+
+    const first = await forkDispatch(ctx, created.ticket.id)
+    await Effect.runPromise(Deferred.await(started))
+    // This copy holds the claim; the other copy checks the same set, so it must
+    // lose instead of creating a second worker for the same work order.
+    expect(sharedClaims().has(created.ticket.id)).toBe(true)
+
+    const copy = await duplicateCopy()
+    const second = await Effect.runPromise(
+      Effect.exit(copy.runDispatch(ctx, { task: "修日志", ticketID: created.ticket.id }, ROUTER)),
+    )
+    expect(Exit.isFailure(second)).toBe(true)
+    if (Exit.isFailure(second)) {
+      expect(String(second.cause)).toContain(`dispatch already in progress for ticket ${created.ticket.id}`)
+    }
+    expect(ctx.createCalls()).toBe(1)
+
+    await release(gate)
+    const firstExit = await Effect.runPromise(Fiber.join(first))
+    expect(Exit.isSuccess(firstExit)).toBe(true)
+    expect(ctx.createdIDs()).toEqual(["ses_worker_1"])
+    expect(store.workers.size).toBe(1)
+    // The claim is released through the same shared set.
+    expect(sharedClaims().has(created.ticket.id)).toBe(false)
+  })
+
+  test("a copy that claims the ticket first blocks this copy", async () => {
+    const ctx = claimContext()
+    const created = await succeed(createTicket(ctx, base))
+    // Stand in for the other copy's claim: same symbol, same set.
+    sharedClaims().add(created.ticket.id)
+    try {
+      const message = await failure(runDispatch(ctx, { task: "修日志", ticketID: created.ticket.id }, ROUTER))
+      expect(message).toContain(`dispatch already in progress for ticket ${created.ticket.id}`)
+      expect(ctx.createCalls()).toBe(0)
+    } finally {
+      sharedClaims().delete(created.ticket.id)
+    }
+  })
+})

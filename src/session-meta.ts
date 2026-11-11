@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import type { Session } from "@opencode/schema/session"
 import { Effect, Option, type Schema } from "effect"
-import { store, toSessionID } from "./state.js"
+import { HYDRATE_CONCURRENCY, store, toSessionID } from "./state.js"
 
 /**
  * Session identity for the Super-agent prototype.
@@ -92,10 +92,21 @@ export const hydrateSessionMeta = Effect.fn("superagent.hydrateSessionMeta")(fun
   const targets: Array<{ sessionID: string; role: SuperagentRole }> = []
   if (store.routerID !== undefined) targets.push({ sessionID: store.routerID, role: "router" })
   for (const worker of store.workers.values()) targets.push({ sessionID: worker.sessionID, role: "worker" })
-  for (const target of targets) {
-    const current = yield* ctx.session.get({ sessionID: toSessionID(target.sessionID) }).pipe(Effect.option)
-    if (Option.isNone(current)) continue
-    const metadata = (current.value as Session.Info).metadata
+  // One `session.get` per owned session is unavoidable, but issuing them
+  // back-to-back made startup O(n) round trips on top of `hydrate`'s own pass.
+  // Read with the same bound, then apply the (rare) backfills in order.
+  const current = yield* Effect.forEach(
+    targets,
+    (target) =>
+      ctx.session.get({ sessionID: toSessionID(target.sessionID) }).pipe(
+        Effect.option,
+        Effect.map((info) => ({ target, info })),
+      ),
+    { concurrency: HYDRATE_CONCURRENCY },
+  )
+  for (const { target, info } of current) {
+    if (Option.isNone(info)) continue
+    const metadata = (info.value as Session.Info).metadata
     if (superagentRole(metadata) === target.role) continue
     const threads = target.role === "worker" ? store.workers.get(target.sessionID)?.threads : undefined
     yield* ctx.session
