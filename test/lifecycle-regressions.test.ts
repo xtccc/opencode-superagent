@@ -4,7 +4,7 @@ import { DateTime, Effect, Exit, type Schema } from "effect"
 import { runAbort } from "../src/abort.js"
 import { decodeReport, reportKey } from "../src/report.js"
 import { encodeWorker, hydrate, store, type WorkerRecord, type WorkerState } from "../src/state.js"
-import { createTicket, getTicket, hydrateTickets, linkTicketToWorker, resetTickets } from "../src/ticket.js"
+import { createTicket, getTicket, hydrateTickets, linkTicketToWorker, requireDispatchTicket, resetTickets, updateTicket } from "../src/ticket.js"
 import { handleIdle } from "../src/watcher.js"
 import { checkWorker, resetWatchdogAlerts, STALL_TIMEOUT_MS } from "../src/watchdog.js"
 
@@ -261,12 +261,56 @@ describe("hydrate reconciles running records", () => {
     expect(h.data.has(reportKey("ses_failed"))).toBe(false)
     expect(getTicket(failedTicket.ticket.id)?.state).toBe("failed")
 
-    // Interrupted: idle + ticket stays open for a deliberate re-dispatch.
+    // Interrupted: idle + ticket parked as `blocked` so a restart does not
+    // leave it `in_progress` behind the idle dispatch gate.
     expect(store.workers.get("ses_interrupted")?.state).toBe("idle")
-    expect(getTicket(interruptedTicket.ticket.id)?.state).toBe("in_progress")
+    const parked = getTicket(interruptedTicket.ticket.id)
+    expect(parked?.state).toBe("blocked")
+    expect(parked?.history.at(-1)?.note).toContain("interrupted")
+    expect(parked?.workerSessionID).toBe("ses_interrupted")
 
     // A session that no longer exists is dropped from memory and KV.
     expect(store.workers.has("ses_gone")).toBe(false)
     expect(h.data.has("worker:ses_gone")).toBe(false)
+  })
+
+  // Regression: hydrate used to only close `done`/`failed` tickets, so an
+  // interrupted worker came back as `idle` while its ticket stayed
+  // `in_progress` — invisible to the gate's "released" heuristic and therefore
+  // undispatchable until a manual abort. After a restart it must land in
+  // `blocked` and be re-dispatchable straight away.
+  test("an interrupted worker's ticket is blocked and re-dispatchable after a restart", async () => {
+    const h = memoryContext()
+    store.routerID = "ses_router"
+    h.infos.set("ses_router", {})
+    h.infos.set("ses_worker", { time: { busy: at(10), idle: at(20) }, outcome: "interrupted" })
+    h.data.set(
+      "worker:ses_worker",
+      encodeWorker(worker("ses_worker", "running", { threadID: "thread:1", threads: ["thread:1"] })),
+    )
+
+    const created = await succeed(
+      createTicket(h.ctx, { ...base, threadID: "thread:1", objective: "restart parks the interrupted ticket" }),
+    )
+    await succeed(linkTicketToWorker(h.ctx, { ticketID: created.ticket.id, sessionID: "ses_worker" }))
+    // The ticket is mid-flight when the plugin dies.
+    await succeed(updateTicket(h.ctx, { ticketID: created.ticket.id, state: "in_progress" }))
+    expect(getTicket(created.ticket.id)?.state).toBe("in_progress")
+
+    // Fresh process: rebuild worker records and tickets from KV.
+    store.workers.clear()
+    resetTickets()
+    await succeed(hydrateTickets(h.ctx))
+    await succeed(hydrate(h.ctx))
+
+    const parked = getTicket(created.ticket.id)
+    expect(store.workers.get("ses_worker")?.state).toBe("idle")
+    expect(parked?.state).toBe("blocked")
+    expect(parked?.history.at(-1)?.note).toContain("interrupted")
+
+    // The idle worker no longer gates the ticket: reopening is enough.
+    await succeed(updateTicket(h.ctx, { ticketID: created.ticket.id, state: "in_progress" }))
+    const ready = await succeed(requireDispatchTicket(created.ticket.id, "thread:1"))
+    expect(ready.id).toBe(created.ticket.id)
   })
 })

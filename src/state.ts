@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import type { Session } from "@opencode/schema/session"
 import { DateTime, Effect, type Schema } from "effect"
 import { buildReport, lastAssistantText, reportSummary, saveReport } from "./report.js"
-import { closeTicketsForWorker } from "./ticket.js"
+import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
 import { WORKER_STATES, workers, type WorkerRecord, type WorkerState } from "./worker-state.js"
 
@@ -165,6 +165,8 @@ export interface Store {
   readonly pending: Array<PendingTrigger>
   readonly triggers: Map<string, TriggerRecord>
   triggerTotal: number
+  /** Pending triggers dropped as stale at hydrate (see the router replay TTL); surfaced by `status`. */
+  pendingDropped: number
 }
 
 /**
@@ -193,10 +195,14 @@ function createStore(): Store {
     pending: new PendingQueue(),
     triggers: new Map(),
     triggerTotal: 0,
+    pendingDropped: 0,
   }
 }
 
 export const store: Store = globals[STORE_KEY] ?? createStore()
+// A store created by an older copy of this plugin may predate a field added
+// here; default it once so later arithmetic never yields `NaN`.
+if (typeof store.pendingDropped !== "number") store.pendingDropped = 0
 globals[STORE_KEY] = store
 
 export const ROUTER_KEY = "router"
@@ -376,7 +382,14 @@ const removeWorker = Effect.fn("superagent.removeWorker")(function* (ctx: Plugin
  * that is still executing keeps `running`; one that finished while the plugin
  * was down is backfilled the same way the watcher would have handled it:
  * capture the last assistant report, persist the terminal/interrupted state,
- * and close its ticket for `done`/`failed`.
+ * close its ticket for `done`/`failed`, and park it as `blocked` for an
+ * interruption.
+ *
+ * The interruption branch is the restart counterpart of the watcher's: the
+ * worker becomes `idle`, which the dispatch gate treats as a live session, so a
+ * ticket left `in_progress` would be gated forever and the Router could never
+ * re-dispatch it. `blocked` records that the attempt was interrupted and makes
+ * the ticket dispatchable again.
  */
 const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(function* (
   ctx: Plugin.Context,
@@ -415,14 +428,40 @@ const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(fu
         }),
       ),
     )
+  } else if (state === "idle") {
+    yield* blockTicketsForWorker(ctx, {
+      sessionID: record.sessionID,
+      ...(info.outcome === undefined ? {} : { reason: `interrupted while the plugin was down (${info.outcome})` }),
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to block ticket for rehydrated interrupted worker", {
+          sessionID: record.sessionID,
+          cause,
+        }),
+      ),
+    )
   }
   yield* Effect.logInfo("superagent rehydrated ended worker", { sessionID: record.sessionID, state })
 })
 
 /**
+ * How many `session.get` calls `hydrate` and `hydrateSessionMeta` keep in
+ * flight. Startup validates every persisted worker/session with one lookup, so
+ * a serial loop costs one round trip per record (the N+1 the review found);
+ * the bound keeps a large install from opening hundreds of requests at once.
+ */
+export const HYDRATE_CONCURRENCY = 8
+
+/**
  * Load KV state into the in-memory maps. Storage is the unique source of
  * truth; every loaded session is validated with `session.get` and stale
  * entries are cleaned from both memory and KV.
+ *
+ * Worker records are decoded page by page but their session lookups run with
+ * bounded concurrency, and the records are then applied in their original
+ * order: the load is no longer one round trip per worker, while the state
+ * transitions (and the ticket reconciliation they trigger) keep the order they
+ * had when the loop was serial.
  */
 export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Context) {
   persistHost = ctx
@@ -440,6 +479,7 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
       store.routerID = info.id
     }
   }
+  const records: Array<WorkerRecord> = []
   let after: string | undefined
   do {
     const page = yield* storage
@@ -451,19 +491,27 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
         yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
         continue
       }
-      const info = yield* sessions.get({ sessionID: toSessionID(record.sessionID) }).pipe(
-        Effect.map((session) => session as Session.Info | undefined),
-        Effect.catch(() => Effect.succeed(undefined)),
-      )
-      if (info === undefined) {
-        yield* removeWorker(ctx, record.sessionID)
-        continue
-      }
-      store.workers.set(record.sessionID, record)
-      if (record.state === "running") yield* reconcileRunningWorker(ctx, record, info)
+      records.push(record)
     }
     after = page.next
   } while (after !== undefined)
+  const validated = yield* Effect.forEach(
+    records,
+    (record) =>
+      sessions.get({ sessionID: toSessionID(record.sessionID) }).pipe(
+        Effect.map((session) => ({ record, info: session as Session.Info | undefined })),
+        Effect.catch(() => Effect.succeed({ record, info: undefined })),
+      ),
+    { concurrency: HYDRATE_CONCURRENCY },
+  )
+  for (const { record, info } of validated) {
+    if (info === undefined) {
+      yield* removeWorker(ctx, record.sessionID)
+      continue
+    }
+    store.workers.set(record.sessionID, record)
+    if (record.state === "running") yield* reconcileRunningWorker(ctx, record, info)
+  }
   let threadAfter: string | undefined
   do {
     const page = yield* storage
