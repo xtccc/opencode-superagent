@@ -6,10 +6,10 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 ## Unreleased
 
 Cross-platform directory handling, ticket search/resiliency, a release gate, a
-`dispatch` reasoning `effort`, and a two-level `/task` browser. No config changes
-are required to upgrade; `pendingTTLMs` is a new optional option and the rest is
-behaviour. A gateway restart is still needed to load the new code (`effort`),
-and the TUI must be reopened for the new `/task` panes.
+`dispatch` reasoning `effort`, and a two-level `/tickets` browser. No config
+changes are required to upgrade; `pendingTTLMs` is a new optional option and the
+rest is behaviour. A gateway restart is still needed to load the new code
+(`effort`), and the TUI must be reopened for the new `/tickets` panes.
 
 ### Fixed
 
@@ -79,14 +79,14 @@ and the TUI must be reopened for the new `/task` panes.
   (`档位：`), per attempt. `src/effort.ts` is the single list shared by the tool
   catalog (`/tools`), the RPC schema (`dispatch` accepts an optional `effort`,
   so older clients keep working) and the dispatcher.
-- **4-character short-id search for `/task` and `/ticket`.** The sidebar shows
+- **4-character short-id search for `/tickets` and `/ticket`.** The sidebar shows
   `dc8d` for `tk_mwbkve34_dc8d`; the picker and `/ticket` now accept that short
   id, a full id, a prefix, a suffix or any middle fragment (case and `tk`/`_`/`-`
   separators ignored). Ranking is exact > suffix > prefix > middle > title, and an
   ambiguous query lists candidates instead of guessing (`src/ticket-search.ts`).
 - **A bigger, terminal-aware picker.** The host's `dialog.select` cannot be
   resized (list capped at `floor(rows/2)-6` rows in a 60-column frame), so
-  `/task` and `/ticket` draw their own `PickerDialog` (`src/tui-picker.ts`):
+  `/tickets` and `/ticket` draw their own `PickerDialog` (`src/tui-picker.ts`):
   75% of the terminal height, 12–30 visible rows, 40–112 columns, keys matching
   the built-in select. `test/tui-picker.test.ts` pins the layout maths.
 - **A release gate.** `bun run release:check` (`script/release-check.ts`) runs
@@ -101,7 +101,7 @@ and the TUI must be reopened for the new `/task` panes.
 
 ### Changed
 
-- **`/task` is a two-level browser: the list opens details, not sessions.**
+- **The `/tickets` browser is two-level: the list opens details, not sessions.**
   `⏎` on a row now shows that row's detail (ticket fields parsed from the
   `ticket` RPC text, or a worker summary), `/` searches, `q` closes. Ticket rows
   carry the tail of their **most recent** worker session as `p1 w=xxx123`
@@ -125,6 +125,22 @@ and the TUI must be reopened for the new `/task` panes.
   workflow also triggers on `src/**`, `server.ts`, `tui.tsx`, `agent/**`,
   `script/**`, `test/**`, `tsconfig*.json` and `bun.lock`, so a code change can
   reach the E2E instead of silently rotting it.
+- **The two-level browser is `/tickets`.** The command keeps its panes, keys,
+  size maths and short-id search; only the slash name changed (`/task` →
+  `/tickets`), which is why the old `/tickets` text list was deleted (see
+  Removed). `/ticket <id>` is unchanged and still opens a single ticket, so the
+  pair now reads as: `/tickets` browses and searches, `/ticket <short id>` opens
+  one. The command table moved to `src/commands.ts` and `tui.tsx` only binds each
+  `run` key to its handler, so `test/commands.test.ts` can pin the registered
+  slash names without loading the Solid renderer.
+
+### Removed
+
+- **The plain-text `/tickets` list command is gone.** Its one-shot
+  `dialog.alert` of the `tickets` RPC text was a narrower version of the
+  browser's list pane, and its slash name is now owned by the browser. Browsing
+  goes through `/tickets` (same rows plus a detail pane); the `tickets` RPC and
+  the sidebar ticket panel are unchanged.
 
 ## 0.4.0
 

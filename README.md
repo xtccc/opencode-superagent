@@ -38,7 +38,7 @@
 - thread 亲和（粘性续聊）：首次出现的事件进入 Router 建 Worker，后续事件回到同一 Worker 继续（已结束会被唤起，不会每句话建新会话）。
 - 批处理：相邻事件合批，减少重复唤醒。
 - 工单：先登记「要什么 + 怎么算完成」，再派活，Worker 终态自动回写；被中断的 Worker 把工单落到 `blocked`，重开即可原单重派。
-- TUI 入口：`/superagent`、`/task`、`/abort`、`/tools`、`/tickets`、`/ticket <id>`（见[使用](#使用-tui-命令)）；工单可用侧栏显示的 4 位短 ID 搜索。
+- TUI 入口：`/superagent`、`/tickets`、`/abort`、`/tools`、`/ticket <id>`（见[使用](#使用-tui-命令)）；工单可用侧栏显示的 4 位短 ID 搜索。
 
 ### 不做什么 P0 边界
 
@@ -128,14 +128,13 @@ opencode plugin add opencode-superagent
 | 命令 | 命令面板名称 | 作用 |
 | --- | --- | --- |
 | `/superagent` | Superagent | 通过 RPC 创建/获取 Router 会话并跳转过去。 |
-| `/task` | Superagent tasks | 两级浏览：列表（工单在前、worker 在后）→ 详情。列表里 `⏎` 进详情、`/` 搜索、`q`/`esc` 退出；行尾 `p1 w=xxx123` 的 `w=` 是该工单**最近一次** dispatch 的 worker 会话尾 6 位（没派过不显示）。详情里 `⏎` 进入该行的 worker 会话（工单取最近一次 dispatch 的 worker，先 `session.get` 校验，会话已不存在时提示「该工单的会话 … 不可用」；无 worker 时提示「该工单暂无会话」）、`q`/`esc` 返回列表（搜索词与光标保留），`↑↓`/`PgUp`/`PgDn` 滚动详情。自绘面板（`src/tui-picker.ts`）按终端尺寸放大：默认占终端高度的 75%（12–30 行可见），窄终端自动收列宽。 |
+| `/tickets` | Superagent tickets | 两级浏览：列表（工单在前、worker 在后）→ 详情。列表里 `⏎` 进详情、`/` 搜索、`q`/`esc` 退出；行尾 `p1 w=xxx123` 的 `w=` 是该工单**最近一次** dispatch 的 worker 会话尾 6 位（没派过不显示）。详情里 `⏎` 进入该行的 worker 会话（工单取最近一次 dispatch 的 worker，先 `session.get` 校验，会话已不存在时提示「该工单的会话 … 不可用」；无 worker 时提示「该工单暂无会话」）、`q`/`esc` 返回列表（搜索词与光标保留），`↑↓`/`PgUp`/`PgDn` 滚动详情。自绘面板（`src/tui-picker.ts`）按终端尺寸放大：默认占终端高度的 75%（12–30 行可见），窄终端自动收列宽。 |
 | `/abort` | Superagent abort worker | 选择要终止的 Worker，或首项「清理全部已结束 worker」（`stale`）批量清理；结果显示在 toast 里。 |
 | `/tools`（别名 `/superagent-tools`） | Superagent tools | 按调度类/查询类/控制类分组列出 Router 当前可用的全部工具，每行显示风险等级（只读/可写/终止）与必填参数；选中某个工具后弹窗给出参数表（名称、必填、类型、说明）、确认方式与用法，末行「能力边界」列出 Router 不能做什么。清单来自 `src/tools.ts` 的工具注册表，新增工具无需改动该命令。 |
-| `/tickets` | Superagent tickets | 浏览工单清单（按状态分组，窄终端友好）。 |
-| `/ticket <id>` | Superagent ticket detail | 查看单张工单详情。`id` 接受全 ID，也接受侧栏显示的 **4 位短 ID**（如 `dc8d`）；前缀/中间片段同样命中，多个候选会列出让你选。 |
+| `/ticket <id>` | Superagent ticket detail | 直接看单张工单详情（`/tickets` 负责浏览 + 搜索，本命令只开一张）。`id` 接受全 ID，也接受侧栏显示的 **4 位短 ID**（如 `dc8d`）；前缀/中间片段同样命中，多个候选会列出让你选。 |
 
 - 短 ID 搜索（`src/ticket-search.ts`）的排序：全 ID 精确 > 后缀（短 ID）> 前缀 > 中间片段 > 标题包含；比较时忽略大小写和 `tk`/`_`/`-` 分隔符，所以 `TK_mwbk-ve34`、`dc8d`、`bkve34` 都能找到 `tk_mwbkve34_dc8d`。歧义（多个同级命中）时不猜，列出候选。
-- 选择器是自绘的 `PickerDialog`（`src/tui-picker.ts` 的 `computeDialogSize`），不再受宿主 `dialog.select`「最多 `floor(rows/2)-6` 条、固定 60 列」的限制；键位与内置选择器一致：输入即搜、`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 移动、`⏎` 选择、`esc` 取消。`/task` 用同一套尺寸与行布局做两级面板（`TaskBrowser`）：列表页帮助行是「⏎ 详情 · q 退出 · / 搜索」，详情页是「⏎ 进入会话 · q 返回」，进入会话前会先确认该 session 仍存在（`session.get` 成功才跳转，否则在面板底部给 `该工单的会话 … 不可用`）；详情字段由 `src/ticket-detail.ts` 从 `ticket` RPC 的文本解析（短 ID、全 ID、标题、状态、优先级、目标、验收、目录、`档位`（有则显示）、最近 worker、尝试次数、创建/更新时间、报告摘要、历史），导航状态机是纯函数 `src/picker-nav.ts` 的 `taskStep`。工单行的 `w=` 尾 6 位只在列表里出现，详情用的是完整 session id（`workerBySuffix` 只在唯一命中时接受）。
+- 选择器是自绘的 `PickerDialog`（`src/tui-picker.ts` 的 `computeDialogSize`），不再受宿主 `dialog.select`「最多 `floor(rows/2)-6` 条、固定 60 列」的限制；键位与内置选择器一致：输入即搜、`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 移动、`⏎` 选择、`esc` 取消。`/tickets` 用同一套尺寸与行布局做两级面板（`TicketBrowser`）：列表页帮助行是「⏎ 详情 · q 退出 · / 搜索」，详情页是「⏎ 进入会话 · q 返回」，进入会话前会先确认该 session 仍存在（`session.get` 成功才跳转，否则在面板底部给 `该工单的会话 … 不可用`）；详情字段由 `src/ticket-detail.ts` 从 `ticket` RPC 的文本解析（短 ID、全 ID、标题、状态、优先级、目标、验收、目录、`档位`（有则显示）、最近 worker、尝试次数、创建/更新时间、报告摘要、历史），导航状态机是纯函数 `src/picker-nav.ts` 的 `ticketStep`。工单行的 `w=` 尾 6 位只在列表里出现，详情用的是完整 session id（`workerBySuffix` 只在唯一命中时接受）。
 
 - TUI 右侧栏（42 列）里有一块「工单」面板，常驻显示工单清单，见[侧栏工单面板](#侧栏工单面板)。
 
@@ -312,7 +311,7 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 - `status({}) -> { version?, router?, pending, workers }`：`version` 是当前网关加载的插件版本（启动日志里也有），演示命令用它等待 `T-1` 的 Worker 就绪。Router 尚未创建时返回 `{ version, pending, workers }`，省略 `router` 键（显式 `undefined` 会导致输出校验失败）。
 - `trigger({ source, threadID, author?, text, title?, createdAt?, id? }) -> { route, sessionID? }`：注入一条事件，`route` 为 `router` / `worker` / `dropped`。
 - `abort({ sessionID?, reason?, all?, stale? }) -> { text }`：终止/清理 Worker，被拒绝时抛 `abort.rejected`（带可读 message）。TUI 的 `/abort`（或命令面板「Superagent abort worker」）会列出 Worker 供选择，首项是「清理全部已结束 worker」。
-- `tickets({ threadID?, status?, limit? }) -> { text }`：渲染工单列表（按状态分组，窄终端友好），对应 `/tickets`。内存页不足时回源 KV 补齐，被裁剪的老单不会显示成缺失。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成「不过滤的完整列表」；服务端另有 `tickets.invalid_status` 作为第二道防线。
+- `tickets({ threadID?, status?, limit? }) -> { text }`：渲染工单列表（按状态分组，窄终端友好），对应侧栏面板与 `/tickets` 的列表页。内存页不足时回源 KV 补齐，被裁剪的老单不会显示成缺失。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成「不过滤的完整列表」；服务端另有 `tickets.invalid_status` 作为第二道防线。
 - `ticket({ ticketID }) -> { text }`：渲染单张工单详情，对应 `/ticket <id>`；内存未命中时从 KV 读一次再渲染，确实不存在才回 `没有找到工单 <id>`。
 
 契约里还声明了 `dispatch` 与 `stop`：两者只给 Router 的工具使用，**RPC 调用一律 fail-closed**。RPC 传输层不提供调用方 session（`RpcCallContext` 只有 `error`），入参里的 `caller`/`routerID` 可伪造（router id 在 `status` 里公开），因此 `dispatch` 固定返回 `dispatch.rejected`、`stop` 固定返回 `stop.rejected`，既不会建 Worker 也不会中断 Worker。这两个错误与其他方法一样声明在共享 `Definition` 里，server 与 TUI 读同一份定义；真正的 Router 通过工具干活，工具的 `context.sessionID` 由宿主提供，是唯一被信任的身份来源。
@@ -389,12 +388,13 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 ```text
 .                              # 仓库根即本包
 ├── tui.tsx                      # TUI 入口：keymap、slash 命令、RPC 调用、侧栏工单面板
+├── src/commands.ts              # slash 命令表（名称/描述/面板标题 + run 键），tui.tsx 绑定处理函数
 ├── server.ts                    # 后台服务入口：注册同一个 Definition
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
 ├── src/version.ts               # 从 package.json 读插件版本（带 fallback），生成启动/status 的版本提示
 ├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
-├── src/ticket-detail.ts         # /task 详情页：解析 ticket 详情文本并重排成详情行
-├── src/picker-nav.ts            # /task 两级导航状态机（列表 ⇄ 详情、⏎ 进会话）与帮助行文案
+├── src/ticket-detail.ts         # /tickets 详情页：解析 ticket 详情文本并重排成详情行
+├── src/picker-nav.ts            # /tickets 两级导航状态机（列表 ⇄ 详情、⏎ 进会话）与帮助行文案
 ├── src/ticket-search.ts         # 工单搜索：全 ID/前后缀/中间片段/短 ID 排序，TUI 选择器共用
 ├── src/tui-picker.ts            # 自绘选择器：对话框尺寸、行布局、可见窗口与帮助行
 ├── src/agents.ts                # Router/Worker agent 的程序化注册（插件 setup 调用）
