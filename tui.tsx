@@ -4,10 +4,13 @@ import type { RpcCallOptions } from "@opencode/client/promise"
 import { Plugin } from "@opencode/plugin/tui"
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { Definition } from "./src/protocol"
+import { missingSessionMessage, taskHint, taskStep, workerBySuffix, type TaskKey, type TaskNavRow, type TaskPane } from "./src/picker-nav"
+import { detailRows, parseTicketDetail, type TicketDetail } from "./src/ticket-detail"
 import { resolveTicketQuery, searchPickerOptions } from "./src/ticket-search"
 import {
   computeDialogSize,
   layoutHelp,
+  layoutHint,
   layoutPickerRow,
   layoutTitle,
   moveSelection,
@@ -22,6 +25,7 @@ import {
   TICKET_PANEL_REFRESH_MS,
   TICKET_STATE_SYMBOL,
   ticketPanel,
+  truncateCells,
   type TicketRow,
   type TicketState,
 } from "./src/ticket-view"
@@ -51,7 +55,7 @@ export default Plugin.define({
         {
           id: "superagent.tasks",
           title: "Superagent tasks",
-          description: "工单 / worker 选择器：支持标题、全 ID、4 位短 ID（如 dc8d）搜索",
+          description: "工单 / worker 两级浏览：⏎ 看详情、/ 搜索、q 退出；详情里 ⏎ 进入该 worker 会话、q 返回。支持标题、全 ID、4 位短 ID（如 dc8d）搜索",
           palette: true,
           slash: { name: "task" },
           run: () => tasks(context),
@@ -203,6 +207,8 @@ interface PickerRow {
   readonly status?: string
   readonly trailing?: string
   readonly tone?: TicketState
+  /** `/task` rows only: what the detail pane shows and what `⏎` enters there. */
+  readonly nav?: TaskNavRow
 }
 
 interface PickerConfig {
@@ -211,6 +217,8 @@ interface PickerConfig {
   readonly rows: ReadonlyArray<PickerRow>
   readonly search?: (query: string, rows: ReadonlyArray<PickerRow>) => ReadonlyArray<PickerRow>
   readonly emptyText?: string
+  /** Footer hint; the shared help line when absent. */
+  readonly hint?: string
 }
 
 /** Only a host that predates `useTerminalDimensions` falls back to this. */
@@ -219,11 +227,97 @@ const terminalDimensions: (() => () => { width: number; height: number }) | unde
   typeof useTerminalDimensions === "function" ? useTerminalDimensions : undefined
 
 /**
+ * The rows of a picker, laid out by `layoutPickerRow` and windowed to the
+ * dialog height. Shared by the plain picker (`/ticket`) and the `/task` list
+ * pane, so both draw the same columns with the same width budget.
+ */
+function PickerRows(props: {
+  context: Plugin.Context
+  rows: ReadonlyArray<PickerRow>
+  selected: number
+  offset: number
+  width: number
+  listRows: number
+  emptyText?: string
+  onActivate: (row: PickerRow) => void
+}) {
+  const theme = props.context.theme
+  const windowBegin = () => Math.min(props.offset, Math.max(0, props.rows.length - 1))
+  const window = () => props.rows.slice(windowBegin(), windowBegin() + props.listRows)
+  return (
+    <box flexDirection="column" height={props.listRows}>
+      <Show
+        when={props.rows.length > 0}
+        fallback={
+          <text wrapMode="none" fg={theme.text.muted}>
+            {props.emptyText ?? "无匹配项"}
+          </text>
+        }
+      >
+        <For each={window()}>
+          {(row, index) => {
+            const active = () => windowBegin() + index() === props.selected
+            const line = createMemo(() =>
+              layoutPickerRow(
+                {
+                  marker: active() ? PICKER_MARKER : PICKER_MARKER_IDLE,
+                  glyph: row.glyph,
+                  code: row.code,
+                  status: row.status,
+                  title: row.title,
+                  trailing: row.trailing,
+                },
+                props.width,
+              ),
+            )
+            const detailColor = () => (active() ? theme.text.action.primary.focused : theme.text.muted)
+            const titleColor = () => (active() ? theme.text.action.primary.focused : theme.text.base)
+            const glyphColor = () => (row.tone === undefined ? detailColor() : ticketStateColor(theme, row.tone))
+            return (
+              <box
+                flexDirection="row"
+                width="100%"
+                backgroundColor={active() ? theme.background.action.primary.focused : undefined}
+                onMouseUp={() => props.onActivate(row)}
+              >
+                <text wrapMode="none">
+                  <span style={{ fg: detailColor() }}>{line().marker}</span>
+                  <span style={{ fg: glyphColor() }}>{line().glyph}</span>
+                  <span style={{ fg: detailColor() }}>{line().detail}</span>
+                  <span style={{ fg: titleColor() }}>{line().title}</span>
+                  <span style={{ fg: detailColor() }}>{line().trailing}</span>
+                </text>
+              </box>
+            )
+          }}
+        </For>
+      </Show>
+    </box>
+  )
+}
+
+/** Header row shared by both panes: the title on the left, the width-sized frame. */
+function PickerHeader(props: { context: Plugin.Context; title: string; width: number; right: string }) {
+  const theme = props.context.theme
+  return (
+    <box flexDirection="row" justifyContent="space-between">
+      <text wrapMode="none" fg={theme.text.base}>
+        <b>{layoutTitle(props.title, props.width)}</b>
+      </text>
+      <text wrapMode="none" fg={theme.text.muted}>
+        {props.right}
+      </text>
+    </box>
+  )
+}
+
+/**
  * The picker dialog. The host's `dialog.select` cannot be resized (its list
  * stops at `floor(rows / 2) - 6` entries inside a 60-column frame), so the
  * picker draws its own body and `computeDialogSize` sizes it for the terminal.
  * Keys match the built-in select: type to search, ↑↓ / PgUp PgDn / Home End to
- * move, ⏎ to pick, esc to cancel.
+ * move, ⏎ to pick, esc to cancel. `/task` uses `TaskBrowser`, which shares the
+ * same frame, size maths and row layout.
  */
 export function PickerDialog(props: {
   readonly context: Plugin.Context
@@ -240,9 +334,11 @@ export function PickerDialog(props: {
     const search = props.config.search
     return search === undefined ? props.config.rows : search(query(), props.config.rows)
   })
-  const help = createMemo(() => layoutHelp(size().width, rows().length, props.config.rows.length))
-  const windowBegin = createMemo(() => Math.min(offset(), Math.max(0, rows().length - 1)))
-  const window = createMemo(() => rows().slice(windowBegin(), windowBegin() + size().listRows))
+  /** Row under the cursor, clamped: `selected` can briefly outrun a shrinking list. */
+  const activeRow = createMemo(() => rows()[Math.min(selected(), Math.max(0, rows().length - 1))])
+  const help = createMemo(() =>
+    layoutHelp(size().width, rows().length, props.config.rows.length, props.config.hint),
+  )
 
   let field: InputRenderable | undefined
   let focusTimer: ReturnType<typeof setTimeout> | undefined
@@ -303,21 +399,14 @@ export function PickerDialog(props: {
         // Submit here so the pick runs before the input consumes the key.
         event.preventDefault()
         event.stopPropagation()
-        pick(rows()[selected()])
+        pick(activeRow())
         return
     }
   })
 
   return (
     <box flexDirection="column" width={size().width} gap={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text wrapMode="none" fg={theme.text.base}>
-          <b>{layoutTitle(props.config.title, size().width)}</b>
-        </text>
-        <text wrapMode="none" fg={theme.text.muted}>
-          esc
-        </text>
-      </box>
+      <PickerHeader context={props.context} title={props.config.title} width={size().width} right="esc" />
       <input
         ref={(element) => (field = element)}
         focused
@@ -330,56 +419,18 @@ export function PickerDialog(props: {
           setSelected(0)
           setOffset(0)
         }}
-        onSubmit={() => pick(rows()[Math.min(selected(), Math.max(0, rows().length - 1))])}
+        onSubmit={() => pick(activeRow())}
       />
-      <box flexDirection="column" height={size().listRows}>
-        <Show
-          when={rows().length > 0}
-          fallback={
-            <text wrapMode="none" fg={theme.text.muted}>
-              {props.config.emptyText ?? "无匹配项"}
-            </text>
-          }
-        >
-          <For each={window()}>
-            {(row, index) => {
-              const active = () => windowBegin() + index() === selected()
-              const line = createMemo(() =>
-                layoutPickerRow(
-                  {
-                    marker: active() ? PICKER_MARKER : PICKER_MARKER_IDLE,
-                    glyph: row.glyph,
-                    code: row.code,
-                    status: row.status,
-                    title: row.title,
-                    trailing: row.trailing,
-                  },
-                  size().width,
-                ),
-              )
-              const detailColor = () => (active() ? theme.text.action.primary.focused : theme.text.muted)
-              const titleColor = () => (active() ? theme.text.action.primary.focused : theme.text.base)
-              const glyphColor = () => (row.tone === undefined ? detailColor() : ticketStateColor(theme, row.tone))
-              return (
-                <box
-                  flexDirection="row"
-                  width="100%"
-                  backgroundColor={active() ? theme.background.action.primary.focused : undefined}
-                  onMouseUp={() => pick(row)}
-                >
-                  <text wrapMode="none">
-                    <span style={{ fg: detailColor() }}>{line().marker}</span>
-                    <span style={{ fg: glyphColor() }}>{line().glyph}</span>
-                    <span style={{ fg: detailColor() }}>{line().detail}</span>
-                    <span style={{ fg: titleColor() }}>{line().title}</span>
-                    <span style={{ fg: detailColor() }}>{line().trailing}</span>
-                  </text>
-                </box>
-              )
-            }}
-          </For>
-        </Show>
-      </box>
+      <PickerRows
+        context={props.context}
+        rows={rows()}
+        selected={selected()}
+        offset={offset()}
+        width={size().width}
+        listRows={size().listRows}
+        emptyText={props.config.emptyText}
+        onActivate={pick}
+      />
       <box flexDirection="row" justifyContent="space-between">
         <text wrapMode="none" fg={theme.text.muted}>
           {help().hint}
@@ -387,6 +438,361 @@ export function PickerDialog(props: {
         <Show when={help().counter !== ""}>
           <text wrapMode="none" fg={theme.text.muted}>
             {help().counter}
+          </text>
+        </Show>
+      </box>
+    </box>
+  )
+}
+
+/** What the `/task` browser resolves to: a session to enter, or nothing (closed). */
+export type TaskResult = { readonly action: "jump"; readonly sessionID: string } | undefined
+
+/** The detail pane content: already wrapped rows, plus the session `⏎` enters. */
+export interface TaskDetailContent {
+  readonly lines: ReadonlyArray<string>
+  /** Session the detail pane's `⏎` enters; absent when the row has none. */
+  readonly sessionID?: string
+}
+
+/** Props of the two-pane browser; `browseTasks` fills in the context and the resolver. */
+export interface TaskBrowserProps {
+  readonly context: Plugin.Context
+  readonly title: string
+  readonly placeholder: string
+  readonly rows: ReadonlyArray<PickerRow>
+  readonly total: number
+  readonly search: (query: string, rows: ReadonlyArray<PickerRow>) => ReadonlyArray<PickerRow>
+  readonly loadDetail: (row: PickerRow, width: number) => Promise<TaskDetailContent | undefined>
+  readonly onDone: (result: TaskResult) => void
+}
+
+/**
+ * `/task` in two panes, sharing `PickerDialog`'s frame, size maths and row
+ * layout:
+ *
+ * - **list**: `/task` rows (tickets, then workers). `⏎` opens the row's detail,
+ *   `/` focuses the search field (the query survives a round trip), `q` closes.
+ * - **detail**: the ticket fields (`src/ticket-detail.ts`) or a worker summary,
+ *   scrollable with ↑↓ / PgUp / PgDn. `⏎` enters the worker session of the row,
+ *   `q` / `esc` go back to the list with its query and cursor intact.
+ *
+ * `taskStep` (pure) decides every transition; this component only applies it and
+ * awaits the RPCs.
+ */
+export function TaskBrowser(props: TaskBrowserProps) {
+  const theme = props.context.theme
+  const dimensions = terminalDimensions ? terminalDimensions() : () => DEFAULT_TERMINAL
+  const size = createMemo(() => computeDialogSize(dimensions().width, dimensions().height))
+  const [pane, setPane] = createSignal<TaskPane>("list")
+  const [searching, setSearching] = createSignal(false)
+  const [query, setQuery] = createSignal("")
+  const [selected, setSelected] = createSignal(0)
+  const [offset, setOffset] = createSignal(0)
+  const [lines, setLines] = createSignal<ReadonlyArray<string>>([])
+  const [detailSession, setDetailSession] = createSignal<string | undefined>(undefined)
+  const [detailOffset, setDetailOffset] = createSignal(0)
+  const [notice, setNotice] = createSignal("")
+  const [loading, setLoading] = createSignal(false)
+
+  const rows = createMemo(() => props.search(query(), props.rows))
+  const activeRow = createMemo(() => rows()[Math.min(selected(), Math.max(0, rows().length - 1))])
+  const help = createMemo(() => taskHint(pane(), searching()))
+
+  let field: InputRenderable | undefined
+  let focusTimer: ReturnType<typeof setTimeout> | undefined
+  onMount(() => {
+    // The list opens in navigate mode so `q` / `⏎` work without a click; `/`
+    // moves the keyboard into the search field.
+    focusTimer = setTimeout(() => field?.blur(), 1)
+  })
+  onCleanup(() => {
+    if (focusTimer !== undefined) clearTimeout(focusTimer)
+  })
+
+  // The cursor and the window stay inside the current result set.
+  createEffect(() => {
+    const count = rows().length
+    const next = moveSelection(selected(), 0, count)
+    if (next !== selected()) setSelected(next)
+  })
+  createEffect(() => {
+    if (pane() !== "list") return
+    const start = windowStart(selected(), offset(), size().listRows)
+    if (start !== offset()) setOffset(start)
+  })
+  createEffect(() => {
+    const max = Math.max(0, lines().length - size().listRows)
+    if (detailOffset() > max) setDetailOffset(max)
+  })
+
+  // The search field only exists inside the list pane, so returning from a
+  // detail remounts it empty. The query lives in a signal; put it back into the
+  // field so the visible filter always matches the list.
+  createEffect(() => {
+    if (pane() !== "list") return
+    const text = query()
+    setTimeout(() => {
+      if (field !== undefined && field.value !== text) field.value = text
+    }, 0)
+  })
+
+  const detailWindow = createMemo(() =>
+    lines().slice(detailOffset(), detailOffset() + size().listRows),
+  )
+
+  const close = () => props.onDone(undefined)
+
+  const openDetail = async () => {
+    // `⏎` can arrive twice (keyboard hook + input submit); the second is a no-op.
+    if (loading()) return
+    const row = activeRow()
+    if (row === undefined) return
+    setNotice("")
+    setPane("detail")
+    setDetailOffset(0)
+    setLoading(true)
+    setLines([])
+    setDetailSession(undefined)
+    try {
+      const loaded = await props.loadDetail(row, size().width)
+      setLines(loaded?.lines ?? ["（该行没有可显示的详情）"])
+      setDetailSession(loaded?.sessionID)
+    } catch (error) {
+      setLines([`读取详情失败：${message(error)}`])
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  /**
+   * Enter the session of the row on screen. The session is verified first: a
+   * ticket whose worker was deleted must say so instead of navigating nowhere.
+   */
+  const enterSession = async (sessionID: string) => {
+    try {
+      await props.context.client.session.get({ sessionID })
+    } catch {
+      setNotice(missingSessionMessage(sessionID))
+      return
+    }
+    props.onDone({ action: "jump", sessionID })
+  }
+
+  const apply = (key: TaskKey) => {
+    const base = activeRow()?.nav
+    // The detail pane knows the session the list row could not: a ticket's
+    // full worker id only appears in its detail text.
+    const row =
+      base === undefined ? undefined : { kind: base.kind, sessionID: detailSession() ?? base.sessionID }
+    const step = taskStep(pane(), key, row)
+    switch (step.kind) {
+      case "close":
+        close()
+        return
+      case "back-to-list":
+        setPane("list")
+        setNotice("")
+        // No blur here: the search field is unmounted while the detail pane is
+        // up, and the one that comes back mounts unfocused.
+        return
+      case "open-detail":
+        void openDetail()
+        return
+      case "jump":
+        void enterSession(step.sessionID)
+        return
+      case "notice":
+        setNotice(step.message)
+        return
+    }
+  }
+
+  useKeyboard((event) => {
+    const key = event.name
+    if (pane() === "detail") {
+      const step = size().listRows
+      const scroll = (delta: number) => {
+        event.preventDefault()
+        event.stopPropagation()
+        setDetailOffset((current) =>
+          Math.min(Math.max(0, current + delta), Math.max(0, lines().length - step)),
+        )
+      }
+      switch (key) {
+        case "up":
+          return scroll(-1)
+        case "down":
+          return scroll(1)
+        case "pageup":
+          return scroll(-step)
+        case "pagedown":
+          return scroll(step)
+        case "return":
+        case "kpenter":
+        case "linefeed":
+        case "q":
+        case "escape":
+          event.preventDefault()
+          event.stopPropagation()
+          apply(key === "return" || key === "kpenter" || key === "linefeed" ? "enter" : "quit")
+          return
+      }
+      return
+    }
+
+    // List pane: the search field owns printable keys while it is focused.
+    if (searching()) {
+      switch (key) {
+        case "up":
+          event.preventDefault()
+          setSelected((current) => moveSelection(current, -1, rows().length))
+          return
+        case "down":
+          event.preventDefault()
+          setSelected((current) => moveSelection(current, 1, rows().length))
+          return
+        case "return":
+        case "kpenter":
+        case "linefeed":
+          event.preventDefault()
+          event.stopPropagation()
+          setSearching(false)
+          field?.blur()
+          void openDetail()
+          return
+        case "escape":
+          event.preventDefault()
+          event.stopPropagation()
+          setSearching(false)
+          field?.blur()
+          return
+      }
+      return
+    }
+
+    const count = rows().length
+    switch (key) {
+      case "up":
+        event.preventDefault()
+        setSelected((current) => moveSelection(current, -1, count))
+        return
+      case "down":
+        event.preventDefault()
+        setSelected((current) => moveSelection(current, 1, count))
+        return
+      case "pageup":
+        event.preventDefault()
+        setSelected((current) => moveSelection(current, -size().listRows, count))
+        return
+      case "pagedown":
+        event.preventDefault()
+        setSelected((current) => moveSelection(current, size().listRows, count))
+        return
+      case "home":
+        event.preventDefault()
+        setSelected(0)
+        return
+      case "end":
+        event.preventDefault()
+        setSelected(Math.max(0, count - 1))
+        return
+      case "return":
+      case "kpenter":
+      case "linefeed":
+        event.preventDefault()
+        event.stopPropagation()
+        apply("enter")
+        return
+      case "q":
+      case "escape":
+        event.preventDefault()
+        event.stopPropagation()
+        apply("quit")
+        return
+      case "/":
+        event.preventDefault()
+        event.stopPropagation()
+        setSearching(true)
+        field?.focus()
+        return
+    }
+  })
+
+  return (
+    <box flexDirection="column" width={size().width} gap={1}>
+      <PickerHeader
+        context={props.context}
+        title={props.title}
+        width={size().width}
+        right={pane() === "detail" ? "q 返回 · esc" : "esc"}
+      />
+      <Show
+        when={pane() === "list"}
+        fallback={
+          <box flexDirection="column" height={size().listRows}>
+            <Show
+              when={!loading()}
+              fallback={
+                <text wrapMode="none" fg={theme.text.muted}>
+                  读取中…
+                </text>
+              }
+            >
+              <For each={detailWindow()}>
+                {(line) => (
+                  <text wrapMode="none" fg={line.startsWith("·") ? theme.text.muted : theme.text.base}>
+                    {line === "" ? " " : line}
+                  </text>
+                )}
+              </For>
+            </Show>
+          </box>
+        }
+      >
+        <input
+          ref={(element) => (field = element)}
+          placeholder={props.placeholder}
+          placeholderColor={theme.text.muted}
+          focusedTextColor={theme.text.base}
+          cursorColor={theme.text.formfield.focused}
+          onInput={(value) => {
+            setQuery(value)
+            setSelected(0)
+            setOffset(0)
+          }}
+          onSubmit={() => {
+            setSearching(false)
+            field?.blur()
+            void openDetail()
+          }}
+        />
+        <PickerRows
+          context={props.context}
+          rows={rows()}
+          selected={selected()}
+          offset={offset()}
+          width={size().width}
+          listRows={size().listRows}
+          onActivate={(row) => {
+            const index = rows().indexOf(row)
+            if (index >= 0) setSelected(index)
+            void openDetail()
+          }}
+        />
+      </Show>
+      <box flexDirection="row" justifyContent="space-between">
+        <text
+          wrapMode="none"
+          fg={notice() !== "" ? theme.text.feedback.warning.base : theme.text.muted}
+        >
+          {pane() === "detail"
+            ? layoutHint(size().width, notice() !== "" ? notice() : help())
+            : layoutHelp(size().width, rows().length, props.total, help()).hint}
+        </text>
+        <Show when={pane() === "list"}>
+          <text wrapMode="none" fg={theme.text.muted}>
+            {layoutHelp(size().width, rows().length, props.total, help()).counter}
           </text>
         </Show>
       </box>
@@ -422,6 +828,35 @@ function pickList(context: Plugin.Context, config: PickerConfig): Promise<string
   })
 }
 
+/**
+ * Show the two-pane `/task` browser and resolve what the user chose. Same frame
+ * contract as `pickList`: the host resets dialogs to `medium`, so the size is
+ * raised right after `show`.
+ */
+function browseTasks(
+  context: Plugin.Context,
+  props: Omit<TaskBrowserProps, "context" | "onDone">,
+): Promise<TaskResult> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (result: TaskResult) => {
+      if (settled) return
+      settled = true
+      context.ui.dialog.clear()
+      resolve(result)
+    }
+    context.ui.dialog.show(
+      () => <TaskBrowser context={context} {...props} onDone={finish} />,
+      () => finish(undefined),
+    )
+    try {
+      context.ui.dialog.set({ size: "xlarge", centered: true })
+    } catch {
+      // Older hosts have no presentation options; the pane still renders.
+    }
+  })
+}
+
 async function open(context: Plugin.Context) {
   try {
     const rpc = context.client.rpc(Definition)
@@ -440,9 +875,15 @@ const TICKET_PICKER_LIMIT = 100
 const TICKET_SEARCH_PLACEHOLDER = "搜索：标题 / 全 ID / 4 位短 ID（如 dc8d）"
 
 /**
- * `/task`: tickets first, then workers. Ticket rows show the 4-character short
- * id the sidebar renders, and both kinds are searchable — a short id, any id
- * fragment, or a title/worker label picks the row.
+ * `/task`: a two-pane browser. The list mixes tickets and worker sessions;
+ * `⏎` always opens the row's detail first (a mis-jump is expensive to undo),
+ * and the detail pane is where `⏎` enters the worker session of that row.
+ *
+ * A ticket's session is its **most recent** worker: every dispatch overwrites
+ * `ticket.workerSessionID`, the list trailer prints that session's last six
+ * characters (`w=abc123`), and the detail text prints the full id. The load
+ * below prefers the exact id from the detail and only falls back to a unique
+ * suffix match.
  */
 async function tasks(context: Plugin.Context) {
   try {
@@ -455,19 +896,25 @@ async function tasks(context: Plugin.Context) {
       context.ui.toast.show({ title: "Superagent tasks", message: "暂无 worker 与工单", variant: "info" })
       return
     }
-    const selection = await pickList(context, {
+    const tickets = new Map(rows.map((row) => [row.id, row]))
+    const workerIDs = status.workers.map((worker) => worker.sessionID)
+    const result = await browseTasks(context, {
       title: `Superagent tasks · 工单 ${rows.length} · worker ${status.workers.length}`,
       placeholder: TICKET_SEARCH_PLACEHOLDER,
       rows: [
         ...rows.map((row) => ({
-          title: `${shortTicketID(row.id)} · ${row.title === "" ? row.id : row.title}`,
+          // The short id is already the `code` column, so the title carries none.
+          title: row.title === "" ? row.id : row.title,
           description: `${TICKET_STATE_SYMBOL[row.state]} ${row.state} · ${row.priority} · ${row.id}`,
           value: `${TICKET_CHOICE_PREFIX}${row.id}`,
           glyph: TICKET_STATE_SYMBOL[row.state],
           tone: row.state,
           code: shortTicketID(row.id),
           status: row.state,
-          trailing: row.priority,
+          // The trailer's six-character tail names the latest worker, so a row
+          // that would jump says so without opening anything.
+          trailing: row.workerSuffix === undefined ? row.priority : `${row.priority} w=${row.workerSuffix}`,
+          nav: { kind: "ticket" as const },
         })),
         ...status.workers.map((worker) => ({
           title: worker.title ?? worker.sessionID.slice(0, 8),
@@ -475,18 +922,78 @@ async function tasks(context: Plugin.Context) {
           value: worker.sessionID,
           status: worker.state,
           trailing: "worker",
+          nav: { kind: "worker" as const, sessionID: worker.sessionID },
         })),
       ],
+      total: rows.length + status.workers.length,
       search: (query, visible) => searchPickerOptions(query, visible, rows, TICKET_CHOICE_PREFIX),
+      loadDetail: async (row, width) => {
+        const ticketID = row.value.startsWith(TICKET_CHOICE_PREFIX)
+          ? row.value.slice(TICKET_CHOICE_PREFIX.length)
+          : undefined
+        if (ticketID === undefined) {
+          const worker = status.workers.find((item) => item.sessionID === row.value)
+          return worker === undefined ? undefined : { lines: workerDetailRows(worker, width) }
+        }
+        const listRow = tickets.get(ticketID)
+        const detail = await loadTicketDetail(context, ticketID)
+        // The full id from the detail is authoritative; the six-character tail
+        // is only a hint, so it is the fallback when the detail is unavailable.
+        const sessionID = detail?.workerSessionID ?? workerBySuffix(workerIDs, listRow?.workerSuffix)
+        if (detail === undefined) {
+          return {
+            lines: [
+              `工单 ${ticketID}`,
+              "",
+              listRow === undefined ? "读取详情失败。" : `${listRow.state} · ${listRow.priority}`,
+              "（详情读取失败，仍可尝试 ⏎ 进入会话）",
+            ],
+            ...(sessionID === undefined ? {} : { sessionID }),
+          }
+        }
+        return { lines: detailRows(detail, width), ...(sessionID === undefined ? {} : { sessionID }) }
+      },
     })
-    if (selection === undefined) return
-    if (selection.startsWith(TICKET_CHOICE_PREFIX)) {
-      await ticket(context, selection.slice(TICKET_CHOICE_PREFIX.length))
-      return
-    }
-    gotoSession(context, selection)
+    if (result === undefined) return
+    gotoSession(context, result.sessionID)
   } catch (error) {
     context.ui.toast.show({ title: "Superagent tasks", message: message(error), variant: "error" })
+  }
+}
+
+/** One worker session as the detail pane shows it. */
+function workerDetailRows(
+  worker: {
+    readonly sessionID: string
+    readonly title?: string
+    readonly threads: ReadonlyArray<string>
+    readonly state: string
+  },
+  width: number,
+): ReadonlyArray<string> {
+  return [
+    `worker · ${worker.state}`,
+    worker.title ?? worker.sessionID,
+    "",
+    `会话：${worker.sessionID}`,
+    `thread：${worker.threads.join(",") || "-"}`,
+    "",
+    "⏎ 进入该会话",
+  ].map((line) => truncateCells(line, width))
+}
+
+/**
+ * Fetch and parse one ticket's detail. `undefined` means the RPC failed or the
+ * gateway no longer knows the ticket; the pane then shows a short explanation
+ * instead of an empty frame.
+ */
+async function loadTicketDetail(context: Plugin.Context, ticketID: string): Promise<TicketDetail | undefined> {
+  try {
+    const rpc = context.client.rpc(Definition)
+    const { text } = await rpc.ticket({ ticketID }, options(context))
+    return parseTicketDetail(text)
+  } catch {
+    return undefined
   }
 }
 
@@ -590,7 +1097,6 @@ async function tickets(context: Plugin.Context) {
  */
 async function ticket(context: Plugin.Context, input?: string) {
   try {
-    const rpc = context.client.rpc(Definition)
     const query = input?.trim() ?? ""
     let rows: Array<TicketRow> | undefined
     try {
@@ -601,11 +1107,17 @@ async function ticket(context: Plugin.Context, input?: string) {
     }
     const ticketID = await chooseTicket(context, rows, query)
     if (ticketID === undefined || ticketID === "") return
-    const { text } = await rpc.ticket({ ticketID }, options(context))
-    await context.ui.dialog.alert({ title: `Superagent ${ticketID}`, message: text })
+    await showTicketDetail(context, ticketID)
   } catch (error) {
     context.ui.toast.show({ title: "Superagent ticket", message: message(error), variant: "error" })
   }
+}
+
+/** The full detail of one ticket in a dialog, used by `/ticket` and the sidebar rows. */
+async function showTicketDetail(context: Plugin.Context, ticketID: string) {
+  const rpc = context.client.rpc(Definition)
+  const { text } = await rpc.ticket({ ticketID }, options(context))
+  await context.ui.dialog.alert({ title: `Superagent ${ticketID}`, message: text })
 }
 
 /** Every ticket the `tickets` RPC can return (the server clamps `limit` at 100). */
@@ -651,8 +1163,11 @@ async function pickTicket(
   return pickList(context, {
     title: `${title} · ${rows.length}`,
     placeholder: TICKET_SEARCH_PLACEHOLDER,
+    // Every row is a ticket and this picker has one level: the search field is
+    // focused from the start, and `⏎` opens the detail right away.
+    hint: "输入即搜 · ↑↓ 移动 · ⏎ 详情 · esc 取消",
     rows: rows.map((row) => ({
-      title: `${shortTicketID(row.id)} · ${row.title === "" ? row.id : row.title}`,
+      title: row.title === "" ? row.id : row.title,
       description: `${TICKET_STATE_SYMBOL[row.state]} ${row.state} · ${row.priority} · ${row.id}`,
       value: row.id,
       glyph: TICKET_STATE_SYMBOL[row.state],

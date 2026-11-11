@@ -107,6 +107,32 @@ describe("ticket sidebar view model", () => {
     expect(parseTicketList("工单 ????")).toEqual([])
   })
 
+  test("a dispatched ticket carries the tail of its latest worker session", async () => {
+    resetTickets()
+    const ctx = memoryContext()
+    const dispatched = await succeed(createTicket(ctx, { ...base, title: "跑过 worker 的单", objective: "跑过 worker 的单" }))
+    const queued = await succeed(createTicket(ctx, { ...base, title: "还没派的单", objective: "还没派的单" }))
+    await succeed(
+      updateTicket(ctx, {
+        ticketID: dispatched.ticket.id,
+        state: "in_progress",
+        workerSessionID: "ses_aaa111bbb222",
+      }),
+    )
+    // A second dispatch overwrites the field: the row names the newest worker.
+    await succeed(
+      updateTicket(ctx, {
+        ticketID: dispatched.ticket.id,
+        state: "blocked",
+        workerSessionID: "ses_ccc333ddd444",
+      }),
+    )
+    const rows = parseTicketList(renderTicketList(listTickets({ limit: 20 })))
+    const row = rows.find((item) => item.id === dispatched.ticket.id)
+    expect(row?.workerSuffix).toBe("ddd444")
+    expect(rows.find((item) => item.id === queued.ticket.id)?.workerSuffix).toBeUndefined()
+  })
+
   test("a wrapped title is stitched back onto one row", async () => {
     const long = "把侧栏工单面板做完并把每一项验收都写清楚再交给下游做回归测试"
     const { text } = await listText([{ title: long }])

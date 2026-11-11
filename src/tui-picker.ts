@@ -151,8 +151,11 @@ export function layoutTitle(title: string, width: number): string {
   return truncateCells(title, Math.max(1, Math.floor(width) - 4))
 }
 
+/** How to move the cursor; shared by every picker, so the wording never drifts. */
+export const PICKER_NAV_KEYS = "↑↓/PgUp/PgDn/Home/End 移动"
+
 /** Footer hint; the same keys the built-in select dialog listens for. */
-export const PICKER_HELP = "↑↓ 移动 · PgUp/PgDn 翻页 · Home/End · ⏎ 选择 · esc 取消"
+export const PICKER_HELP = `${PICKER_NAV_KEYS} · ⏎ 选择 · esc 取消`
 
 /**
  * Move the cursor by `delta` and clamp it to the result set. The built-in
@@ -176,18 +179,30 @@ export function windowStart(index: number, start: number, visible: number): numb
   return Math.max(0, start)
 }
 
+/**
+ * A hint with no match counter, for a pane that has no result set (the ticket
+ * detail). Same width contract as `layoutHelp`.
+ */
+export function layoutHint(width: number, hint: string): string {
+  return truncateCells(hint, Math.max(1, Math.floor(width)))
+}
+
 export interface PickerHelpLine {
   readonly hint: string
   readonly counter: string
 }
 
-/** Fit the help line and the match counter into one row, dropping the counter first. */
-export function layoutHelp(width: number, matched: number, total: number): PickerHelpLine {
+/**
+ * Fit the help line and the match counter into one row, dropping the counter
+ * first. `hint` lets a picker describe its own ⏎ mapping (the same list can
+ * jump to a session or open a detail, depending on the row).
+ */
+export function layoutHelp(width: number, matched: number, total: number, hint = PICKER_HELP): PickerHelpLine {
   const room = Math.max(1, Math.floor(width))
   const counter = matched === total ? `${total} 项` : `${matched}/${total} 项`
   const counterWidth = displayWidth(counter)
-  if (displayWidth(PICKER_HELP) + counterWidth + 2 <= room) return { hint: PICKER_HELP, counter }
-  const hint = truncateCells(PICKER_HELP, Math.max(0, room - counterWidth - 1))
-  if (displayWidth(hint) + counterWidth + 1 <= room) return { hint, counter }
-  return { hint: truncateCells(PICKER_HELP, room), counter: "" }
+  if (displayWidth(hint) + counterWidth + 2 <= room) return { hint, counter }
+  const trimmed = truncateCells(hint, Math.max(0, room - counterWidth - 1))
+  if (displayWidth(trimmed) + counterWidth + 1 <= room) return { hint: trimmed, counter }
+  return { hint: truncateCells(hint, room), counter: "" }
 }

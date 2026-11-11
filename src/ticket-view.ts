@@ -71,6 +71,13 @@ export interface TicketRow {
   readonly title: string
   readonly state: TicketState
   readonly priority: TicketPriority
+  /**
+   * Last six characters of the ticket's most recently dispatched worker session
+   * (`w=abc123` in the list trailer), or `undefined` when the ticket never had
+   * one. The full session id is not in the list text; the picker falls back to
+   * the ticket detail for it.
+   */
+  readonly workerSuffix?: string
 }
 
 export interface TicketPanelItem {
@@ -91,8 +98,13 @@ export interface TicketPanel {
 
 const GROUP_LINE = /^(open|in_progress|blocked|done|failed|cancelled|superseded) \(\d+\)$/
 const ITEM_LINE = /^· (tk_\S+) (p[012])(?: (.*))?$/
-/** `renderTicketList` writes `MM-DD HH:MM` (plus an optional worker suffix) under every item. */
-const TRAILER_LINE = /^\s{2}\d{2}-\d{2} \d{2}:\d{2}(?: w=\S+)?$/
+/**
+ * `renderTicketList` writes the timestamp (plus `w=<last 6 of the worker
+ * session>`) as one more bullet under every item, so the line starts with
+ * `· ` and never with the two spaces a wrapped title uses. The worker part is
+ * optional: a ticket that was never dispatched has none.
+ */
+const TRAILER_LINE = /^· \d{2}-\d{2} \d{2}:\d{2}(?: w=(\S+))?$/
 
 /**
  * Parse `renderTicketList` output. Rows arrive grouped by state and already
@@ -101,7 +113,7 @@ const TRAILER_LINE = /^\s{2}\d{2}-\d{2} \d{2}:\d{2}(?: w=\S+)?$/
  * "no tickets" instead of breaking the sidebar.
  */
 export function parseTicketList(text: string): Array<TicketRow> {
-  const rows: Array<{ id: string; title: string; state: TicketState; priority: TicketPriority }> = []
+  const rows: Array<{ id: string; title: string; state: TicketState; priority: TicketPriority; workerSuffix?: string }> = []
   let state: TicketState | undefined
   for (const line of text.split("\n")) {
     const group = GROUP_LINE.exec(line)
@@ -119,8 +131,16 @@ export function parseTicketList(text: string): Array<TicketRow> {
       })
       continue
     }
-    // A wrapped title continues on indented lines; trailers are not titles.
-    if (state !== undefined && rows.length > 0 && line.startsWith("  ") && !TRAILER_LINE.test(line)) {
+    // The trailer belongs to the item above it; `w=` is the worker's session tail.
+    const trailer = TRAILER_LINE.exec(line)
+    if (trailer !== null) {
+      const last = rows[rows.length - 1]
+      const suffix = trailer[1]
+      if (last !== undefined && suffix !== undefined) last.workerSuffix = suffix
+      continue
+    }
+    // A wrapped title continues on indented lines.
+    if (state !== undefined && rows.length > 0 && line.startsWith("  ")) {
       const last = rows[rows.length - 1]!
       const continuation = line.trim()
       if (continuation !== "") last.title = last.title === "" ? continuation : `${last.title} ${continuation}`
