@@ -5,10 +5,11 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
-Cross-platform directory handling, ticket search/resiliency, and a release gate.
-No config changes are required to upgrade; `pendingTTLMs` is a new optional
-option and the rest is behaviour. A gateway restart is still needed to load the
-new code.
+Cross-platform directory handling, ticket search/resiliency, a release gate, a
+`dispatch` reasoning `effort`, and a two-level `/task` browser. No config changes
+are required to upgrade; `pendingTTLMs` is a new optional option and the rest is
+behaviour. A gateway restart is still needed to load the new code (`effort`),
+and the TUI must be reopened for the new `/task` panes.
 
 ### Fixed
 
@@ -62,6 +63,22 @@ new code.
 
 ### Added
 
+- **`dispatch` takes a reasoning `effort`.** `dispatch({ task, title?, threadID?, agent?, effort?, directory?, ticketID })`
+  accepts `"low"`, `"medium"`, `"high"`, `"max"` and applies it as the worker's
+  model *variant* (`sessions.create`'s `model.variant` — `sessions.prompt` has no
+  effort field, so it cannot change per turn). The whitelist is the model's own
+  `variants` from `ctx.model.list()`: the server stores an unknown variant
+  instead of rejecting it, so the plugin validates and fails with
+  `dispatch: effort <level> is not available for <provider>/<model>; available: …; omit effort to inherit the router's current effort`
+  without creating a session. Omitted effort inherits the router's current
+  level exactly as before; `effort` cannot be combined with an `agent` override
+  (the agent keeps its own model) and says so; a missing/failing model catalog
+  degrades to the inherited level, logs a warning and records
+  `effort=<level> (unverified: inherited)` in the ticket history instead of
+  blocking the dispatch. The dispatch entry and `/ticket <id>` show the level
+  (`档位：`), per attempt. `src/effort.ts` is the single list shared by the tool
+  catalog (`/tools`), the RPC schema (`dispatch` accepts an optional `effort`,
+  so older clients keep working) and the dispatcher.
 - **4-character short-id search for `/task` and `/ticket`.** The sidebar shows
   `dc8d` for `tk_mwbkve34_dc8d`; the picker and `/ticket` now accept that short
   id, a full id, a prefix, a suffix or any middle fragment (case and `tk`/`_`/`-`
@@ -84,6 +101,23 @@ new code.
 
 ### Changed
 
+- **`/task` is a two-level browser: the list opens details, not sessions.**
+  `⏎` on a row now shows that row's detail (ticket fields parsed from the
+  `ticket` RPC text, or a worker summary), `/` searches, `q` closes. Ticket rows
+  carry the tail of their **most recent** worker session as `p1 w=xxx123`
+  (`w=` is absent until the ticket was dispatched), because a dispatch
+  overwrites `ticket.workerSessionID`. The detail pane lists the ticket
+  (short/full id, state, priority, title, objective, acceptance, directory,
+  `档位` when the dispatch recorded one, latest worker, attempts, timestamps,
+  report summary, history) and scrolls with `↑↓`/`PgUp`/`PgDn`. In the detail
+  pane `⏎` enters the row's worker session — verified with `session.get` first,
+  so a deleted session says `该工单的会话 … 不可用` instead of navigating
+  nowhere — and a ticket without a worker says 「该工单暂无会话」 instead of
+  failing silently. `q`/`esc` go back to the list with its query and cursor
+  intact, and the footer hint follows the pane
+  (`⏎ 详情 · q 退出 · / 搜索` vs `⏎ 进入会话 · q 返回`). The detail pane reuses
+  `computeDialogSize`/`layoutPickerRow` from the existing picker, so there is
+  one set of layout constants; `src/picker-nav.ts` holds the pure key map.
 - **E2E tests the local tarball.** `e2e/plugin-load.e2e.ts` now runs
   `bun pm pack` on the working tree, installs that tarball into a scratch prefix,
   compares the installed `dist/` with the fresh build, and boots a real host

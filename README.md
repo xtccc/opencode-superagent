@@ -128,14 +128,14 @@ opencode plugin add opencode-superagent
 | 命令 | 命令面板名称 | 作用 |
 | --- | --- | --- |
 | `/superagent` | Superagent | 通过 RPC 创建/获取 Router 会话并跳转过去。 |
-| `/task` | Superagent tasks | 从当前 Worker 列表中选择一个，跳转到它的会话。自绘选择器（`src/tui-picker.ts`）按终端尺寸放大：默认占终端高度的 75%（12–30 行可见），窄终端自动收列宽。 |
+| `/task` | Superagent tasks | 两级浏览：列表（工单在前、worker 在后）→ 详情。列表里 `⏎` 进详情、`/` 搜索、`q`/`esc` 退出；行尾 `p1 w=xxx123` 的 `w=` 是该工单**最近一次** dispatch 的 worker 会话尾 6 位（没派过不显示）。详情里 `⏎` 进入该行的 worker 会话（工单取最近一次 dispatch 的 worker，先 `session.get` 校验，会话已不存在时提示「该工单的会话 … 不可用」；无 worker 时提示「该工单暂无会话」）、`q`/`esc` 返回列表（搜索词与光标保留），`↑↓`/`PgUp`/`PgDn` 滚动详情。自绘面板（`src/tui-picker.ts`）按终端尺寸放大：默认占终端高度的 75%（12–30 行可见），窄终端自动收列宽。 |
 | `/abort` | Superagent abort worker | 选择要终止的 Worker，或首项「清理全部已结束 worker」（`stale`）批量清理；结果显示在 toast 里。 |
 | `/tools`（别名 `/superagent-tools`） | Superagent tools | 按调度类/查询类/控制类分组列出 Router 当前可用的全部工具，每行显示风险等级（只读/可写/终止）与必填参数；选中某个工具后弹窗给出参数表（名称、必填、类型、说明）、确认方式与用法，末行「能力边界」列出 Router 不能做什么。清单来自 `src/tools.ts` 的工具注册表，新增工具无需改动该命令。 |
 | `/tickets` | Superagent tickets | 浏览工单清单（按状态分组，窄终端友好）。 |
 | `/ticket <id>` | Superagent ticket detail | 查看单张工单详情。`id` 接受全 ID，也接受侧栏显示的 **4 位短 ID**（如 `dc8d`）；前缀/中间片段同样命中，多个候选会列出让你选。 |
 
 - 短 ID 搜索（`src/ticket-search.ts`）的排序：全 ID 精确 > 后缀（短 ID）> 前缀 > 中间片段 > 标题包含；比较时忽略大小写和 `tk`/`_`/`-` 分隔符，所以 `TK_mwbk-ve34`、`dc8d`、`bkve34` 都能找到 `tk_mwbkve34_dc8d`。歧义（多个同级命中）时不猜，列出候选。
-- 选择器是自绘的 `PickerDialog`（`src/tui-picker.ts` 的 `computeDialogSize`），不再受宿主 `dialog.select`「最多 `floor(rows/2)-6` 条、固定 60 列」的限制；键位与内置选择器一致：输入即搜、`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 移动、`⏎` 选择、`esc` 取消。
+- 选择器是自绘的 `PickerDialog`（`src/tui-picker.ts` 的 `computeDialogSize`），不再受宿主 `dialog.select`「最多 `floor(rows/2)-6` 条、固定 60 列」的限制；键位与内置选择器一致：输入即搜、`↑↓`/`PgUp`/`PgDn`/`Home`/`End` 移动、`⏎` 选择、`esc` 取消。`/task` 用同一套尺寸与行布局做两级面板（`TaskBrowser`）：列表页帮助行是「⏎ 详情 · q 退出 · / 搜索」，详情页是「⏎ 进入会话 · q 返回」，进入会话前会先确认该 session 仍存在（`session.get` 成功才跳转，否则在面板底部给 `该工单的会话 … 不可用`）；详情字段由 `src/ticket-detail.ts` 从 `ticket` RPC 的文本解析（短 ID、全 ID、标题、状态、优先级、目标、验收、目录、`档位`（有则显示）、最近 worker、尝试次数、创建/更新时间、报告摘要、历史），导航状态机是纯函数 `src/picker-nav.ts` 的 `taskStep`。工单行的 `w=` 尾 6 位只在列表里出现，详情用的是完整 session id（`workerBySuffix` 只在唯一命中时接受）。
 
 - TUI 右侧栏（42 列）里有一块「工单」面板，常驻显示工单清单，见[侧栏工单面板](#侧栏工单面板)。
 
@@ -170,7 +170,7 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 
 | 工具 | 用途 |
 | --- | --- |
-| `dispatch` | 派活给后台 Worker，可并行多次调用。 |
+| `dispatch({ task, title?, threadID?, agent?, effort?, directory?, ticketID })` | 派活给后台 Worker，可并行多次调用。`effort` 取该模型 `variants` 中的推理档位（low/medium/high/max），缺省继承 Router 当前档位。 |
 | `sleep({ seconds? })` | 暂停 Router 指定秒数（默认 30，范围 1..60 的整数），每 250ms 检查 Worker 终态与新 trigger，变化即提前返回；Goal 模式下 dispatch 后给 Worker 执行时间；真实定时器，不忙等。 |
 | `ticket_create({ threadID, title, objective, acceptance, directory, priority?, parentTicketID?, dedupeKey? })` | 建工单：`objective`/`acceptance`(1-10 条)/`directory` 必填，同 thread 同 dedupeKey 自动复用（`reused=true`）。 |
 | `ticket_list({ threadID?, status?, since?, limit? })` | 按 thread/状态/更新时间列工单（默认 20 条，上限 100），含 id/state/title/priority/更新时间/worker。 |
@@ -184,6 +184,7 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 | `abort_session({ sessionID?, reason?, all?, stale? })` | 终止/清理 Worker：中断、等待终态、标记 `aborted`、解除 thread 亲和（见[终止会话](#终止会话-abort_session)）。 |
 
 - 只有 Router 能调这些工具（`dispatch`、`sleep`、`ticket_*`、`thread_detail`/`worker_detail`/`report_read`/`worker_prompt`/`abort_session` 复用 `status` 的权限位，Router 会话已放行；其他会话直调会被拒绝）。
+- `dispatch` 的 `effort` 是 **模型 variant**：在 `sessions.create` 时写进 `model.variant`（`sessions.prompt` 没有档位字段，不能逐条改）。合法值以 `ctx.model.list()` 里该模型的 `variants` 为准——服务端对未知 variant 不报错、会存成坏值，所以由插件侧白名单校验：不在列表时报 `dispatch: effort <档位> is not available for <provider>/<model>; available: ...; omit effort to inherit the router's current effort`，不建会话。`effort` 不能和 `agent` 覆盖同用（agent 保留自己的模型）；`model.list` 不可用或模型探测失败时降级为继承 Router 档位并记日志，派发不中断，工单历史写作 `effort=<档位> (unverified: inherited)`。派发时记一条 `effort=<档位>`，`/ticket <id>` 详情里显示「档位：」。
 - `worker_prompt` 只接受 `store.workers` 中 `running`/`idle` 的 Worker：Router 自身、未知 session、failed/aborted/done 记录都会被拒绝；工单已结单时错误形如 `worker <id> ticket <id> is closed (<state>); start a new worker instead`，且不会发出任何 prompt/interrupt。
 - `sleep` 是 Goal 模式的节流阀：dispatch 之后暂停 Router（默认 30 秒，范围 1..60 的整数，非法值直接报错），用 `Effect.sleep` 真实定时器等待，期间其他任务照常推进，不会忙等。等待期间每 250ms 轮询插件内存状态：Worker 进入终态或新 trigger 入队会立即提前返回，text 形如 `slept 3s of 30s (woken: worker completed)` / `slept 3s of 30s (woken: 2 new event(s))`，output 带 `woken` 字段；被新 trigger 唤醒时以 `delivery: "steer"` flush pending 队列，下一步即可看到，Worker 完成通知由 watcher 投递、不重复。sleep 开始时已存在的终态/pending 不触发虚假唤醒。它是 Router-only 工具：Worker 会话的工具列表里没有它，直调也会被 `guard` 拒绝。
 - 唤醒基线比较的是**身份**而不是计数器：终态 Worker 按 `sessionID + state/updatedAt` 快照，pending 按 trigger id 快照。这样「一个终态 Worker 被唤起、同时另一个完成」（终态数不变）或「空闲钩子冲掉队列、同时新 trigger 到达」（队列长度不变）都不会被静默吞掉。
@@ -392,6 +393,8 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 ├── src/protocol.ts              # 服务端 RPC 契约（由服务端实现提供）
 ├── src/version.ts               # 从 package.json 读插件版本（带 fallback），生成启动/status 的版本提示
 ├── src/ticket-view.ts           # 侧栏面板的纯视图模型：解析 tickets 文本、排序、按 cell 截断
+├── src/ticket-detail.ts         # /task 详情页：解析 ticket 详情文本并重排成详情行
+├── src/picker-nav.ts            # /task 两级导航状态机（列表 ⇄ 详情、⏎ 进会话）与帮助行文案
 ├── src/ticket-search.ts         # 工单搜索：全 ID/前后缀/中间片段/短 ID 排序，TUI 选择器共用
 ├── src/tui-picker.ts            # 自绘选择器：对话框尺寸、行布局、可见窗口与帮助行
 ├── src/agents.ts                # Router/Worker agent 的程序化注册（插件 setup 调用）
