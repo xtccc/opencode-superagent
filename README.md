@@ -38,11 +38,11 @@
 - thread 亲和（粘性续聊）：首次出现的事件进入 Router 建 Worker，后续事件回到同一 Worker 继续（已结束会被唤起，不会每句话建新会话）。
 - 批处理：相邻事件合批，减少重复唤醒。
 - 工单：先登记「要什么 + 怎么算完成」，再派活，Worker 终态自动回写。
-- TUI 入口：`/superagent`、`/task`、`/abort`、`/tools`、`/tickets`、`/ticket <id>`、`/superagent-demo`（见[使用](#使用-tui-命令)）。
+- TUI 入口：`/superagent`、`/task`、`/abort`、`/tools`、`/tickets`、`/ticket <id>`（见[使用](#使用-tui-命令)）。
 
 ### 不做什么 P0 边界
 
-- 没有内置的 IM 信道（GitHub、邮件、即时通讯等）：事件由 RPC `trigger` 注入，TUI 演示事件用于本地联调。
+- 没有内置的 IM 信道（GitHub、邮件、即时通讯等）：事件由 RPC `trigger` 注入，任何调用 `trigger` 的客户端都可以作为本地联调入口。
 - Worker 会话不做隐藏，仍然出现在普通会话列表中，方便观察和排障。
 - Watchdog 只告警，不自动重启、不自动回收、不升级给 Router。
 - 没有 Worker 反向派活：Worker 不能创建子任务给其他 Worker；长期上下文靠链式召回带回 Router。
@@ -133,20 +133,7 @@ opencode plugin add opencode-superagent
 | `/tools`（别名 `/superagent-tools`） | Superagent tools | 按调度类/查询类/控制类分组列出 Router 当前可用的全部工具，每行显示风险等级（只读/可写/终止）与必填参数；选中某个工具后弹窗给出参数表（名称、必填、类型、说明）、确认方式与用法，末行「能力边界」列出 Router 不能做什么。清单来自 `src/tools.ts` 的工具注册表，新增工具无需改动该命令。 |
 | `/tickets` | Superagent tickets | 浏览工单清单（按状态分组，窄终端友好）。 |
 | `/ticket <id>` | Superagent ticket detail | 查看单张工单详情。 |
-| `/superagent-demo` | Superagent demo triggers | 注入一组演示事件并显示每条事件的路由结果。 |
 
-### 演示命令 `/superagent-demo`
-
-按下面的顺序注入 6 条演示事件，以便看到直通效果：
-
-1. 先调用 `router` 确保 Router 会话存在。
-2. 注入 `T-1` 的第 1 条事件，期望返回 `router`。
-3. 轮询 `status`（每 500ms 一次，最多 20 秒），直到 `status.workers` 中出现 `threads` 包含 `T-1` 的 Worker；轮询期间不发送其他 `T-1` 事件。
-4. 找到负责 `T-1` 的 Worker 后，再注入 `T-1` 的第 2、3 条事件，期望返回 `worker`。
-5. 最后注入 `T-2` 的 2 条、`T-3` 的 1 条事件；这些 thread 首次出现，期望返回 `router`。
-
-- 相邻事件间隔 150ms，最后用 toast 汇总每条事件的返回路由：`thread=router`、`thread=worker` 或 `thread=dropped`；20 秒内没等到 `T-1` 的 Worker 时，toast 会附带 `T-1 wait timed out`。
-- 演示命令先创建 Router 再注入事件，因此不需要靠「先失败再创建 Router」的兜底逻辑。
 - TUI 右侧栏（42 列）里有一块「工单」面板，常驻显示工单清单，见[侧栏工单面板](#侧栏工单面板)。
 
 ## 工作原理
@@ -206,7 +193,7 @@ Router 的 system prompt 只保留**字节稳定**的 `ROUTER_PROMPT`（prompt c
 
 - 同一 thread 的追问默认**回到上一个 Worker 继续**：运行中直接收，已结束（done/idle）会被唤起继续，不会每句话建新会话。
 - 只有全新 thread（该 thread 没有 Worker 记录）或上一个 Worker 失败了，消息才进 Router → `dispatch` 建新 Worker。
-- 事件入口通过 RPC 注入（TUI 的 `/superagent-demo`，或任何调用 `trigger` 的客户端）；`trigger` 的 `source` 可用插件选项 `sources` 过滤，未配置则全部放行。
+- 事件入口通过 RPC 注入（任何调用 `trigger` 的客户端）；`trigger` 的 `source` 可用插件选项 `sources` 过滤，未配置则全部放行。
 - 插件选项 `worker_detail_message_limit` 控制 `worker_detail` 单条消息截断字数（默认 1500，夹在 200–4000 之间）。
 - Worker 结束（`succeeded`/`failed`/`interrupted`）时，`watcher.ts` 把结论写回 Router：完整报告先写入 `report:<sessionID>`（KV，全文，上限 20 万字），Worker 记录只留 2000 字摘要 `lastReport` 供 `status`/`worker_detail` 使用；注入 Router 的事件带上「全文长度 N，可用 report_read 读取」句柄，用 `report_read({ sessionID, offset?, limit? })` 翻页读全文。
 - 终态通知按 `worker sessionID + 执行轮次 + 终态` 去重：Worker 记录里的 `notified`（随 `worker:<sessionID>` 落 KV）在通知前写入，同一执行的重复投递（watcher 抖动、host 重投 durable 事件、`hydrate` 重放）不会再注入第二条；`execution` 记录当前执行的 `session.execution.started` 序号，真正的续聊（新执行）会清空 `notified` 并再次通知。注入使用由该身份派生的稳定 `msg_` id，作为 host 侧重投时的最后一道防线。

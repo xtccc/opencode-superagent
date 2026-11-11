@@ -3,6 +3,15 @@
 All notable changes to `opencode-superagent` are documented here. The package
 version is independent of the main OpenCode line (see README, "发布与构建").
 
+## Unreleased
+
+Removes the TUI demo slash command; no RPC or config changes.
+
+- **`/superagent-demo` deleted.** The command injected six demo events to show
+  router/worker routing. Use any RPC client that calls `trigger` for local
+  debugging instead; `trigger`, `status`, and the rest of the RPC surface are
+  unchanged.
+
 ## 0.3.3
 
 Adds the router-only `worker_prompt` follow-up channel for existing workers; no
