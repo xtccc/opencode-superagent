@@ -4,8 +4,9 @@ import { Effect, Stream } from "effect"
 import { createHash } from "node:crypto"
 import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport } from "./report.js"
 import { ensureRouter } from "./router.js"
+import { clipCodePoints } from "./format.js"
 import { saveWorker, store, toSessionID, type WorkerRecord } from "./state.js"
-import { closeTicketsForWorker } from "./ticket.js"
+import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
 
 /**
@@ -34,17 +35,24 @@ function errorDetail(data: unknown): string | undefined {
   if (typeof typed.type === "string" && typed.type !== "") parts.push(typed.type)
   if (typeof typed.status === "number") parts.push(`status ${typed.status}`)
   if (typeof typed.message === "string") {
-    const message = typed.message.trim().slice(0, 500)
+    const message = clipCodePoints(typed.message.trim(), 500)
     if (message !== "") parts.push(message)
   }
   if (parts.length === 0) return undefined
   return parts.join(" ")
 }
 
-function interruptDetail(data: unknown): string | undefined {
+/**
+ * Raw `reason` the host attached to an interruption (`context canceled`, a
+ * user label, …), if any. It is recorded on the ticket, so keep it free of
+ * wording the ticket layer adds itself.
+ */
+function interruptReason(data: unknown): string | undefined {
   if (typeof data !== "object" || data === null) return undefined
   const reason = (data as { reason?: unknown }).reason
-  return typeof reason === "string" && reason !== "" ? `interrupted (${reason})` : "interrupted"
+  if (typeof reason !== "string") return undefined
+  const trimmed = reason.trim()
+  return trimmed === "" ? undefined : clipCodePoints(trimmed, 500)
 }
 
 /** Relative position of an event's execution before/after the worker's current one. */
@@ -173,8 +181,9 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   const captured = report === undefined ? undefined : yield* captureReport(ctx, worker, report)
   yield* saveWorker(ctx, worker)
   // A worker that reached a terminal state closes its in-progress ticket.
-  // Interruptions (`idle`) leave it open: the abort tool closes it explicitly
-  // and a plain interrupt may still be resumed with a follow-up.
+  // An interruption (`idle`) parks it instead: the work did not finish and the
+  // attempt did not fail, but leaving it `in_progress` would keep it out of
+  // every later dispatch. `blocked` records the reason and stays re-dispatchable.
   const closeOutcome = closeOutcomeForWorkerState(state)
   if (closeOutcome !== undefined) {
     yield* closeTicketsForWorker(ctx, {
@@ -184,6 +193,15 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("superagent failed to close ticket for ended worker", { sessionID, cause }),
+      ),
+    )
+  } else if (state === "idle") {
+    yield* blockTicketsForWorker(ctx, {
+      sessionID,
+      ...(detail === undefined ? {} : { reason: detail }),
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to block ticket for interrupted worker", { sessionID, cause }),
       ),
     )
   }
@@ -288,7 +306,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
                 store.routerBusy = false
                 return
               }
-              yield* handleEnded(ctx, sessionID, "idle", interruptDetail(event.data as unknown), execution)
+              yield* handleEnded(ctx, sessionID, "idle", interruptReason(event.data as unknown), execution)
               return
             }
             case "session.idle": {

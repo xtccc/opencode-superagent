@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import type { Schema } from "effect"
 import { Effect } from "effect"
+import { clipUtf16 } from "./format.js"
 
 /**
  * Full worker reports ("spill") kept beside the compact `worker:<id>` record.
@@ -59,23 +60,29 @@ export const reportKey = (sessionID: string) => `${REPORT_PREFIX}${sessionID}`
 
 /** Capture-time copy of the text, clipped to the hard cap and tagged with its metadata. */
 export function buildReport(sessionID: string, text: string, capturedAt = Date.now()): ReportRecord {
+  // The cap bounds stored size, so it is counted in UTF-16 units — but the cut
+  // must land on a code point boundary: a naive slice can keep half an emoji,
+  // which then renders as garbage and shifts `report_read` paging.
   if (text.length <= REPORT_TEXT_LIMIT) {
     return { sessionID, text, length: text.length, capturedAt, truncated: false }
   }
+  const stored = clipUtf16(text, REPORT_TEXT_LIMIT)
   return {
     sessionID,
-    text: text.slice(0, REPORT_TEXT_LIMIT),
+    text: stored,
     length: text.length,
     capturedAt,
     truncated: true,
-    clippedAt: REPORT_TEXT_LIMIT,
+    // Offset of the stored text inside the original, in the same UTF-16 units
+    // `sliceReport` pages by.
+    clippedAt: stored.length,
   }
 }
 
 /** The compact form kept in `worker:<id>.lastReport`. */
 export function reportSummary(record: ReportRecord): string {
   if (record.text.length <= REPORT_SUMMARY_LIMIT) return record.text
-  return `${record.text.slice(0, REPORT_SUMMARY_LIMIT)}…`
+  return `${clipUtf16(record.text, REPORT_SUMMARY_LIMIT)}…`
 }
 
 /** One router-facing line that names the full-text handle. */

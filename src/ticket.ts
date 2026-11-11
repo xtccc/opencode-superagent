@@ -1,8 +1,9 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Tool } from "@opencode/schema/tool"
-import { Effect, type Schema } from "effect"
+import { Effect, Exit, type Schema } from "effect"
 import { createHash } from "node:crypto"
-import { normalizeDirectory } from "./dirs.js"
+import { DIRECTORY_ERROR, normalizeDirectory } from "./dirs.js"
+import { clipCodePoints, codePointLength } from "./format.js"
 import {
   ACTIVE_STATES,
   findActiveTicketForWorker,
@@ -124,6 +125,42 @@ export const tickets = new Map<string, Ticket>()
 const byThread = new Map<string, Set<string>>()
 
 /**
+ * How many ticket records exist in KV. `hydrateTickets` counts the whole
+ * prefix and `createTicket` adds one per new record; nothing else removes a
+ * record. Memory only holds the newest `MEMORY_LIMIT` tickets, so
+ * `tickets.size < kvTotal` is the signal that a query must fall back to KV
+ * instead of reporting "no such ticket" for a trimmed one.
+ */
+let kvTotal = 0
+
+export function kvTicketCount(): number {
+  return kvTotal
+}
+
+/** True while the in-memory map still mirrors every record in KV. */
+function memoryComplete(): boolean {
+  return tickets.size >= kvTotal
+}
+
+/**
+ * Write-behind state. A ticket (or index bucket) whose KV write failed stays
+ * queued here: memory already moved on, so dropping the write would make a
+ * restart resurrect the old state. The next write retries it.
+ */
+const dirty = new Map<string, Ticket>()
+const dirtyIndexes = new Map<string, Array<string>>()
+
+/** Ticket ids whose last write failed and is still queued for retry. */
+export function dirtyTicketIDs(): ReadonlyArray<string> {
+  return [...dirty.keys()]
+}
+
+/** Index keys whose last write failed and is still queued for retry. */
+export function dirtyTicketIndexKeys(): ReadonlyArray<string> {
+  return [...dirtyIndexes.keys()]
+}
+
+/**
  * The trigger most recently delivered to the Router. `ticket_create` copies
  * it into `authorization`, so a ticket always points at what the user said.
  * It is a heuristic: the newest flushed trigger wins, which matches how the
@@ -159,6 +196,9 @@ export function currentTrigger(): RouterTriggerNote | undefined {
 export function resetTickets(): void {
   tickets.clear()
   byThread.clear()
+  dirty.clear()
+  dirtyIndexes.clear()
+  kvTotal = 0
   routerTrigger = undefined
 }
 
@@ -189,6 +229,33 @@ function trimMemory(): void {
 export function getTicket(ticketID: string): Ticket | undefined {
   return tickets.get(ticketID)
 }
+
+/**
+ * Memory first, KV second. Memory only holds the newest `MEMORY_LIMIT`
+ * tickets, so a closed ticket that was trimmed out must still be readable:
+ * answering from memory alone is what made the UI claim a ticket in KV did not
+ * exist. One `get` on a miss, never a scan.
+ */
+export const loadTicket = Effect.fn("superagent.loadTicket")(function* (ctx: Plugin.Context, ticketID: string) {
+  const id = ticketID.trim()
+  const cached = tickets.get(id)
+  if (cached !== undefined) return cached
+  const value = yield* ctx.storage
+    .get(ticketKey(id))
+    .pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("superagent failed to read ticket from storage", { ticketID: id, cause }).pipe(
+          Effect.as(undefined),
+        ),
+      ),
+    )
+  const ticket = decodeTicket(value)
+  if (ticket === undefined) return undefined
+  // Re-cache only while there is room: a read must not push memory back over
+  // the cap it was trimmed to.
+  if (tickets.size < MEMORY_LIMIT) remember(ticket)
+  return ticket
+})
 
 /** Same-thread, same-dedupe-key ticket still open or in progress, if any. */
 export function findDuplicate(threadID: string, dedupeKey: string): Ticket | undefined {
@@ -267,27 +334,31 @@ export function validateCreateInput(input: {
   if ((input.threadID ?? "").trim() === "") return "ticket_create needs a threadID"
   const title = (input.title ?? "").trim()
   if (title === "") return "ticket_create needs a non-empty title"
-  if (title.length > TITLE_MAX) return `title must be at most ${TITLE_MAX} characters`
+  // Lengths are counted in code points: a 40-emoji title is 40 characters to
+  // the user, not the 80 UTF-16 units a naive `length` sees.
+  if (codePointLength(title) > TITLE_MAX) return `title must be at most ${TITLE_MAX} characters`
   const objective = (input.objective ?? "").trim()
   if (objective === "") return "ticket_create needs a non-empty objective; ask the user first"
-  if (objective.length > OBJECTIVE_MAX) return `objective must be at most ${OBJECTIVE_MAX} characters`
+  if (codePointLength(objective) > OBJECTIVE_MAX) return `objective must be at most ${OBJECTIVE_MAX} characters`
   const acceptance = (input.acceptance ?? []).map((item) => item.trim()).filter((item) => item !== "")
   if (acceptance.length === 0) {
     return "ticket_create needs at least one acceptance criterion; ask the user instead of creating an empty ticket"
   }
   if (acceptance.length > ACCEPTANCE_MAX) return `acceptance takes at most ${ACCEPTANCE_MAX} items`
-  if (acceptance.some((item) => item.length > ACCEPTANCE_ITEM_MAX)) {
+  if (acceptance.some((item) => codePointLength(item) > ACCEPTANCE_ITEM_MAX)) {
     return `each acceptance item must be at most ${ACCEPTANCE_ITEM_MAX} characters`
   }
-  if ((input.directory ?? "").trim() === "") return "ticket_create needs a directory (absolute path)"
-  if (normalizeDirectory(input.directory ?? "") === undefined) return "directory must be an absolute path"
+  if ((input.directory ?? "").trim() === "") return `ticket_create needs a directory: ${DIRECTORY_ERROR}`
+  if (normalizeDirectory(input.directory ?? "") === undefined) return DIRECTORY_ERROR
   return undefined
 }
 
 function compact(text: string, limit: number): string {
   const clean = text.replace(/\s+/g, " ").trim()
-  if (clean.length <= limit) return clean
-  return `${clean.slice(0, limit - 1).trimEnd()}…`
+  if (codePointLength(clean) <= limit) return clean
+  // Code points, not UTF-16 units: cutting a report mid-emoji leaves a lone
+  // surrogate that no longer renders as anything.
+  return `${clipCodePoints(clean, limit - 1).trimEnd()}…`
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -465,20 +536,72 @@ function collect(predicate: (ticket: Ticket) => boolean): Array<string> {
     .map((ticket) => ticket.id)
 }
 
+/**
+ * Retry everything the last write left behind. Cheap and idempotent: with an
+ * empty queue this is a no-op, so every mutation can call it first.
+ */
+export const flushTicketWrites = Effect.fn("superagent.flushTicketWrites")(function* (ctx: Plugin.Context) {
+  for (const [id, snapshot] of [...dirty]) {
+    // The live record wins over the snapshot: it is the newest state.
+    const ticket = tickets.get(id) ?? snapshot
+    const exit = yield* Effect.exit(ctx.storage.set(ticketKey(id), encodeTicket(ticket)))
+    if (Exit.isSuccess(exit)) {
+      dirty.delete(id)
+      continue
+    }
+    yield* Effect.logWarning("superagent ticket write retry failed", {
+      ticketID: id,
+      state: ticket.state,
+      key: ticketKey(id),
+      cause: exit.cause,
+    })
+  }
+  for (const [key, ids] of [...dirtyIndexes]) {
+    const exit = yield* Effect.exit(ctx.storage.set(key, ids as unknown as Schema.Json))
+    if (Exit.isSuccess(exit)) {
+      dirtyIndexes.delete(key)
+      continue
+    }
+    yield* Effect.logWarning("superagent ticket index write retry failed", { key, ids: ids.length, cause: exit.cause })
+  }
+})
+
 const writeIds = Effect.fn("superagent.persistTicketIndex")(function* (
   ctx: Plugin.Context,
   key: string,
   ids: Array<string>,
 ) {
-  yield* ctx.storage
-    .set(key, ids as unknown as Schema.Json)
-    .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist ticket index", { key, cause })))
+  const exit = yield* Effect.exit(ctx.storage.set(key, ids as unknown as Schema.Json))
+  if (Exit.isSuccess(exit)) {
+    dirtyIndexes.delete(key)
+    return
+  }
+  // Index buckets are derived accelerators, so a lost write never loses a
+  // ticket — but the queue keeps it retried instead of silently stale.
+  dirtyIndexes.set(key, [...ids])
+  yield* Effect.logWarning("superagent failed to persist ticket index; queued for retry", {
+    key,
+    ids: ids.length,
+    cause: exit.cause,
+  })
 })
 
 const persistTicket = Effect.fn("superagent.persistTicket")(function* (ctx: Plugin.Context, ticket: Ticket) {
-  yield* ctx.storage
-    .set(ticketKey(ticket.id), encodeTicket(ticket))
-    .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist ticket", { cause })))
+  yield* flushTicketWrites(ctx)
+  const exit = yield* Effect.exit(ctx.storage.set(ticketKey(ticket.id), encodeTicket(ticket)))
+  if (Exit.isSuccess(exit)) {
+    dirty.delete(ticket.id)
+    return
+  }
+  // Never swallow this: memory is already updated, so the write is queued and
+  // retried by the next mutation instead of being lost until a restart.
+  dirty.set(ticket.id, ticket)
+  yield* Effect.logWarning("superagent failed to persist ticket; kept in memory and queued for retry", {
+    ticketID: ticket.id,
+    state: ticket.state,
+    key: ticketKey(ticket.id),
+    cause: exit.cause,
+  })
 })
 
 /** Only the buckets the ticket touches are rewritten; the record prefix stays authoritative. */
@@ -559,7 +682,7 @@ export const createTicket = Effect.fn("superagent.createTicket")(function* (
   if (failure !== undefined) return yield* new Tool.Error({ message: failure })
   const now = input.now ?? Date.now()
   const directory = normalizeDirectory(input.directory)
-  if (directory === undefined) return yield* new Tool.Error({ message: "directory must be an absolute path" })
+  if (directory === undefined) return yield* new Tool.Error({ message: DIRECTORY_ERROR })
   const acceptance = input.acceptance.map((item) => item.trim()).filter((item) => item !== "")
   const dedupeKey =
     input.dedupeKey?.trim() ||
@@ -596,6 +719,7 @@ export const createTicket = Effect.fn("superagent.createTicket")(function* (
     history: [{ at: now, kind: "created", to: "open" }],
   }
   remember(ticket)
+  kvTotal += 1
   trimMemory()
   yield* persistTicket(ctx, ticket)
   yield* persistIndexes(ctx, ticket)
@@ -615,7 +739,7 @@ export const updateTicket = Effect.fn("superagent.updateTicket")(function* (
   ctx: Plugin.Context,
   input: UpdateTicketInput,
 ) {
-  const ticket = tickets.get(input.ticketID)
+  const ticket = yield* loadTicket(ctx, input.ticketID)
   if (ticket === undefined) return yield* new Tool.Error({ message: `unknown ticket ${input.ticketID}` })
   const now = input.now ?? Date.now()
   if (input.state !== undefined && input.state !== ticket.state) {
@@ -655,7 +779,7 @@ export const closeTicket = Effect.fn("superagent.closeTicket")(function* (
   ctx: Plugin.Context,
   input: CloseTicketInput,
 ) {
-  const ticket = tickets.get(input.ticketID)
+  const ticket = yield* loadTicket(ctx, input.ticketID)
   if (ticket === undefined) return yield* new Tool.Error({ message: `unknown ticket ${input.ticketID}` })
   // Re-closing with the same outcome is idempotent; a different outcome is a conflict.
   if (isTerminalState(ticket.state)) {
@@ -685,15 +809,80 @@ export interface ListTicketsInput {
   readonly limit?: number
 }
 
+function matchesQuery(ticket: Ticket, input: ListTicketsInput): boolean {
+  if (input.threadID !== undefined && ticket.threadID !== input.threadID) return false
+  if (input.status !== undefined && ticket.state !== input.status) return false
+  if (input.since !== undefined && ticket.updatedAt < input.since) return false
+  return true
+}
+
 /** Newest-updated first; filters are combined with AND. */
 export function listTickets(input: ListTicketsInput = {}): Array<Ticket> {
   const limit = clamp(input.limit ?? LIST_DEFAULT, 1, LIST_MAX)
   return [...tickets.values()]
-    .filter((ticket) => input.threadID === undefined || ticket.threadID === input.threadID)
-    .filter((ticket) => input.status === undefined || ticket.state === input.status)
-    .filter((ticket) => input.since === undefined || ticket.updatedAt >= input.since)
+    .filter((ticket) => matchesQuery(ticket, input))
     .sort((left, right) => right.updatedAt - left.updatedAt)
     .slice(0, limit)
+}
+
+/**
+ * Page a ticket list the way `ticket_list` needs it: memory answers while it
+ * is complete (the normal case, no I/O). Once trimming has dropped closed
+ * records, a page that memory cannot fill is completed from KV, so a ticket
+ * that exists in KV never shows up as "no such ticket". The KV walk is paged
+ * and only runs on that short-page path, never on every call.
+ */
+export const listTicketRecords = Effect.fn("superagent.listTicketRecords")(function* (
+  ctx: Plugin.Context,
+  input: ListTicketsInput = {},
+) {
+  // A read is the cheapest retry point for writes an earlier storage hiccup
+  // left queued, so a ticket that memory already shows can reach KV even when
+  // no further mutation happens.
+  yield* flushTicketWrites(ctx)
+  const limit = clamp(input.limit ?? LIST_DEFAULT, 1, LIST_MAX)
+  const local = listTickets(input)
+  if (memoryComplete() || local.length >= limit) return local
+  const merged = new Map(local.map((ticket) => [ticket.id, ticket]))
+  let after: string | undefined
+  do {
+    const page = yield* ctx.storage
+      .scan({ prefix: TICKET_PREFIX, after, limit: 100 })
+      .pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("superagent failed to scan tickets; showing memory only", { after, cause }).pipe(
+            Effect.as({ entries: [], next: undefined }),
+          ),
+        ),
+      )
+    for (const entry of page.entries) {
+      const id = entry.key.slice(TICKET_PREFIX.length)
+      if (merged.has(id)) continue
+      const ticket = decodeTicket(entry.value)
+      if (ticket === undefined || !matchesQuery(ticket, input)) continue
+      merged.set(ticket.id, ticket)
+    }
+    after = page.next
+  } while (after !== undefined)
+  return [...merged.values()].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, limit)
+})
+
+/**
+ * True when the ticket was parked (`blocked`) or closed after its newest
+ * dispatch, i.e. the worker that was dispatched no longer owns it. A parked
+ * ticket is how an interruption is undone: the watcher moves `in_progress` to
+ * `blocked`, the Router re-opens it, and the interrupted (now `idle`) worker
+ * must not gate that re-dispatch any more.
+ */
+function releasedSinceDispatch(ticket: Ticket): boolean {
+  for (let index = ticket.history.length - 1; index >= 0; index--) {
+    const entry = ticket.history[index]
+    if (entry === undefined) continue
+    if (entry.kind === "dispatch") return false
+    const to = entry.kind === "state" || entry.kind === "closed" ? entry.to : undefined
+    if (to === "blocked" || (to !== undefined && isTerminalState(to))) return true
+  }
+  return false
 }
 
 /**
@@ -732,15 +921,19 @@ export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket
   // One ticket never runs two workers at once: the previous worker must be
   // terminal (done, failed, aborted) before anything is dispatched again.
   // `idle` is NOT terminal — the session may still be resumed — so it blocks
-  // a re-dispatch exactly like `running`. A worker record that is gone blocks
-  // nothing: there is no live worker left to wait for.
+  // a re-dispatch exactly like `running`, unless the ticket was parked after
+  // that worker went idle (an interruption released it). A worker record that
+  // is gone blocks nothing: there is no live worker left to wait for.
   const workerID = ticket.workerSessionID
   const worker = workerID === undefined ? undefined : workers.get(workerID)
   if (workerID !== undefined && worker !== undefined && !isWorkerTerminal(worker.state)) {
-    const article = worker.state === "idle" ? "an" : "a"
-    return yield* new Tool.Error({
-      message: `ticket ${ticket.id} already has ${article} ${worker.state} worker ${workerID}; wait for it to finish, abort_session it, or ticket_create a new ticket for the re-dispatch`,
-    })
+    const released = worker.state === "idle" && releasedSinceDispatch(ticket)
+    if (!released) {
+      const article = worker.state === "idle" ? "an" : "a"
+      return yield* new Tool.Error({
+        message: `ticket ${ticket.id} already has ${article} ${worker.state} worker ${workerID}; wait for it to finish, abort_session it, or ticket_create a new ticket for the re-dispatch`,
+      })
+    }
   }
   return ticket
 })
@@ -760,7 +953,7 @@ export const linkTicketToWorker = Effect.fn("superagent.linkTicketToWorker")(fun
   ctx: Plugin.Context,
   input: LinkTicketInput,
 ) {
-  const ticket = tickets.get(input.ticketID)
+  const ticket = yield* loadTicket(ctx, input.ticketID)
   if (ticket === undefined) return yield* new Tool.Error({ message: `unknown ticket ${input.ticketID}` })
   if (!ACTIVE_STATES.includes(ticket.state)) {
     return yield* new Tool.Error({
@@ -812,6 +1005,43 @@ export const closeTicketsForWorker = Effect.fn("superagent.closeTicketsForWorker
   })
 })
 
+/** Why a ticket was parked: the worker was interrupted, not finished. */
+export const INTERRUPTED_REASON = "interrupted"
+
+export interface BlockForWorkerInput {
+  readonly sessionID: string
+  /** Raw interruption detail (the host's `reason`), when there is one. */
+  readonly reason?: string
+  readonly now?: number
+}
+
+/**
+ * Park the in-progress ticket of a worker that was interrupted.
+ *
+ * An interruption finishes neither the work nor the attempt: closing the
+ * ticket as `failed` would lie and leaving it `in_progress` would keep it out
+ * of every later dispatch (the interrupted worker stays `idle`, which the
+ * dispatch gate treats as live). `blocked` is the honest state — the ticket
+ * says why it stopped, and the Router can re-open and re-dispatch it. The
+ * history entry is also what tells the gate that worker released the ticket.
+ */
+export const blockTicketsForWorker = Effect.fn("superagent.blockTicketsForWorker")(function* (
+  ctx: Plugin.Context,
+  input: BlockForWorkerInput,
+) {
+  const ticket = activeTicketForWorker(input.sessionID)
+  if (ticket === undefined) return undefined
+  const now = input.now ?? Date.now()
+  const reason = input.reason === undefined || input.reason.trim() === "" ? undefined : input.reason.trim()
+  const note = compact(reason === undefined ? INTERRUPTED_REASON : `${INTERRUPTED_REASON}: ${reason}`, SUMMARY_MAX)
+  ticket.history.push({ at: now, kind: "state", from: ticket.state, to: "blocked", note })
+  ticket.state = "blocked"
+  ticket.updatedAt = now
+  yield* persistTicket(ctx, ticket)
+  yield* persistIndexes(ctx, ticket)
+  return ticket
+})
+
 /**
  * Load every `ticket:<id>` record and rebuild the indexes. Older workers are
  * never backfilled: a worker with no ticket stays without one, silently.
@@ -830,12 +1060,15 @@ export const hydrateTickets = Effect.fn("superagent.hydrateTickets")(function* (
         continue
       }
       remember(ticket)
+      // Count everything KV holds, not what survives trimming: this is the
+      // baseline that tells a query whether memory is still complete.
+      kvTotal += 1
     }
     after = page.next
   } while (after !== undefined)
   trimMemory()
   yield* rewriteIndexes(ctx)
-  yield* Effect.logInfo("superagent tickets hydrated", { count: tickets.size })
+  yield* Effect.logInfo("superagent tickets hydrated", { count: tickets.size, inKV: kvTotal })
 })
 
 // ── rendering (shared by tools and the TUI, narrow-terminal first) ─────────────
