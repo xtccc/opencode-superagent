@@ -3,7 +3,7 @@
 All notable changes to `opencode-superagent` are documented here. The package
 version is independent of the main OpenCode line (see README, "发布与构建").
 
-## Unreleased
+## 0.4.0
 
 Removes the TUI demo slash command; no RPC or config changes.
 

@@ -349,7 +349,7 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
   - `tui.d.ts` 只声明默认导出的 `Plugin.Definition`，不描述 `setup` 内部类型；TUI 插件是动态加载的，消费方通常只需要包名。
   - `dist/tui.js` 约 41 KB（未压缩，Solid JSX 编译结果 + 内联的 `src/` 纯函数），不包含 `solid-js`/`@opentui/solid`，那部分由宿主提供。
   - `@opencode/schema` 会带上自己的一份 `effect`（其 manifest 的 dependency）。运行时所有 `effect` 导入都被宿主接管，这份副本不会被求值，只是多占几 MB 磁盘。
-  - 包版本 `0.3.3` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
+  - 包版本 `0.4.0` 与主仓 `2.2.5` 解耦，发版需要单独 bump。
 
 ## 已知限制与路线图
 
