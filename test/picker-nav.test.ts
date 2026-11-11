@@ -1,5 +1,5 @@
 /**
- * `src/picker-nav.ts` pins the two-level `/task` navigation: `⏎` on a list row
+ * `src/picker-nav.ts` pins the two-level `/tickets` navigation: `⏎` on a list row
  * opens the detail, the detail's `⏎` enters that row's worker session, and
  * `q` / `esc` go back one level. A ticket whose session is unknown must say so
  * instead of jumping nowhere, and the list's query/cursor survive a round trip
@@ -13,64 +13,64 @@ import {
   missingSessionMessage,
   NO_SESSION_MESSAGE,
   SEARCH_HINT,
-  taskHint,
-  taskStep,
+  ticketHint,
+  ticketStep,
   workerBySuffix,
-  type TaskNavRow,
+  type TicketNavRow,
 } from "../src/picker-nav"
 import { computeDialogSize, layoutHint } from "../src/tui-picker"
 import { displayWidth } from "../src/tools"
 
-const ticketWithWorker: TaskNavRow = { kind: "ticket", sessionID: "ses_worker" }
-const ticketWithoutWorker: TaskNavRow = { kind: "ticket" }
+const ticketWithWorker: TicketNavRow = { kind: "ticket", sessionID: "ses_worker" }
+const ticketWithoutWorker: TicketNavRow = { kind: "ticket" }
 
-describe("taskStep: list pane", () => {
+describe("ticketStep: list pane", () => {
   test("⏎ opens the detail and never jumps straight to a session", () => {
-    expect(taskStep("list", "enter", ticketWithWorker)).toEqual({ kind: "open-detail" })
-    expect(taskStep("list", "enter", ticketWithoutWorker)).toEqual({ kind: "open-detail" })
+    expect(ticketStep("list", "enter", ticketWithWorker)).toEqual({ kind: "open-detail" })
+    expect(ticketStep("list", "enter", ticketWithoutWorker)).toEqual({ kind: "open-detail" })
   })
 
   test("q and esc close the browser", () => {
-    expect(taskStep("list", "quit", ticketWithWorker)).toEqual({ kind: "close" })
-    expect(taskStep("list", "back", ticketWithWorker)).toEqual({ kind: "close" })
+    expect(ticketStep("list", "quit", ticketWithWorker)).toEqual({ kind: "close" })
+    expect(ticketStep("list", "back", ticketWithWorker)).toEqual({ kind: "close" })
   })
 
   test("an empty list has nothing to open", () => {
-    const step = taskStep("list", "enter", undefined)
+    const step = ticketStep("list", "enter", undefined)
     expect(step.kind).toBe("notice")
   })
 })
 
-describe("taskStep: detail pane", () => {
+describe("ticketStep: detail pane", () => {
   test("⏎ enters the session of the row", () => {
-    expect(taskStep("detail", "enter", ticketWithWorker)).toEqual({
+    expect(ticketStep("detail", "enter", ticketWithWorker)).toEqual({
       kind: "jump",
       sessionID: "ses_worker",
     })
-    expect(taskStep("detail", "enter", { kind: "worker", sessionID: "ses_w2" })).toEqual({
+    expect(ticketStep("detail", "enter", { kind: "worker", sessionID: "ses_w2" })).toEqual({
       kind: "jump",
       sessionID: "ses_w2",
     })
   })
 
   test("a ticket without a worker says so instead of navigating", () => {
-    const step = taskStep("detail", "enter", ticketWithoutWorker)
+    const step = ticketStep("detail", "enter", ticketWithoutWorker)
     expect(step).toEqual({ kind: "notice", message: NO_SESSION_MESSAGE })
     // Still loading reads the same way: no silent no-op.
-    expect(taskStep("detail", "enter", undefined).kind).toBe("notice")
+    expect(ticketStep("detail", "enter", undefined).kind).toBe("notice")
   })
 
   test("q and esc go back to the list, one level only", () => {
-    expect(taskStep("detail", "quit", ticketWithWorker)).toEqual({ kind: "back-to-list" })
-    expect(taskStep("detail", "back", ticketWithWorker)).toEqual({ kind: "back-to-list" })
+    expect(ticketStep("detail", "quit", ticketWithWorker)).toEqual({ kind: "back-to-list" })
+    expect(ticketStep("detail", "back", ticketWithWorker)).toEqual({ kind: "back-to-list" })
   })
 
   test("the round trip list → detail → list is stable", () => {
     const state: { pane: "list" | "detail" } = { pane: "list" }
     /** Read through a function so the assertion is not narrowed by the writes below. */
     const pane = (): "list" | "detail" => state.pane
-    const apply = (key: "enter" | "back" | "quit", row: TaskNavRow) => {
-      const step = taskStep(state.pane, key, row)
+    const apply = (key: "enter" | "back" | "quit", row: TicketNavRow) => {
+      const step = ticketStep(state.pane, key, row)
       if (step.kind === "open-detail") state.pane = "detail"
       if (step.kind === "back-to-list") state.pane = "list"
       return step
@@ -104,21 +104,21 @@ describe("workerBySuffix", () => {
   })
 })
 
-describe("taskHint", () => {
+describe("ticketHint", () => {
   test("the list advertises detail, quit and search", () => {
-    expect(taskHint("list", false)).toBe(LIST_HINT)
+    expect(ticketHint("list", false)).toBe(LIST_HINT)
     expect(LIST_HINT).toContain("⏎ 详情")
     expect(LIST_HINT).toContain("q 退出")
     expect(LIST_HINT).toContain("/ 搜索")
   })
 
   test("the search field gets its own hint", () => {
-    expect(taskHint("list", true)).toBe(SEARCH_HINT)
+    expect(ticketHint("list", true)).toBe(SEARCH_HINT)
     expect(SEARCH_HINT).toContain("esc")
   })
 
   test("the detail pane advertises the session and the way back", () => {
-    expect(taskHint("detail", false)).toBe(DETAIL_HINT)
+    expect(ticketHint("detail", false)).toBe(DETAIL_HINT)
     expect(DETAIL_HINT).toContain("⏎ 进入会话")
     expect(DETAIL_HINT).toContain("q 返回")
     // Scrolling is the only movement in the detail pane.
@@ -127,12 +127,12 @@ describe("taskHint", () => {
   })
 
   test("no hint claims ⏎ opens a detail on the detail pane", () => {
-    expect(taskHint("detail", false)).not.toContain("⏎ 详情")
+    expect(ticketHint("detail", false)).not.toContain("⏎ 详情")
   })
 
   test("every hint fits the 80x24 picker", () => {
     const width = computeDialogSize(80, 24).width
-    for (const hint of [taskHint("list", false), taskHint("list", true), taskHint("detail", false)]) {
+    for (const hint of [ticketHint("list", false), ticketHint("list", true), ticketHint("detail", false)]) {
       expect(displayWidth(layoutHint(width, hint))).toBeLessThanOrEqual(width)
       expect(layoutHint(width, hint)).toBe(hint)
     }

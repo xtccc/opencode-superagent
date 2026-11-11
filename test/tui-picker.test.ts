@@ -120,7 +120,7 @@ describe("layoutPickerRow", () => {
     glyph: "●",
     code: "dc8d",
     status: "in_progress",
-    title: "放大 /task 选择器窗口并做窄终端自适应",
+    title: "放大 /tickets 选择器窗口并做窄终端自适应",
     trailing: "p1",
   }
 
@@ -134,7 +134,7 @@ describe("layoutPickerRow", () => {
 
   test("the title column is padded so the trailing column lines up", () => {
     const short = layoutPickerRow({ ...parts, title: "短" }, 112)
-    const long = layoutPickerRow({ ...parts, title: "放大 /task 选择器窗口并做窄终端自适应" }, 112)
+    const long = layoutPickerRow({ ...parts, title: "放大 /tickets 选择器窗口并做窄终端自适应" }, 112)
     expect(displayWidth(short.title)).toBe(displayWidth(long.title))
     expect(displayWidth(short.title) + displayWidth(short.trailing)).toBe(112 - 1 - displayWidth(short.marker) - displayWidth(short.glyph) - displayWidth(short.detail))
   })
@@ -182,13 +182,13 @@ describe("layoutPickerRow", () => {
   test("an 80x24 picker still fits short id, state and a whole title on one line", () => {
     const size = computeDialogSize(80, 24)
     const line = layoutPickerRow(
-      { marker: PICKER_MARKER, glyph: "●", code: "dc8d", status: "in_progress", title: "放大 /task 选择器窗口并做窄终端自适应", trailing: "p1" },
+      { marker: PICKER_MARKER, glyph: "●", code: "dc8d", status: "in_progress", title: "放大 /tickets 选择器窗口并做窄终端自适应", trailing: "p1" },
       size.width,
     )
     // Nothing is dropped or clipped at the narrow-terminal width.
     expect(line.detail).toContain("dc8d")
     expect(line.detail).toContain("in_progress")
-    expect(line.title.trimEnd()).toBe("放大 /task 选择器窗口并做窄终端自适应")
+    expect(line.title.trimEnd()).toBe("放大 /tickets 选择器窗口并做窄终端自适应")
     expect(line.title).not.toContain("…")
     expect(line.trailing.trim()).toBe("p1")
     const used =
@@ -203,11 +203,11 @@ describe("layoutPickerRow", () => {
 
 describe("layoutTitle", () => {
   test("short titles are untouched", () => {
-    expect(layoutTitle("Superagent tasks · 工单 4", 76)).toBe("Superagent tasks · 工单 4")
+    expect(layoutTitle("Superagent tickets · 工单 4", 76)).toBe("Superagent tickets · 工单 4")
   })
 
   test("long titles leave room for the esc label", () => {
-    const title = layoutTitle("Superagent tasks · 工单 40 · worker 12 · 很长的标题".repeat(3), 36)
+    const title = layoutTitle("Superagent tickets · 工单 40 · worker 12 · 很长的标题".repeat(3), 36)
     expect(displayWidth(title) + 3).toBeLessThanOrEqual(36)
     expect(title.endsWith("…")).toBe(true)
   })

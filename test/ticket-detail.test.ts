@@ -1,5 +1,5 @@
 /**
- * `src/ticket-detail.ts` turns the `ticket` RPC text into the fields the `/task`
+ * `src/ticket-detail.ts` turns the `ticket` RPC text into the fields the `/tickets`
  * detail pane shows. The gateway is text-only and deployed separately, so this
  * parser is the TUI's only contract: it must pick up every field the pane
  * promises, keep `effort` optional, and never overflow the pane width.
@@ -38,7 +38,7 @@ async function succeed<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
 
 const base = {
   threadID: "T-1",
-  objective: "用户预期 /task 列表按回车是进入对应 session，现在行为不符合。",
+  objective: "用户预期 /tickets 列表按回车是进入对应 session，现在行为不符合。",
   acceptance: ["说清现状", "⏎ 进 session"],
   directory: "/home/tmzy/opencode-superagent",
   priority: "p1",
@@ -50,7 +50,7 @@ const base = {
 async function dispatchedDetail() {
   resetTickets()
   const ctx = memoryContext()
-  const created = await succeed(createTicket(ctx, { ...base, title: "/task 回车行为改为跳转 session" }))
+  const created = await succeed(createTicket(ctx, { ...base, title: "/tickets 回车行为改为跳转 session" }))
   const updated = await succeed(
     updateTicket(ctx, {
       ticketID: created.ticket.id,
@@ -69,7 +69,7 @@ describe("parseTicketDetail", () => {
     expect(detail!.id).toBe(id)
     expect(detail!.state).toBe("in_progress")
     expect(detail!.priority).toBe("p1")
-    expect(detail!.title).toBe("/task 回车行为改为跳转 session")
+    expect(detail!.title).toBe("/tickets 回车行为改为跳转 session")
     expect(detail!.objective?.replace(/\s+/g, "")).toBe(base.objective.replace(/\s+/g, ""))
     expect([...detail!.acceptance]).toEqual(["1. 说清现状", "2. ⏎ 进 session"])
     expect(detail!.threadID).toBe("T-1")
