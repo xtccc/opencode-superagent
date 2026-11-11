@@ -101,6 +101,17 @@ rest is behaviour. A gateway restart is still needed to load the new code
 
 ### Changed
 
+- **The router prompt now carries an effort allocation policy.** `ROUTER_PROMPT`
+  gained a 「推理档位分配」 section: concrete criteria for `low` / `medium`
+  (default) / `high`, an explicit ban on "just use high to be safe", retry
+  escalation (low→medium→high after a failed or interrupted worker, with a
+  one-line reason), and a `effort=<level>：<reason>` accounting line required on
+  the first line of every dispatch task. It also restates the boundaries the
+  dispatcher enforces — no combination with an explicit `agent` override, the
+  model's `variants` whitelist, and the `(unverified: inherited)` degradation —
+  so the router stops guessing. The worker prompt keeps only a short
+  "the level is fixed at session creation" constraint, never the policy itself.
+
 - **The `/tickets` browser is two-level: the list opens details, not sessions.**
   `⏎` on a row now shows that row's detail (ticket fields parsed from the
   `ticket` RPC text, or a worker summary), `/` searches, `q` closes. Ticket rows
