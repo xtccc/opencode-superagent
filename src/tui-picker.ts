@@ -1,5 +1,5 @@
 /**
- * Layout math for the Superagent pickers (`/task`, `/ticket`).
+ * Layout math for the Superagent pickers (`/tickets`, `/ticket`).
  *
  * The host's `dialog.select` frame is a fixed 60 columns wide and its list
  * stops at `floor(rows / 2) - 6` entries, so a 40-row terminal shows 14 rows

@@ -1,5 +1,5 @@
 /**
- * Ticket detail view model for the `/task` detail pane.
+ * Ticket detail view model for the `/tickets` detail pane.
  *
  * `renderTicketDetail` (server side) returns ready-to-read text, and the TUI
  * cannot ask for structured fields: the `ticket` RPC is text-only so a TUI can

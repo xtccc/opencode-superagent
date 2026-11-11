@@ -1,5 +1,5 @@
 /**
- * Ticket search shared by the TUI pickers (`/task`, `/ticket`).
+ * Ticket search shared by the TUI pickers (`/tickets`, `/ticket`).
  *
  * Ticket ids look like `tk_mwbkve34_dc8d`: a `tk_` prefix, an 8-character
  * random middle, and a 4-character suffix that the sidebar renders as the

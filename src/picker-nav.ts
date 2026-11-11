@@ -1,5 +1,5 @@
 /**
- * `/task` navigation: the list pane and the detail pane, and the keys that
+ * `/tickets` navigation: the list pane and the detail pane, and the keys that
  * move between them.
  *
  * The picker is two levels deep. `⏎` on a list row opens that row's detail
@@ -15,13 +15,13 @@
 import { PICKER_NAV_KEYS } from "./tui-picker.js"
 
 /** Which pane the picker shows. */
-export type TaskPane = "list" | "detail"
+export type TicketPane = "list" | "detail"
 
 /** Keys the state machine understands; every other key belongs to the pane. */
-export type TaskKey = "enter" | "back" | "quit"
+export type TicketKey = "enter" | "back" | "quit"
 
 /** The row under the cursor, reduced to what navigation needs. */
-export interface TaskNavRow {
+export interface TicketNavRow {
   readonly kind: "ticket" | "worker"
   /**
    * Session `⏎` would enter from the detail pane. Known immediately for a
@@ -32,7 +32,7 @@ export interface TaskNavRow {
 }
 
 /** What one key press does; the caller renders it or awaits it. */
-export type TaskStep =
+export type TicketStep =
   | { readonly kind: "open-detail" }
   | { readonly kind: "back-to-list" }
   | { readonly kind: "close" }
@@ -52,7 +52,7 @@ export function missingSessionMessage(sessionID: string): string {
  * detail has not loaded yet) keeps the user on the detail pane and says why,
  * instead of silently doing nothing.
  */
-export function taskStep(pane: TaskPane, key: TaskKey, row: TaskNavRow | undefined): TaskStep {
+export function ticketStep(pane: TicketPane, key: TicketKey, row: TicketNavRow | undefined): TicketStep {
   if (pane === "list") {
     if (key === "enter") return row === undefined ? { kind: "notice", message: "没有可查看的行" } : { kind: "open-detail" }
     return { kind: "close" }
@@ -86,7 +86,7 @@ export const SEARCH_HINT = "输入筛选 · ↑↓ 移动 · ⏎ 详情 · esc �
 export const DETAIL_HINT = "↑↓/PgUp/PgDn 滚动 · ⏎ 进入会话 · q 返回"
 
 /** Footer hint for the current pane and mode; the search field is a third mode. */
-export function taskHint(pane: TaskPane, searching: boolean): string {
+export function ticketHint(pane: TicketPane, searching: boolean): string {
   if (pane === "detail") return DETAIL_HINT
   return searching ? SEARCH_HINT : LIST_HINT
 }

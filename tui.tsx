@@ -3,8 +3,17 @@ import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import type { RpcCallOptions } from "@opencode/client/promise"
 import { Plugin } from "@opencode/plugin/tui"
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { COMMANDS, type CommandRun } from "./src/commands"
 import { Definition } from "./src/protocol"
-import { missingSessionMessage, taskHint, taskStep, workerBySuffix, type TaskKey, type TaskNavRow, type TaskPane } from "./src/picker-nav"
+import {
+  missingSessionMessage,
+  ticketHint,
+  ticketStep,
+  workerBySuffix,
+  type TicketKey,
+  type TicketNavRow,
+  type TicketPane,
+} from "./src/picker-nav"
 import { detailRows, parseTicketDetail, type TicketDetail } from "./src/ticket-detail"
 import { resolveTicketQuery, searchPickerOptions } from "./src/ticket-search"
 import {
@@ -39,57 +48,26 @@ import {
   specFor,
 } from "./src/tools"
 
+/** Handler behind each `run` key of `COMMANDS` (`browse` is the `/tickets` two-pane browser). */
+const RUNNERS: Record<CommandRun, (context: Plugin.Context, input?: string) => Promise<void> | void> = {
+  open: (context) => open(context),
+  browse: (context) => tickets(context),
+  abort: (context) => abort(context),
+  tools: (context) => tools(context),
+  detail: (context, input) => ticket(context, input),
+}
+
 export default Plugin.define({
   id: "opencode.superagent",
   setup(context) {
     context.keymap.layer(() => ({
       mode: "global",
-      commands: [
-        {
-          id: "superagent.open",
-          title: "Superagent",
-          palette: true,
-          slash: { name: "superagent" },
-          run: () => open(context),
-        },
-        {
-          id: "superagent.tasks",
-          title: "Superagent tasks",
-          description: "工单 / worker 两级浏览：⏎ 看详情、/ 搜索、q 退出；详情里 ⏎ 进入该 worker 会话、q 返回。支持标题、全 ID、4 位短 ID（如 dc8d）搜索",
-          palette: true,
-          slash: { name: "task" },
-          run: () => tasks(context),
-        },
-        {
-          id: "superagent.abort",
-          title: "Superagent abort worker",
-          palette: true,
-          slash: { name: "abort" },
-          run: () => abort(context),
-        },
-        {
-          id: "superagent.tools",
-          title: "Superagent tools",
-          palette: true,
-          slash: { name: "tools", aliases: ["superagent-tools"] },
-          run: () => tools(context),
-        },
-        {
-          id: "superagent.tickets",
-          title: "Superagent tickets",
-          palette: true,
-          slash: { name: "tickets" },
-          run: () => tickets(context),
-        },
-        {
-          id: "superagent.ticket",
-          title: "Superagent ticket detail",
-          description: "查看工单详情：全 ID，或侧栏显示的 4 位短 ID（如 dc8d）",
-          palette: true,
-          slash: { name: "ticket", arguments: true },
-          run: (input) => ticket(context, input),
-        },
-      ],
+      // The slash names live in `src/commands.ts`; this file only binds each
+      // `run` key to its handler.
+      commands: COMMANDS.map((command) => ({
+        ...command,
+        run: (input?: string) => RUNNERS[command.run](context, input),
+      })),
     }))
 
     // Append below the built-in sidebar modules (todo, mcp, limit). The claim
@@ -207,8 +185,8 @@ interface PickerRow {
   readonly status?: string
   readonly trailing?: string
   readonly tone?: TicketState
-  /** `/task` rows only: what the detail pane shows and what `⏎` enters there. */
-  readonly nav?: TaskNavRow
+  /** `/tickets` rows only: what the detail pane shows and what `⏎` enters there. */
+  readonly nav?: TicketNavRow
 }
 
 interface PickerConfig {
@@ -228,7 +206,7 @@ const terminalDimensions: (() => () => { width: number; height: number }) | unde
 
 /**
  * The rows of a picker, laid out by `layoutPickerRow` and windowed to the
- * dialog height. Shared by the plain picker (`/ticket`) and the `/task` list
+ * dialog height. Shared by the plain picker (`/ticket`) and the `/tickets` list
  * pane, so both draw the same columns with the same width budget.
  */
 function PickerRows(props: {
@@ -316,7 +294,7 @@ function PickerHeader(props: { context: Plugin.Context; title: string; width: nu
  * stops at `floor(rows / 2) - 6` entries inside a 60-column frame), so the
  * picker draws its own body and `computeDialogSize` sizes it for the terminal.
  * Keys match the built-in select: type to search, ↑↓ / PgUp PgDn / Home End to
- * move, ⏎ to pick, esc to cancel. `/task` uses `TaskBrowser`, which shares the
+ * move, ⏎ to pick, esc to cancel. `/tickets` uses `TicketBrowser`, which shares the
  * same frame, size maths and row layout.
  */
 export function PickerDialog(props: {
@@ -445,46 +423,46 @@ export function PickerDialog(props: {
   )
 }
 
-/** What the `/task` browser resolves to: a session to enter, or nothing (closed). */
-export type TaskResult = { readonly action: "jump"; readonly sessionID: string } | undefined
+/** What the `/tickets` browser resolves to: a session to enter, or nothing (closed). */
+export type TicketResult = { readonly action: "jump"; readonly sessionID: string } | undefined
 
 /** The detail pane content: already wrapped rows, plus the session `⏎` enters. */
-export interface TaskDetailContent {
+export interface TicketDetailContent {
   readonly lines: ReadonlyArray<string>
   /** Session the detail pane's `⏎` enters; absent when the row has none. */
   readonly sessionID?: string
 }
 
-/** Props of the two-pane browser; `browseTasks` fills in the context and the resolver. */
-export interface TaskBrowserProps {
+/** Props of the two-pane browser; `browseTickets` fills in the context and the resolver. */
+export interface TicketBrowserProps {
   readonly context: Plugin.Context
   readonly title: string
   readonly placeholder: string
   readonly rows: ReadonlyArray<PickerRow>
   readonly total: number
   readonly search: (query: string, rows: ReadonlyArray<PickerRow>) => ReadonlyArray<PickerRow>
-  readonly loadDetail: (row: PickerRow, width: number) => Promise<TaskDetailContent | undefined>
-  readonly onDone: (result: TaskResult) => void
+  readonly loadDetail: (row: PickerRow, width: number) => Promise<TicketDetailContent | undefined>
+  readonly onDone: (result: TicketResult) => void
 }
 
 /**
- * `/task` in two panes, sharing `PickerDialog`'s frame, size maths and row
+ * `/tickets` in two panes, sharing `PickerDialog`'s frame, size maths and row
  * layout:
  *
- * - **list**: `/task` rows (tickets, then workers). `⏎` opens the row's detail,
+ * - **list**: `/tickets` rows (tickets, then workers). `⏎` opens the row's detail,
  *   `/` focuses the search field (the query survives a round trip), `q` closes.
  * - **detail**: the ticket fields (`src/ticket-detail.ts`) or a worker summary,
  *   scrollable with ↑↓ / PgUp / PgDn. `⏎` enters the worker session of the row,
  *   `q` / `esc` go back to the list with its query and cursor intact.
  *
- * `taskStep` (pure) decides every transition; this component only applies it and
+ * `ticketStep` (pure) decides every transition; this component only applies it and
  * awaits the RPCs.
  */
-export function TaskBrowser(props: TaskBrowserProps) {
+export function TicketBrowser(props: TicketBrowserProps) {
   const theme = props.context.theme
   const dimensions = terminalDimensions ? terminalDimensions() : () => DEFAULT_TERMINAL
   const size = createMemo(() => computeDialogSize(dimensions().width, dimensions().height))
-  const [pane, setPane] = createSignal<TaskPane>("list")
+  const [pane, setPane] = createSignal<TicketPane>("list")
   const [searching, setSearching] = createSignal(false)
   const [query, setQuery] = createSignal("")
   const [selected, setSelected] = createSignal(0)
@@ -497,7 +475,7 @@ export function TaskBrowser(props: TaskBrowserProps) {
 
   const rows = createMemo(() => props.search(query(), props.rows))
   const activeRow = createMemo(() => rows()[Math.min(selected(), Math.max(0, rows().length - 1))])
-  const help = createMemo(() => taskHint(pane(), searching()))
+  const help = createMemo(() => ticketHint(pane(), searching()))
 
   let field: InputRenderable | undefined
   let focusTimer: ReturnType<typeof setTimeout> | undefined
@@ -579,13 +557,13 @@ export function TaskBrowser(props: TaskBrowserProps) {
     props.onDone({ action: "jump", sessionID })
   }
 
-  const apply = (key: TaskKey) => {
+  const apply = (key: TicketKey) => {
     const base = activeRow()?.nav
     // The detail pane knows the session the list row could not: a ticket's
     // full worker id only appears in its detail text.
     const row =
       base === undefined ? undefined : { kind: base.kind, sessionID: detailSession() ?? base.sessionID }
-    const step = taskStep(pane(), key, row)
+    const step = ticketStep(pane(), key, row)
     switch (step.kind) {
       case "close":
         close()
@@ -829,24 +807,24 @@ function pickList(context: Plugin.Context, config: PickerConfig): Promise<string
 }
 
 /**
- * Show the two-pane `/task` browser and resolve what the user chose. Same frame
+ * Show the two-pane `/tickets` browser and resolve what the user chose. Same frame
  * contract as `pickList`: the host resets dialogs to `medium`, so the size is
  * raised right after `show`.
  */
-function browseTasks(
+function browseTickets(
   context: Plugin.Context,
-  props: Omit<TaskBrowserProps, "context" | "onDone">,
-): Promise<TaskResult> {
+  props: Omit<TicketBrowserProps, "context" | "onDone">,
+): Promise<TicketResult> {
   return new Promise((resolve) => {
     let settled = false
-    const finish = (result: TaskResult) => {
+    const finish = (result: TicketResult) => {
       if (settled) return
       settled = true
       context.ui.dialog.clear()
       resolve(result)
     }
     context.ui.dialog.show(
-      () => <TaskBrowser context={context} {...props} onDone={finish} />,
+      () => <TicketBrowser context={context} {...props} onDone={finish} />,
       () => finish(undefined),
     )
     try {
@@ -871,11 +849,11 @@ async function open(context: Plugin.Context) {
 const TICKET_CHOICE_PREFIX = "ticket:"
 /** The `tickets` RPC clamps `limit` at 100, so this is every ticket a picker can see. */
 const TICKET_PICKER_LIMIT = 100
-/** Shared by `/task` and the `/ticket` candidate list. */
+/** Shared by `/tickets` and the `/ticket` candidate list. */
 const TICKET_SEARCH_PLACEHOLDER = "搜索：标题 / 全 ID / 4 位短 ID（如 dc8d）"
 
 /**
- * `/task`: a two-pane browser. The list mixes tickets and worker sessions;
+ * `/tickets`: a two-pane browser. The list mixes tickets and worker sessions;
  * `⏎` always opens the row's detail first (a mis-jump is expensive to undo),
  * and the detail pane is where `⏎` enters the worker session of that row.
  *
@@ -885,7 +863,7 @@ const TICKET_SEARCH_PLACEHOLDER = "搜索：标题 / 全 ID / 4 位短 ID（如 
  * below prefers the exact id from the detail and only falls back to a unique
  * suffix match.
  */
-async function tasks(context: Plugin.Context) {
+async function tickets(context: Plugin.Context) {
   try {
     const rpc = context.client.rpc(Definition)
     const call = options(context)
@@ -893,13 +871,13 @@ async function tasks(context: Plugin.Context) {
     // A broken ticket list must not hide the worker list (and vice versa).
     const rows = await loadTickets(context).catch(() => [])
     if (status.workers.length === 0 && rows.length === 0) {
-      context.ui.toast.show({ title: "Superagent tasks", message: "暂无 worker 与工单", variant: "info" })
+      context.ui.toast.show({ title: "Superagent tickets", message: "暂无 worker 与工单", variant: "info" })
       return
     }
-    const tickets = new Map(rows.map((row) => [row.id, row]))
+    const ticketByID = new Map(rows.map((row) => [row.id, row]))
     const workerIDs = status.workers.map((worker) => worker.sessionID)
-    const result = await browseTasks(context, {
-      title: `Superagent tasks · 工单 ${rows.length} · worker ${status.workers.length}`,
+    const result = await browseTickets(context, {
+      title: `Superagent tickets · 工单 ${rows.length} · worker ${status.workers.length}`,
       placeholder: TICKET_SEARCH_PLACEHOLDER,
       rows: [
         ...rows.map((row) => ({
@@ -935,7 +913,7 @@ async function tasks(context: Plugin.Context) {
           const worker = status.workers.find((item) => item.sessionID === row.value)
           return worker === undefined ? undefined : { lines: workerDetailRows(worker, width) }
         }
-        const listRow = tickets.get(ticketID)
+        const listRow = ticketByID.get(ticketID)
         const detail = await loadTicketDetail(context, ticketID)
         // The full id from the detail is authoritative; the six-character tail
         // is only a hint, so it is the fallback when the detail is unavailable.
@@ -957,7 +935,7 @@ async function tasks(context: Plugin.Context) {
     if (result === undefined) return
     gotoSession(context, result.sessionID)
   } catch (error) {
-    context.ui.toast.show({ title: "Superagent tasks", message: message(error), variant: "error" })
+    context.ui.toast.show({ title: "Superagent tickets", message: message(error), variant: "error" })
   }
 }
 
@@ -1076,17 +1054,6 @@ async function tools(context: Plugin.Context) {
     }
   } catch (error) {
     context.ui.toast.show({ title: "Superagent tools", message: message(error), variant: "error" })
-  }
-}
-
-/** `/tickets`: one compact list grouped by state, safe on a narrow terminal. */
-async function tickets(context: Plugin.Context) {
-  try {
-    const rpc = context.client.rpc(Definition)
-    const { text } = await rpc.tickets({}, options(context))
-    await context.ui.dialog.alert({ title: "Superagent 工单", message: text })
-  } catch (error) {
-    context.ui.toast.show({ title: "Superagent tickets", message: message(error), variant: "error" })
   }
 }
 
