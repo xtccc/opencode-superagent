@@ -1,16 +1,28 @@
 name: E2E (real OpenCode host)
 
-# This job boots a real OpenCode host, downloads the published
-# `opencode-superagent` package from npm and loads it. It is deliberately kept
-# out of `ci.yml` (fast gate) and runs on demand, or on pull requests that
-# touch the E2E surface itself.
+# This job builds and `bun pm pack`s the working tree, installs that tarball into
+# an isolated HOME and boots a real OpenCode host against it. Because the packed
+# tarball is exactly what `npm publish` would upload, it exercises HEAD rather
+# than whatever is already on the npm registry.
+#
+# It stays out of `ci.yml` (fast gate) and runs on demand, or on pull requests
+# that touch anything the package is built from — a `src/` change must be able to
+# reach this job, otherwise the E2E can silently rot.
 "on":
   workflow_dispatch:
   pull_request:
     paths:
+      - "src/**"
+      - "server.ts"
+      - "tui.tsx"
+      - "agent/**"
       - "e2e/**"
-      - ".github/workflows/e2e.yml"
+      - "script/**"
+      - "test/**"
+      - "tsconfig*.json"
+      - "bun.lock"
       - "package.json"
+      - ".github/workflows/e2e.yml"
 
 permissions:
   contents: read
@@ -21,9 +33,9 @@ concurrency:
 
 jobs:
   plugin-load:
-    name: Load opencode-superagent@0.4.0 in a real host
+    name: Load the tarball packed from this tree in a real host
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -48,7 +60,6 @@ jobs:
           # `/api/agent` and `/api/rpc/:id/:method`. The `opencode-ai` package
           # on npm is still the v1 line (1.19.5), so install the v2 CLI
           # package instead; its `opencode` binary serves the v2 API.
-          npm view @opencode/cli version --registry=https://registry.npmjs.org/
           npm install -g @opencode/cli@2.2.6
           opencode --version
 
@@ -58,5 +69,8 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Run real-host E2E
+      # Builds, packs the tarball, installs it in a scratch prefix, boots a real
+      # host and asserts the plugin is active and reports the package.json
+      # version. Fails if HEAD does not build or pack.
+      - name: Run real-host E2E against the packed tarball
         run: bun run test:e2e

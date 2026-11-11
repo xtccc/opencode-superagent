@@ -46,7 +46,9 @@
     "test": "bun test",
     "test:e2e": "bun run e2e/plugin-load.e2e.ts",
     "typecheck": "bun check --no-script",
-    "typecheck:tsc": "tsc --noEmit"
+    "typecheck:tsc": "tsc --noEmit",
+    "release:check": "bun run script/release-check.ts",
+    "prepublishOnly": "bun run release:check"
   },
   "dependencies": {
     "@opencode/schema": "^2.2.5"
