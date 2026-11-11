@@ -244,6 +244,29 @@ describe("superagent agent markdown templates", () => {
     expect(ROUTER_PROMPT).toContain("ticket_close")
   })
 
+  test("ROUTER_PROMPT carries the effort allocation policy", () => {
+    // The router is the only place that picks an effort, so the judged criteria,
+    // the retry escalation, the accounting line and the degradation rules must
+    // live here rather than in the worker prompt.
+    expect(ROUTER_PROMPT).toContain("推理档位分配")
+    for (const level of ["low：", "medium（默认）", "high："]) expect(ROUTER_PROMPT).toContain(level)
+    expect(ROUTER_PROMPT).toContain("禁止无理由用 high")
+    expect(ROUTER_PROMPT).toContain("重试升档")
+    expect(ROUTER_PROMPT).toContain("effort=<档位>：<理由>")
+    expect(ROUTER_PROMPT).toContain("不能与显式 agent 覆盖同用")
+    expect(ROUTER_PROMPT).toContain("unverified: inherited")
+  })
+
+  test("the worker prompt does not restate the effort policy", () => {
+    // Keeping the rulebook out of the worker keeps its context small; the only
+    // effort-related line there is the "you cannot change it" constraint.
+    const { system } = AGENT_DEFINITIONS.find((definition) => definition.id === WORKER_AGENT)!
+    expect(system).toContain("推理档位在会话创建时已固定")
+    for (const term of ["推理档位分配", "medium（默认）", "重试升档", "effort=<档位>", "low：", "high："]) {
+      expect(system).not.toContain(term)
+    }
+  })
+
   // Template sync for the repository's own copy. It is optional on purpose: a
   // fresh install has no `.opencode/agent` files at all, and this copy can be
   // deleted now that setup registers both agents.
