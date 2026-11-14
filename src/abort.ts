@@ -158,9 +158,9 @@ export const runAbort = Effect.fn("superagent.abort")(function* (
   input: AbortInput,
   caller?: string,
 ) {
-  // A router can only touch workers of its own directory; the TUI passes no
-  // caller and keeps its process-wide reach. Flag off -> every worker is in
-  // the default partition, so this is the historical behaviour.
+  // A router can only touch the workers it dispatched (its own partition); the
+  // TUI passes no caller and keeps its process-wide reach. Flag off -> every
+  // worker is in the default partition, so this is the historical behaviour.
   const callerDirKey = caller === undefined ? undefined : yield* requireRouter(caller, "abort_session")
   const inCallerPartition = (sessionID: string | undefined): boolean =>
     callerDirKey === undefined || dirKeyForWorker(store.workers.get(sessionID ?? "")) === callerDirKey
@@ -187,7 +187,7 @@ export const runAbort = Effect.fn("superagent.abort")(function* (
     }
     if (perDirectoryRouterEnabled() && !inCallerPartition(input.sessionID)) {
       return yield* new Tool.Error({
-        message: `${input.sessionID} belongs to another directory's router; abort it from that router (or from the TUI)`,
+        message: `${input.sessionID} belongs to another router's partition (${dirKeyForWorker(store.workers.get(input.sessionID))}); abort it from that router (or from the TUI)`,
       })
     }
     const result = yield* abortWorker(ctx, input.sessionID, input.reason)

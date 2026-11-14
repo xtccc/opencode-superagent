@@ -5,6 +5,54 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
+### Fixed
+
+- **Partition ownership follows the calling Router, not the working directory
+  (`perDirectoryRouter`).** The previous stage-2b rule derived a ticket's (and a
+  worker's) partition from `directory`, which conflated "where the work runs"
+  with "who owns the work order". With the flag on this locked the default
+  partition's Router — the one a pre-flag gateway session ends up in — out of
+  every directory it tried to operate on
+  (`this router (partition default) cannot operate on /home/x/tmp (partition …)`),
+  routed completion reports of a cross-directory dispatch to the wrong Router,
+  and scattered legacy tickets across partitions so a Router saw
+  `closed=0` instead of its own history. Now:
+  - `ticket_create` / `ticket_list` / `ticket_update` / `ticket_close` /
+    `dispatch` / `abort_session` / `worker_prompt` take their partition from the
+    caller (`requireRouter` → `dirKey`, `default` when unset). `directory` is
+    still validated as an absolute working directory, but only decides where the
+    worker session is created. `Ticket` gained a `dirKey` ownership field next to
+    `directory`. `requireRouterFor` (which refused a foreign directory) is gone.
+  - `dispatch` may now send a worker into any directory; the gate is
+    "caller partition == ticket partition". The dispatch no longer rewrites its
+    own target directory into the caller's partition.
+  - `WorkerRecord` gained `ownerDirKey` (the dispatching Router's partition,
+    set by `dispatch`). `watcher` terminal delivery, `watchdog` stall alerts,
+    `sleep` wake-ups and the `recall` / `session-meta` / `status` / ticket
+    lookups all resolve a worker's partition through
+    `workerOwnerDirKey()` (`ownerDirKey` first, `directory` for old records,
+    `default` + one-shot warning when neither is present). A partition's Router
+    is never created in the worker's working directory unless that directory
+    really is the partition's own.
+  - `hydrateTickets` reads the legacy `ticket:<id>` prefix **into the default
+    partition** and writes no scoped copy; records already under
+    `dir:<dirKey>:` keep their partition, and when both copies of one id exist
+    (the old migration's leftover) the ownership returns to `default` while the
+    content comes from the newer `updatedAt`, so state updated after the
+    migration is not rolled back. Legacy `router` / `thread:` / `trigger:` /
+    `pending:` keys already landed in `default` and still do. Hydration stays
+    write-free and idempotent.
+  - New regression suite `test/partition-ownership.test.ts` (cross-directory
+    dispatch stays in the dispatcher's partition and reports only to it; the
+    creator can list/update/close its own ticket; two Routers stay isolated;
+    legacy hydration visibility and idempotency; legacy worker fallback;
+    `sleep` not woken by another partition; flag-off byte-identical
+    `statusText`/`buildStatusInjection`) plus updated
+    `test/ticket-partition.test.ts`, `test/per-directory-router.test.ts`,
+    `test/rpc-directory.test.ts`, and a cross-directory case in
+    `e2e/per-directory.e2e.ts`. The README's "单网关多目录" section documents the
+    new ownership rule.
+
 ### Added
 
 - **Groundwork for one-instance-per-directory (stage 1, no behaviour change).**

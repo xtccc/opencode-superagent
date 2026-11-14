@@ -185,6 +185,58 @@ export function effectiveDirKey(dirKey: string | undefined): string {
   return dirKey ?? DEFAULT_DIR_KEY
 }
 
+/**
+ * The record shape a worker partition can be derived from. Structural (not the
+ * `WorkerRecord` type) because this module must stay a leaf: `ticket.ts` and
+ * `worker-state.ts` both need the rule and neither may import `state.ts`.
+ */
+export interface WorkerOwnerRef {
+  /**
+   * Partition of the Router that dispatched this worker. **This** is the
+   * ownership field: a worker may run in any directory, so its working
+   * directory says nothing about which Router gets its report.
+   */
+  readonly ownerDirKey?: string
+  /** Legacy only: used when `ownerDirKey` is absent (records from before it). */
+  readonly directory?: string
+}
+
+/**
+ * Partition that owns a worker record: the dispatching Router's partition.
+ *
+ * - new records carry `ownerDirKey` and it always wins;
+ * - records written before that field fall back to deriving it from
+ *   `directory` (the pre-fix behaviour, kept so an upgrade does not lose the
+ *   routing of workers that are still running);
+ * - neither present → the default partition (the caller warns once).
+ */
+export function workerOwnerDirKey(record: WorkerOwnerRef | undefined): string {
+  if (!perDirectoryRouterEnabled()) return DEFAULT_DIR_KEY
+  const owner = record?.ownerDirKey
+  if (owner !== undefined && owner !== "") return owner
+  return dirKeyOf(record?.directory)
+}
+
+/** Whether a worker record states its own partition (either field), for the one-shot degradation warning. */
+export function workerOwnerKnown(record: WorkerOwnerRef | undefined): boolean {
+  if (record === undefined) return false
+  const owner = record.ownerDirKey
+  return (owner !== undefined && owner !== "") || record.directory !== undefined
+}
+
+/**
+ * The directory a partition's Router should be created in, when the worker's
+ * record can tell: only if its `directory` really is that partition's own
+ * directory (the legacy rule). A cross-directory dispatch must never move the
+ * dispatcher's Router into the worker's working directory — that is exactly the
+ * bug that made a completion notice arrive "from" another directory.
+ */
+export function workerHomeDirectory(record: WorkerOwnerRef | undefined, dirKey: string): string | undefined {
+  const directory = record?.directory
+  if (directory === undefined) return undefined
+  return dirKeyOf(directory) === dirKey ? directory : undefined
+}
+
 /** realpath 优先，失败或结果非法时退回规范形式（磁盘上不存在的目录很常见）。 */
 function resolveRealPath(canonical: string): string {
   try {

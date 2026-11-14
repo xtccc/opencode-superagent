@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Schema } from "effect"
-import { requireRouter, requireRouterFor } from "./guard.js"
+import { requireRouter } from "./guard.js"
 import {
   closeTicket,
   createTicket,
@@ -96,10 +96,10 @@ const runTicketCreate = Effect.fn("superagent.ticketCreate")(function* (
   input: TicketCreateInput,
   caller: string,
 ) {
-  // A Router only creates work orders for its own directory. With the switch
-  // off `requireRouterFor` always returns the single default partition, so this
-  // is the historical behaviour.
-  const dirKey = yield* requireRouterFor(caller, input.directory, "ticket_create")
+  // The ticket belongs to the calling Router's partition. `directory` is only
+  // the working directory: a Router may create work for any directory it can
+  // reach, and the ticket must stay operable by the Router that created it.
+  const dirKey = yield* requireRouter(caller, "ticket_create")
   const trigger = currentTrigger(dirKey)
   const threadID = input.threadID.trim()
   const requester = trigger?.threadID === threadID ? trigger : undefined

@@ -100,11 +100,11 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
       message: `${sessionID} is not tracked by the superagent router; refusing to prompt a session the plugin does not own`,
     })
   }
-  // A router only drives workers of its own directory: prompting another
-  // directory's worker would inject instructions from the wrong context.
+  // A router only drives the workers it dispatched: a worker running in this
+  // directory but owned by another partition belongs to that Router.
   if (perDirectoryRouterEnabled() && dirKeyForWorker(worker) !== callerDirKey) {
     return yield* new Tool.Error({
-      message: `worker ${sessionID} belongs to another directory's router; prompt it from that router`,
+      message: `worker ${sessionID} belongs to another router's partition (${dirKeyForWorker(worker)}); prompt it from that router`,
     })
   }
 

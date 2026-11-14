@@ -282,9 +282,9 @@ describe("tickets live in the caller's partition", () => {
   })
 })
 
-// ── 2. legacy KV migrates once, idempotently ─────────────────────────────────
+// ── 2. legacy KV lands in the default partition ──────────────────────────────
 
-describe("legacy tickets migrate into their partition exactly once", () => {
+describe("legacy tickets hydrate into the default partition", () => {
   const legacyID = "tk_legacy_b"
   const legacyTicket = {
     id: legacyID,
@@ -305,37 +305,69 @@ describe("legacy tickets migrate into their partition exactly once", () => {
     history: [{ at: 1_000, kind: "created" as const, to: "open" as const }],
   }
 
-  test("hydrate writes the scoped copy, keeps the legacy key, and is idempotent", async () => {
+  test("the legacy key stays the record's home: default partition, no scoped copy, idempotent", async () => {
     applySettings({ perDirectoryRouter: true })
     const h = harness()
     h.data.set(ticketKey(legacyID), encodeTicket(legacyTicket))
     h.data.set("ticketidx:all", [legacyID] as unknown as Schema.Json)
 
     await succeed(hydrateTickets(h.ctx))
-    const scopedKey = `${DIR_SCOPE_PREFIX}${KEY_B}:${ticketKey(legacyID)}`
-    expect(h.data.get(scopedKey)).toBeDefined()
-    // 旧 key 保留：老版本回滚后仍能读到自己的数据。
+    // 旧记录一律归默认分区：**不**按 directory 打散，也**不**写分区副本。
     expect(h.data.get(ticketKey(legacyID))).toBeDefined()
+    expect([...h.data.keys()].filter((key) => key.includes(ticketKey(legacyID)))).toEqual([ticketKey(legacyID)])
     expect(tickets.size).toBe(1)
     expect(kvTicketCount()).toBe(1)
     expect(dirtyTicketIDs()).toEqual([])
-    // 迁移落在正确分区：A 看不见，B 看得见。
-    const listedA = await succeed(listTicketRecords(h.ctx, { limit: 10 }, KEY_A))
-    expect(listedA).toEqual([])
+    // 默认分区的 Router 看得见；B 分区看不见（旧 key 不是 B 的数据）。
+    const listedDefault = (await succeed(listTicketRecords(h.ctx, { limit: 10 }, DEFAULT_DIR_KEY))).map(
+      (ticket) => ticket.id,
+    )
+    expect(listedDefault).toEqual([legacyID])
+    expect(ticketStats(DEFAULT_DIR_KEY).total).toBe(1)
     const listedB = await succeed(listTicketRecords(h.ctx, { limit: 10 }, KEY_B))
-    expect(listedB.map((ticket) => ticket.id)).toEqual([legacyID])
+    expect(listedB).toEqual([])
+    expect(await succeed(loadTicket(h.ctx, legacyID, DEFAULT_DIR_KEY))).toBeDefined()
+    expect(await succeed(loadTicket(h.ctx, legacyID, KEY_B))).toBeUndefined()
 
-    // 第二次 hydrate：键集合不变，迁移写入不重复（索引桶每次 hydrate 都会重写，
-    // 那是既有的派生加速器行为，与迁移幂等性无关）。
+    // 幂等：重复 hydrate 的键集合与结果完全相同，且迁移不产生任何写入。
     const before = [...h.data.keys()].sort()
-    expect(h.writes.filter((key) => key === scopedKey)).toHaveLength(1)
+    const writesBefore = h.writes.length
     await succeed(hydrateTickets(h.ctx))
     await succeed(hydrateTickets(h.ctx))
     expect([...h.data.keys()].sort()).toEqual(before)
-    expect(h.writes.filter((key) => key === scopedKey)).toHaveLength(1)
+    // 索引桶会重写（派生加速器）；记录本身不写。
+    expect(h.writes.slice(writesBefore).filter((key) => key.includes(ticketKey(legacyID)))).toEqual([])
     expect(tickets.size).toBe(1)
     expect(kvTicketCount()).toBe(1)
     expect(dirtyTicketIDs()).toEqual([])
+  })
+
+  test("a copy left behind by the old directory-splitting migration does not shadow the legacy record", async () => {
+    applySettings({ perDirectoryRouter: true })
+    const h = harness()
+    // 旧版本迁移过的形状：旧 key + 一份 `dir:<KEY_B>:` 副本（内容更新，因为
+    // 当时所有写入都落在 B 的命名空间里）。
+    h.data.set(ticketKey(legacyID), encodeTicket(legacyTicket))
+    h.data.set(
+      `${DIR_SCOPE_PREFIX}${KEY_B}:${ticketKey(legacyID)}`,
+      encodeTicket({ ...legacyTicket, state: "done", updatedAt: 2_000, closedAt: 2_000 }),
+    )
+
+    await succeed(hydrateTickets(h.ctx))
+
+    // 归属回到默认分区（旧键就是它的家），内容取更新的那份，不回滚状态。
+    expect(tickets.size).toBe(1)
+    expect(kvTicketCount()).toBe(1)
+    expect(getTicket(legacyID)?.state).toBe("done")
+    expect(ticketStats(DEFAULT_DIR_KEY).closed).toBe(1)
+    expect(ticketStats(KEY_B).total).toBe(0)
+    expect((await succeed(listTicketRecords(h.ctx, { limit: 10 }, KEY_B))).map((ticket) => ticket.id)).toEqual([])
+
+    // 再次 hydrate 仍然稳定。
+    await succeed(hydrateTickets(h.ctx))
+    expect(getTicket(legacyID)?.state).toBe("done")
+    expect(ticketStats(DEFAULT_DIR_KEY).closed).toBe(1)
+    expect(ticketStats(KEY_B).total).toBe(0)
   })
 
   test("with the switch off nothing is migrated and no dir: key is written", async () => {

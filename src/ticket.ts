@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Exit, type Schema } from "effect"
 import { createHash } from "node:crypto"
-import { DEFAULT_DIR_KEY, DIRECTORY_ERROR, dirKeyOf, effectiveDirKey, normalizeDirectory } from "./dirs.js"
+import { DEFAULT_DIR_KEY, DIRECTORY_ERROR, effectiveDirKey, normalizeDirectory, workerOwnerDirKey } from "./dirs.js"
 import { clipCodePoints, codePointLength } from "./format.js"
 import { dirScopedKey, scanDirScoped, scanEntries } from "./scope.js"
 import {
@@ -124,17 +124,18 @@ export const ticketThreadKey = (threadID: string): string => `${TICKET_THREAD_PR
 /**
  * 工单的分区归属。
  *
- * 阶段 2b 起，工单与 Router / thread 亲和一样按目录分区：
+ * 阶段 2b 起，工单与 Router / thread 亲和一样按分区隔离，但**归属口径**是
+ * 「谁创建的」而不是「工作目录在哪」：
  *
  * - **KV 布局**：默认分区仍是旧 key（`ticket:<id>` / `ticketidx:*`），非默认分区是
  *   `dir:<dirKey>:ticket:<id>` / `dir:<dirKey>:ticketidx:*`（`dirScopedKey`）。
  *   开关关闭时 `effectiveDirKey` 恒返回默认分区，所以键名逐字节不变。
- * - **归属判定**：工单的分区由它自己的 `directory` 推导（`dirKeyOf`），这与
- *   `requireRouterFor(caller, ticket.directory)` 用的是同一个口径，所以"哪个 Router
- *   能操作这张单"和"这张单存在哪个命名空间"永远是同一件事。
+ * - **归属判定**：工单记录自己的 `dirKey` —— 创建它的 Router 的分区。`directory`
+ *   只是工作目录（展示/审计，以及 dispatch 的默认落点），**不参与**归属判断：
+ *   一个 Router 可以把 worker 派到任意目录，工单仍然属于它。
  * - **内存**：`tickets` 仍是一张按 id 索引的表（id 全局随机唯一，便于 `getTicket`
  *   这样的进程级视图），分区记在 `ticketPartitions` 里；`byThread` 的 key 是
- *   `(dirKey, threadID)` 复合键，所以同一个 threadID 在两个目录下各有各的桶。
+ *   `(dirKey, threadID)` 复合键，所以同一个 threadID 在两个分区下各有各的桶。
  */
 export const tickets = new Map<string, Ticket>()
 const ticketPartitions = new Map<string, string>()
@@ -152,9 +153,18 @@ function scopeOf(dirKey: string | undefined): string {
   return effectiveDirKey(dirKey)
 }
 
-/** 一张工单实际落在哪个分区。 */
+/**
+ * 一张工单的归属分区：记录自己的 `dirKey`。旧记录（阶段 2b 之前、没有 `dirKey`）
+ * 一律归默认分区 —— 那是它们当初唯一可能落在的地方，也是升级后老 Router 还能
+ * 看见自己历史数据的原因。
+ */
+function ticketOwner(ticket: Ticket): string {
+  return scopeOf(ticket.dirKey ?? DEFAULT_DIR_KEY)
+}
+
+/** 一张工单实际落在哪个分区（内存索引优先，它记录了 hydrate 是从哪个命名空间读到的）。 */
 function partitionOf(ticket: Ticket): string {
-  return ticketPartitions.get(ticket.id) ?? scopeOf(dirKeyOf(ticket.directory))
+  return ticketPartitions.get(ticket.id) ?? ticketOwner(ticket)
 }
 
 /** 该工单是否对某个分区的调用方可见。`dirKey === undefined` 表示进程级视图。 */
@@ -265,7 +275,7 @@ export function resetTickets(): void {
 }
 
 function remember(ticket: Ticket, dirKey?: string): void {
-  const partition = scopeOf(dirKey ?? dirKeyOf(ticket.directory))
+  const partition = scopeOf(dirKey ?? ticket.dirKey ?? DEFAULT_DIR_KEY)
   tickets.set(ticket.id, ticket)
   ticketPartitions.set(ticket.id, partition)
   const slot = threadSlot(partition, ticket.threadID)
@@ -335,7 +345,11 @@ export const loadTicket = Effect.fn("superagent.loadTicket")(function* (
   const id = ticketID.trim()
   const cached = tickets.get(id)
   if (cached !== undefined) return visibleIn(cached, dirKey) ? cached : undefined
-  let owner = dirKey === undefined ? undefined : scopeOf(dirKey)
+  const owner = dirKey === undefined ? undefined : scopeOf(dirKey)
+  // Where the record was physically read from. A record written before the
+  // ownership field existed has no `dirKey` of its own, and the namespace it
+  // lives in is then the only statement about its partition.
+  let readFrom: string | undefined = owner
   let value = yield* ctx.storage
     .get(owner === undefined ? ticketKey(id) : dirScopedKey(ticketKey(id), owner))
     .pipe(
@@ -349,19 +363,20 @@ export const loadTicket = Effect.fn("superagent.loadTicket")(function* (
     for (const entry of yield* scanDirScoped(ctx, TICKET_PREFIX)) {
       if (entry.suffix !== ticketKey(id)) continue
       value = entry.value
-      owner = entry.dirKey
+      readFrom = entry.dirKey
       break
     }
   }
   const ticket = decodeTicket(value)
   if (ticket === undefined) return undefined
-  // Deriving the partition from the record itself (not from where it was read)
-  // keeps a misplaced key from becoming a visible ticket in the wrong directory.
-  const derived = scopeOf(dirKeyOf(ticket.directory))
+  // Ownership is the record's own `dirKey` (or the namespace it came from), not
+  // its working directory: a misplaced key must not become a visible ticket in
+  // the wrong partition, and a cross-directory dispatch must stay readable.
+  const derived = ticket.dirKey === undefined ? scopeOf(readFrom ?? DEFAULT_DIR_KEY) : ticketOwner(ticket)
   if (dirKey !== undefined && derived !== scopeOf(dirKey)) return undefined
   // Re-cache only while there is room: a read must not push memory back over
   // the cap it was trimmed to.
-  if (tickets.size < MEMORY_LIMIT) remember(ticket, owner ?? derived)
+  if (tickets.size < MEMORY_LIMIT) remember(ticket, derived)
   return ticket
 })
 
@@ -417,11 +432,12 @@ export function activeTicketSummary(threadID: string | undefined, limit = 3, dir
 /**
  * Partition of the worker that owns a session, when it is a tracked worker.
  * Used to scope the ticket lookups the watcher/abort paths make: they only
- * have a session id, and the worker record (not the ticket) knows the directory.
+ * have a session id, and the worker record (not the ticket) knows who
+ * dispatched it (`ownerDirKey`, falling back to `directory` for old records).
  */
 function workerScope(sessionID: string): string | undefined {
   const worker = workers.get(sessionID)
-  return worker === undefined ? undefined : scopeOf(dirKeyOf(worker.directory))
+  return worker === undefined ? undefined : scopeOf(workerOwnerDirKey(worker))
 }
 
 /** Active ticket for a worker session, used when a worker ends. */
@@ -573,6 +589,7 @@ export function decodeTicket(value: Schema.Json | undefined): Ticket | undefined
       })
     : []
   const workerSessionID = optionalString(value, "workerSessionID")
+  const dirKey = optionalString(value, "dirKey")
   const directory = optionalString(value, "directory")
   const parentTicketID = optionalString(value, "parentTicketID")
   const closedAt = optionalNumber(value, "closedAt")
@@ -597,6 +614,7 @@ export function decodeTicket(value: Schema.Json | undefined): Ticket | undefined
     ...(workerSessionID === undefined ? {} : { workerSessionID }),
     attempts,
     priority: PRIORITIES.includes(priority as TicketPriority) ? (priority as TicketPriority) : "p1",
+    ...(dirKey === undefined ? {} : { dirKey }),
     ...(directory === undefined ? {} : { directory }),
     dedupeKey,
     ...(parentTicketID === undefined ? {} : { parentTicketID }),
@@ -634,6 +652,7 @@ export function encodeTicket(ticket: Ticket): Schema.Json {
       ...(attempt.note === undefined ? {} : { note: attempt.note }),
     })),
     priority: ticket.priority,
+    ...(ticket.dirKey === undefined ? {} : { dirKey: ticket.dirKey }),
     ...(ticket.directory === undefined ? {} : { directory: ticket.directory }),
     dedupeKey: ticket.dedupeKey,
     ...(ticket.parentTicketID === undefined ? {} : { parentTicketID: ticket.parentTicketID }),
@@ -808,10 +827,10 @@ export interface CreateTicketInput {
   /** Defaults to the trigger most recently delivered to the Router. */
   readonly authorization?: TicketAuthorization
   /**
-   * Partition of the caller (the Router). Defaults to the partition of
-   * `directory`, which is the same thing for every caller that passed
-   * `requireRouterFor` first; the explicit value keeps a caller-supplied
-   * directory from moving the record into another namespace.
+   * Partition of the caller (the Router). This is the ticket's owner; it
+   * defaults to the default partition (a caller that did not identify itself),
+   * **never** to the partition of `directory`: the directory is only the
+   * working directory, and one Router may create tickets for any directory.
    */
   readonly dirKey?: string
   readonly now?: number
@@ -837,7 +856,8 @@ export const createTicket = Effect.fn("superagent.createTicket")(function* (
   const directory = normalizeDirectory(input.directory)
   if (directory === undefined) return yield* new Tool.Error({ message: DIRECTORY_ERROR })
   const acceptance = input.acceptance.map((item) => item.trim()).filter((item) => item !== "")
-  const dirKey = scopeOf(input.dirKey ?? dirKeyOf(directory))
+  // 归属＝调用方 Router 的分区。`directory` 已通过绝对路径校验，但只作为工作目录。
+  const dirKey = scopeOf(input.dirKey ?? DEFAULT_DIR_KEY)
   const dedupeKey =
     input.dedupeKey?.trim() ||
     dedupeKeyFor({ source: input.source, threadID: input.threadID, objective: input.objective })
@@ -866,6 +886,7 @@ export const createTicket = Effect.fn("superagent.createTicket")(function* (
     threadID: input.threadID,
     attempts: [],
     priority: input.priority ?? "p1",
+    dirKey,
     directory,
     dedupeKey,
     ...(input.parentTicketID === undefined ? {} : { parentTicketID: input.parentTicketID }),
@@ -907,7 +928,7 @@ function foreignTicketMessage(ticketID: string, dirKey: string | undefined): str
   const own = partitionOf(known)
   const mine = scopeOf(dirKey)
   if (own === mine) return undefined
-  return `ticket ${known.id} belongs to partition ${own}, not this router's partition ${mine}; operate on it from that directory's router`
+  return `ticket ${known.id} belongs to partition ${own}, not this router's partition ${mine}; operate on it from that partition's router`
 }
 
 /** Move a ticket through the state machine. Illegal moves fail with a `Tool.Error`. */
@@ -1019,9 +1040,9 @@ export function listTickets(input: ListTicketsInput = {}, dirKey?: string): Arra
  * that exists in KV never shows up as "no such ticket". The KV walk is paged
  * and only runs on that short-page path, never on every call.
  *
- * The KV walk is scoped to the caller's partition: a legacy `ticket:` record
- * whose directory belongs elsewhere (the pre-2b layout, kept for rollback) is
- * filtered out instead of leaking into this directory's list.
+ * The KV walk is scoped to the caller's partition: records of another
+ * partition (and legacy `ticket:` records, which belong to the default one)
+ * are filtered out instead of leaking into this partition's list.
  */
 export const listTicketRecords = Effect.fn("superagent.listTicketRecords")(function* (
   ctx: Plugin.Context,
@@ -1036,22 +1057,26 @@ export const listTicketRecords = Effect.fn("superagent.listTicketRecords")(funct
   const local = listTickets(input, dirKey)
   if (memoryComplete(dirKey) || local.length >= limit) return local
   const merged = new Map(local.map((ticket) => [ticket.id, ticket]))
-  const add = (value: Schema.Json | undefined): void => {
+  // `from` is the namespace the record was read from: a record written before
+  // the ownership field existed has no `dirKey` of its own, and the namespace
+  // is then the only statement about its partition.
+  const add = (value: Schema.Json | undefined, from?: string): void => {
     const ticket = decodeTicket(value)
     if (ticket === undefined || merged.has(ticket.id)) return
-    if (!matchesQuery(ticket, input) || !visibleIn(ticket, dirKey)) return
+    if (!matchesQuery(ticket, input)) return
+    const owner = ticket.dirKey === undefined ? scopeOf(from ?? DEFAULT_DIR_KEY) : ticketOwner(ticket)
+    if (dirKey !== undefined && owner !== scopeOf(dirKey)) return
     merged.set(ticket.id, ticket)
   }
   if (dirKey === undefined) {
     // Process-wide view (TUI/RPC): both the legacy prefix and the scoped ones.
-    for (const entry of yield* scanEntries(ctx, TICKET_PREFIX)) add(entry.value)
-    for (const entry of yield* scanDirScoped(ctx, TICKET_PREFIX)) add(entry.value)
+    for (const entry of yield* scanEntries(ctx, TICKET_PREFIX)) add(entry.value, DEFAULT_DIR_KEY)
+    for (const entry of yield* scanDirScoped(ctx, TICKET_PREFIX)) add(entry.value, entry.dirKey)
   } else {
-    // One partition: its own namespace. A legacy `ticket:` record whose
-    // directory belongs elsewhere (the pre-2b layout, kept for rollback) is
-    // filtered out by `visibleIn` instead of leaking into this list.
+    // One partition: its own namespace. Records of another partition are
+    // filtered out instead of leaking into this list.
     const prefix = dirScopedKey(TICKET_PREFIX, scopeOf(dirKey))
-    for (const entry of yield* scanEntries(ctx, prefix)) add(entry.value)
+    for (const entry of yield* scanEntries(ctx, prefix)) add(entry.value, scopeOf(dirKey))
   }
   return [...merged.values()].sort((left, right) => right.updatedAt - left.updatedAt).slice(0, limit)
 })
@@ -1255,39 +1280,41 @@ export const blockTicketsForWorker = Effect.fn("superagent.blockTicketsForWorker
 /**
  * Load every ticket record and rebuild the indexes.
  *
- * Stage 2b reads two namespaces:
+ * Two namespaces are read:
  *
- * - the legacy `ticket:<id>` prefix (the default partition's layout, and where
- *   every pre-2b record lives), and
- * - `dir:<dirKey>:ticket:<id>` per non-default partition.
+ * - the legacy `ticket:<id>` prefix, and
+ * - `dir:<dirKey>:ticket:<id>` per explicit partition.
  *
- * **Migration**：旧记录按 `ticket.directory` 推导分区（`dirKeyFor`，与
- * `requireRouterFor` 同口径），非默认分区的那部分会**额外写一份**到自己的分区
- * key，**旧 key 保留**。保留的理由是回滚：老版本只认 `ticket:`，删掉旧 key
- * 就等于回滚后这批工单凭空消失；而保留不会产生重复语义，因为内存表按 id 索引
- * （同一条记录读两遍仍是同一条），并且第二次 hydrate 发现 scoped key 已存在就
- * 不再写，`dirtyTicketIDs()` 始终为空。
+ * **Migration**：旧键里的工单**一律归默认分区**，不再按 `ticket.directory` 打散，
+ * 也**不再写**分区副本（旧 key 保留，回滚后老版本仍读得到）。理由：分区归属是
+ * 「谁创建的」，而旧记录没有 `dirKey`，它们当初只可能在默认分区；按目录打散会让
+ * 开关打开后老 Router 一张自己的历史工单都看不见（`closed=19` → `closed=0`）。
+ *
+ * `dir:<dirKey>:` 下的记录保持原样（那是显式分区过的）。同一 id 在两处都存在
+ * （旧版本迁移时写过一份副本）时：归属回到默认分区（它本来就是旧键里的那张单），
+ * 内容取 `updatedAt` 更新的那份，所以迁移后继续更新的状态不会被旧副本回滚。
+ *
+ * 整个过程**不写 KV**（除了清理损坏记录与重写派生索引），因此重复 hydrate 的
+ * 结果与键集合完全相同。
  */
 export const hydrateTickets = Effect.fn("superagent.hydrateTickets")(function* (ctx: Plugin.Context) {
   resetTickets()
-  const settled = new Set<string>()
-  const adopt = (ticket: Ticket, dirKey: string): void => {
-    if (settled.has(ticket.id)) return
-    settled.add(ticket.id)
-    remember(ticket, dirKey)
-    bumpKvTotal(dirKey)
-  }
-  // 1. 新布局优先：`dir:<dirKey>:ticket:<id>`。已经迁移过的记录在这一步就被认领，
-  //    所以下面的旧 key 扫描不会再写一次——这正是幂等性的来源。
-  for (const entry of yield* scanDirScoped(ctx, TICKET_PREFIX)) {
-    const ticket = decodeTicket(entry.value)
-    if (ticket === undefined) {
-      yield* ctx.storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
-      continue
+  /** id → 归属分区与该 id 的最新内容。 */
+  const settled = new Map<string, { ticket: Ticket; dirKey: string }>()
+  /**
+   * 旧键扫描先跑：出现在旧键里的 id 一律归默认分区。副本更新时只替换内容，
+   * 不改变归属（`lockDirKey`）。
+   */
+  const consider = (ticket: Ticket, dirKey: string, lockDirKey: boolean): void => {
+    const previous = settled.get(ticket.id)
+    if (previous === undefined) {
+      settled.set(ticket.id, { ticket, dirKey })
+      return
     }
-    adopt(ticket, entry.dirKey)
+    if (ticket.updatedAt <= previous.ticket.updatedAt) return
+    settled.set(ticket.id, { ticket, dirKey: lockDirKey ? previous.dirKey : dirKey })
   }
-  // 2. 旧布局：`ticket:<id>`。开关关闭时只会走这一条路径。
+  // 1. 旧布局：`ticket:<id>`。开关关闭时只会走这一条路径。
   let after: string | undefined
   do {
     const page = yield* ctx.storage
@@ -1299,26 +1326,23 @@ export const hydrateTickets = Effect.fn("superagent.hydrateTickets")(function* (
         yield* ctx.storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
         continue
       }
-      // 已经从分区 key 认领过：不重复记，也不重复写。
-      if (settled.has(ticket.id)) continue
-      const dirKey = scopeOf(dirKeyOf(ticket.directory))
-      adopt(ticket, dirKey)
-      // 默认分区本来就用旧 key，没有可迁移的东西。
-      if (dirKey === DEFAULT_DIR_KEY) continue
-      yield* ctx.storage
-        .set(dirScopedKey(ticketKey(ticket.id), dirKey), encodeTicket(ticket))
-        .pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("superagent failed to migrate ticket into its directory partition", {
-              ticketID: ticket.id,
-              dirKey,
-              cause,
-            }),
-          ),
-        )
+      consider(ticket, DEFAULT_DIR_KEY, true)
     }
     after = page.next
   } while (after !== undefined)
+  // 2. 显式分区：`dir:<dirKey>:ticket:<id>`。已由旧键认领的 id 不再改变归属。
+  for (const entry of yield* scanDirScoped(ctx, TICKET_PREFIX)) {
+    const ticket = decodeTicket(entry.value)
+    if (ticket === undefined) {
+      yield* ctx.storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
+      continue
+    }
+    consider(ticket, entry.dirKey, settled.has(ticket.id))
+  }
+  for (const { ticket, dirKey } of settled.values()) {
+    remember(ticket, dirKey)
+    bumpKvTotal(dirKey)
+  }
   trimMemory()
   yield* rewriteIndexes(ctx)
   yield* Effect.logInfo("superagent tickets hydrated", { count: tickets.size, inKV: kvTicketCount() })

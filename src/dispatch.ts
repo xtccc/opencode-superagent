@@ -7,12 +7,11 @@ import { Effect, Schema } from "effect"
 import { WORKER_AGENT } from "./agents.js"
 import { DEFAULT_DIR_KEY, directoryError, normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
 import { DISPATCH_EFFORTS, type DispatchEffort } from "./effort.js"
-import { requireRouter, requireRouterFor } from "./guard.js"
+import { requireRouter } from "./guard.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { perDirectoryRouterEnabled, maxWorkersPerDirectorySetting, parseWorkerLimit } from "./settings.js"
 import {
   detachWorkerThreads,
-  dirKeyFor,
   dirKeyForRouter,
   dirKeyForWorker,
   dirScopedKey,
@@ -169,12 +168,12 @@ export function maxWorkersPerDirectory(ctx: Plugin.Context): number {
   return fromContext > 0 ? fromContext : maxWorkersPerDirectorySetting()
 }
 
-/** Live (non-terminal) workers of one partition. */
+/** Live (non-terminal) workers owned by one partition. */
 function partitionWorkerCount(dirKey: string): number {
   let live = 0
   for (const worker of store.workers.values()) {
     if (isWorkerTerminal(worker.state)) continue
-    if (dirKeyFor(worker.directory) === dirKey) live += 1
+    if (dirKeyForWorker(worker) === dirKey) live += 1
   }
   return live
 }
@@ -543,11 +542,10 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
   // an unknown/closed one, a thread mismatch and a ticket whose worker is
   // still running, so no dispatch can bypass the work-order record.
+  // `callerDirKey` also scopes the gate: a Router only dispatches work orders
+  // of its own partition. The **directory** is irrelevant here — a worker may
+  // be dispatched into any directory, and the ticket keeps its owner.
   const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID, callerDirKey)
-  // A router only dispatches work orders of its own directory: with the switch
-  // on, router A can never create a worker in directory B. A ticket with no
-  // directory falls into the default partition, matching `requireRouterFor`.
-  yield* requireRouterFor(caller, ticket.directory, "dispatch")
   // Claim the ticket synchronously before any further dispatch step. Check
   // and insert happen in one uninterrupted block, so two concurrent calls can
   // never both see the ticket as free and race into `sessions.create`; the
@@ -625,8 +623,11 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
   const routerModel = routerInherit?.model
   const routerDirectory = routerInherit?.directory
   // Single gateway, Router-managed directories: explicit directory wins,
-  // otherwise the ticket's directory, then thread binding / alias match,
-  // otherwise follow Router. The gateway process directory itself is irrelevant.
+  // otherwise the ticket's working directory, then thread binding / alias
+  // match, otherwise follow Router. The gateway process directory itself is
+  // irrelevant. Any of these may name a directory outside the caller's own
+  // partition: the worker runs there, but it is owned by the dispatching
+  // Router (`ownerDirKey`), so its report comes back here.
   const requestedDir = input.directory === undefined ? undefined : normalizeDirectory(input.directory)
   const ticketDir = ticket.directory === undefined ? undefined : normalizeDirectory(ticket.directory)
   const rememberedDir = resolveDirectory({
@@ -635,18 +636,6 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
     requested: requestedDir ?? ticketDir,
   })
   const targetDirectory = rememberedDir ?? routerDirectory
-  // With the switch on the worker must land in the caller's own directory:
-  // `resolveDirectory` can still return a thread binding from another
-  // directory, and creating the worker there would put it under a Router that
-  // never dispatched it (its completion would then be routed elsewhere).
-  if (perDirectoryRouterEnabled()) {
-    const targetDirKey = dirKeyFor(targetDirectory ?? routerDirectory)
-    if (targetDirKey !== dirKey) {
-      return yield* new Tool.Error({
-        message: `dispatch: resolved directory ${targetDirectory ?? routerDirectory ?? "(unknown)"} belongs to partition ${targetDirKey}, not this router's ${dirKey}; pass directory of this router's directory or use that directory's router`,
-      })
-    }
-  }
   // An explicit agent keeps its own model priority, so there is no model to
   // attach a variant to: refuse instead of silently dropping the effort.
   if (input.effort !== undefined && input.agent !== undefined) {
@@ -700,14 +689,18 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
     state: "running" as const,
     createdAt: Date.now(),
     ...(targetDirectory === undefined ? {} : { directory: targetDirectory }),
+    // Ownership: the dispatching Router's partition. `directory` above is only
+    // where the session runs; completion/stall/wake notices follow this key.
+    ownerDirKey: dirKey,
   }
   store.workers.set(created.id, record)
   yield* saveWorker(ctx, record)
   // Complete the reverse edge (trigger → worker) so the dispatch can be traced
   // from the message that caused it. A missing trigger is not an error: the
-  // ticket remains the durable record in that case.
+  // ticket remains the durable record in that case. The trigger lives in the
+  // caller's partition, so the edge must be written there.
   if (triggerID !== undefined) {
-    yield* linkTriggerToWorker(ctx, triggerID, created.id).pipe(
+    yield* linkTriggerToWorker(ctx, triggerID, created.id, dirKey).pipe(
       Effect.catch((cause) => Effect.logWarning("superagent failed to link trigger to worker", { cause })),
     )
   }

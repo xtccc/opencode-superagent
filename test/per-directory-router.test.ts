@@ -5,7 +5,7 @@ import { runAbort } from "../src/abort.js"
 import { filterSessionTools } from "../src/context.js"
 import { DEFAULT_DIR_KEY, aliasConflicts, aliasDirs, dirKeyOf, threadDirs } from "../src/dirs.js"
 import { runDispatch, statusText } from "../src/dispatch.js"
-import { requireRouter, requireRouterFor } from "../src/guard.js"
+import { requireRouter } from "../src/guard.js"
 import {
   ensureRouter,
   enqueuePending,
@@ -347,9 +347,9 @@ describe("the idle hook drains one partition only", () => {
   })
 })
 
-// ── 3. auth is per directory ──────────────────────────────────────────────────
+// ── 3. auth is per partition ──────────────────────────────────────────────────
 
-describe("router identity is per directory", () => {
+describe("router identity is per partition", () => {
   test("requireRouter accepts every partition's router and rejects anything else", async () => {
     applySettings({ perDirectoryRouter: true })
     const h = partitionContext()
@@ -361,11 +361,13 @@ describe("router identity is per directory", () => {
     expect(await succeed(requireRouter(routerA, "status"))).toBe(keyA)
     expect(await succeed(requireRouter(routerB, "status"))).toBe(keyB)
     expect(await failure(requireRouter("ses_user", "status"))).toContain("only available to the router session")
-    // `requireRouterFor` 把调用方钉在目录对应的分区上。
-    expect(await succeed(requireRouterFor(routerA, DIR_A, "dispatch"))).toBe(keyA)
-    const denied = await failure(requireRouterFor(routerA, DIR_B, "dispatch"))
-    expect(denied).toContain("cannot operate on")
-    expect(denied).toContain(keyB)
+  })
+
+  test("no guard ties a router to a directory any more", async () => {
+    // 回归守卫：`requireRouterFor(caller, directory)` 把「工作目录」当成「归属分区」，
+    // 开关打开后默认分区的 Router 连自己的工作目录都用不了。归属只由调用方决定。
+    const guard = (await import("../src/guard.js")) as Record<string, unknown>
+    expect("requireRouterFor" in guard).toBe(false)
   })
 
   test("the tool filter recognises a router of any partition", async () => {
@@ -384,7 +386,7 @@ describe("router identity is per directory", () => {
     expect(Object.keys(userTools).sort()).toEqual(["bash", "dispatch", "sleep"])
   })
 
-  test("a router cannot dispatch another directory's ticket", async () => {
+  test("a router cannot dispatch another partition's ticket", async () => {
     applySettings({ perDirectoryRouter: true })
     const h = partitionContext()
     const keyA = dirKeyOf(DIR_A)
@@ -399,10 +401,10 @@ describe("router identity is per directory", () => {
       source: "telegram",
     } as const
     const ticketA = await succeed(
-      createTicket(h.ctx, { ...base, threadID: THREAD_A, directory: DIR_A }),
+      createTicket(h.ctx, { ...base, threadID: THREAD_A, directory: DIR_A, dirKey: keyA }),
     )
     const ticketB = await succeed(
-      createTicket(h.ctx, { ...base, threadID: THREAD_B, directory: DIR_B }),
+      createTicket(h.ctx, { ...base, threadID: THREAD_B, directory: DIR_B, dirKey: dirKeyOf(DIR_B) }),
     )
 
     const denied = await failure(runDispatch(h.ctx, { task: "修日志", ticketID: ticketB.ticket.id }, routerA))
@@ -419,28 +421,28 @@ describe("router identity is per directory", () => {
     expect(h.data.get(dirScopedKey(threadKey(THREAD_A), keyA))).toBeDefined()
     expect(h.data.get(threadKey(THREAD_A))).toBeUndefined()
 
-    // 反向：B 的 Router 派发 A 目录的（另一张）工单同样被拒。
+    // 反向：B 的 Router 派发 A 分区的（另一张）工单同样被拒。
     const ticketC = await succeed(
-      createTicket(h.ctx, { ...base, objective: "另一件事", threadID: THREAD_A, directory: DIR_A }),
+      createTicket(h.ctx, { ...base, objective: "另一件事", threadID: THREAD_A, directory: DIR_A, dirKey: keyA }),
     )
     const deniedB = await failure(runDispatch(h.ctx, { task: "修日志", ticketID: ticketC.ticket.id }, routerB))
     expect(deniedB).toContain("partition")
   })
 
-  test("abort and worker_prompt refuse another directory's worker", async () => {
+  test("abort and worker_prompt refuse another partition's worker", async () => {
     applySettings({ perDirectoryRouter: true })
     const h = partitionContext()
     const routerA = await succeed(ensureRouter(h.ctx, { dirKey: dirKeyOf(DIR_A), directory: DIR_A }))
     store.workers.set("ses_wb", worker("ses_wb", { directory: DIR_B, threadID: THREAD_B, threads: [THREAD_B] }))
 
     const abortDenied = await failure(runAbort(h.ctx, { sessionID: "ses_wb" }, routerA))
-    expect(abortDenied).toContain("another directory's router")
+    expect(abortDenied).toContain("another router's partition")
     expect(store.workers.get("ses_wb")?.state).toBe("running")
 
     const promptDenied = await failure(
       runWorkerPrompt(h.ctx, { sessionID: "ses_wb", text: "继续" }, routerA),
     )
-    expect(promptDenied).toContain("another directory's router")
+    expect(promptDenied).toContain("another router's partition")
     expect(h.prompts).toHaveLength(0)
   })
 })

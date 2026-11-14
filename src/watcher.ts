@@ -6,6 +6,7 @@ import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport
 import { ensureRouter } from "./router.js"
 import { clipCodePoints } from "./format.js"
 import { perDirectoryRouterEnabled } from "./settings.js"
+import { workerHomeDirectory, workerOwnerKnown } from "./dirs.js"
 import {
   dirKeyForRouter,
   dirKeyForWorker,
@@ -290,31 +291,37 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
 })
 
 /**
- * The Router a worker's notification belongs to: the one of the worker's own
- * directory partition.
+ * The Router a worker's notification belongs to: the one that **dispatched** it
+ * (`ownerDirKey`). The worker's `directory` is only where the session runs, so
+ * a Router that dispatched into another directory still receives its report —
+ * and the Router of that directory receives nothing.
  *
  * Degradation is explicit, never silent: with the switch on, a worker record
- * without a directory has no partition of its own, so its completion falls
- * back to the default partition and warns **once** — dropping it would lose
- * the only signal the Router gets that the work finished. A partition whose
- * router cannot be created keeps the `notified` marker released (the caller
- * retries on the next delivery) instead of misrouting the report elsewhere.
+ * with neither an owner nor a directory has no partition of its own, so its
+ * completion falls back to the default partition and warns **once** — dropping
+ * it would lose the only signal the Router gets that the work finished. A
+ * partition whose router cannot be created keeps the `notified` marker released
+ * (the caller retries on the next delivery) instead of misrouting the report.
+ *
+ * Only the partition key is passed to `ensureRouter`: the Router must be
+ * created in its own partition's directory, never in the worker's working
+ * directory.
  */
 const ensureRouterForWorker = Effect.fn("superagent.ensureRouterForWorker")(function* (
   ctx: Plugin.Context,
   worker: WorkerRecord,
 ) {
   const dirKey = dirKeyForWorker(worker)
-  if (perDirectoryRouterEnabled() && worker.directory === undefined) {
-    yield* warnOnce("worker-without-directory", "superagent worker has no directory; reporting to the default router", {
+  if (perDirectoryRouterEnabled() && !workerOwnerKnown(worker)) {
+    yield* warnOnce("worker-without-directory", "superagent worker has no partition; reporting to the default router", {
       sessionID: worker.sessionID,
       dirKey,
     })
   }
-  return yield* ensureRouter(ctx, {
-    dirKey,
-    ...(worker.directory === undefined ? {} : { directory: worker.directory }),
-  })
+  // Only a directory that really is this partition's own may host its Router:
+  // a worker dispatched into another directory must not drag the Router there.
+  const home = workerHomeDirectory(worker, dirKey)
+  return yield* ensureRouter(ctx, { dirKey, ...(home === undefined ? {} : { directory: home }) })
 })
 
 /** Partition whose Router this session is, or `undefined` when it is not a router. */

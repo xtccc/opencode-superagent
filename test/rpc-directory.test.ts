@@ -254,11 +254,12 @@ describe("tickets RPC: directory scoping", () => {
   test("a directory only lists its own tickets; omitted stays process-wide", async () => {
     applySettings({ perDirectoryRouter: true })
     const ctx = memoryContext()
+    // 归属＝调用方分区（`dirKey`），不是 `directory`：两条记录分别属于 A、B 分区。
     const ticketA = await succeed(
-      createTicket(ctx, { ...base, threadID: "telegram:a", title: "A", directory: DIR_A }),
+      createTicket(ctx, { ...base, threadID: "telegram:a", title: "A", directory: DIR_A, dirKey: dirKeyFor(DIR_A) }),
     )
     const ticketB = await succeed(
-      createTicket(ctx, { ...base, threadID: "telegram:b", title: "B", directory: DIR_B }),
+      createTicket(ctx, { ...base, threadID: "telegram:b", title: "B", directory: DIR_B, dirKey: dirKeyFor(DIR_B) }),
     )
 
     const scopedA = await succeed(renderTicketsTextDeep(ctx, {}, dirKeyFor(DIR_A)))

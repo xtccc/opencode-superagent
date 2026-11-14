@@ -577,6 +577,16 @@ interface HarnessResult {
     readonly leakedToA: boolean
     readonly leakedToB: boolean
   }
+  /** A Router dispatching into the *other* directory: owner and delivery must stay with A. */
+  readonly crossDirectory: {
+    readonly worker: string
+    readonly workerDirectory: string | undefined
+    readonly ownerDirKey: string | undefined
+    readonly deliveries: number
+    readonly deliveredTo: string | undefined
+    readonly ticketOwner: string | undefined
+    readonly visibleInBeta: number
+  }
   readonly flagOff: {
     readonly routerA: string
     readonly routerB: string
@@ -707,6 +717,7 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
       objective: "touch alpha",
       acceptance: ["done"],
       directory: dirA,
+      dirKey: keyA,
       source: "e2e",
     }),
   )
@@ -717,6 +728,7 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
       objective: "touch beta",
       acceptance: ["done"],
       directory: dirB,
+      dirKey: keyB,
       source: "e2e",
     }),
   )
@@ -750,6 +762,55 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
   assertEqual(statusOn.partitions?.length, 2, "flag-on aggregate partitions")
   assertEqual(statusModule.statusSnapshot({ directory: dirA }).workers?.length, 1, "flag-on scoped alpha workers")
 
+  // ── ownership: a worker dispatched into the OTHER directory stays owned by A ──
+  // Router A creates a ticket whose working directory is beta and dispatches a
+  // worker there. The ticket and the completion notice must stay with A: the
+  // directory is a working directory, not a partition.
+  const crossTicket = await succeed(
+    ticketModule.createTicket(on.ctx, {
+      threadID: "e2e:cross",
+      title: "cross-dir task",
+      objective: "touch beta from alpha",
+      acceptance: ["done"],
+      directory: dirB,
+      dirKey: keyA,
+      source: "e2e",
+    }),
+  )
+  assertEqual(crossTicket.ticket.dirKey, keyA, "cross-directory ticket owner")
+  assertEqual(crossTicket.ticket.directory, dirB, "cross-directory ticket working directory")
+  const crossDispatch = await succeed(
+    dispatchModule.runDispatch(
+      on.ctx,
+      { task: "touch beta from alpha", threadID: "e2e:cross", ticketID: crossTicket.ticket.id, directory: dirB },
+      routerA,
+    ),
+  )
+  const crossWorker = crossDispatch.output.sessionID
+  const crossRecord = stateModule.store.workers.get(crossWorker)
+  assert(crossRecord !== undefined, "cross-directory worker record must exist")
+  assertEqual(crossRecord.directory, dirB, "cross-directory worker runs in beta")
+  assertEqual(crossRecord.ownerDirKey, keyA, "cross-directory worker is owned by alpha")
+  assertEqual(
+    ticketModule.listTickets({}, keyA).filter((ticket) => ticket.id === crossTicket.ticket.id).length,
+    1,
+    "cross-directory ticket lives in alpha's partition",
+  )
+  assertEqual(
+    ticketModule.listTickets({}, keyB).filter((ticket) => ticket.id === crossTicket.ticket.id).length,
+    0,
+    "cross-directory ticket is invisible in beta's partition",
+  )
+
+  const syntheticBefore = on.synthetic.length
+  await succeed(watcherModule.handleEnded(on.ctx, crossWorker, "done", undefined, 3))
+  const crossDeliveries = on.synthetic.slice(syntheticBefore)
+  assertEqual(crossDeliveries.length, 1, "one completion delivery for the cross-directory worker")
+  assertEqual(crossDeliveries[0]?.sessionID, routerA, "cross-directory completion returns to the dispatching Router")
+  assert(crossDeliveries[0]?.text.includes(crossWorker) === true, "alpha Router receives the cross-directory report")
+  assertEqual(ticketModule.getTicket(crossTicket.ticket.id)?.state, "done", "cross-directory ticket closed by its worker")
+  assertEqual(statusModule.statusSnapshot({ directory: dirA }).workers?.length, 2, "cross-directory worker counts for alpha")
+
   // ── flag off: both directories collapse onto the single default Router ──
   reset(false)
   const off = memoryContext()
@@ -762,7 +823,8 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
 
   console.log(
     `[e2e] harness     flag-on routers=${routerA},${routerB} workers=${workerA}@${dirA},${workerB}@${dirB} ` +
-      `deliveries=${toA.length}/${toB.length} flag-off router=${offRouterA} created=${off.created.length}`,
+      `deliveries=${toA.length}/${toB.length} cross=${crossWorker}@${dirB} owner=${crossRecord.ownerDirKey} ` +
+      `delivered=${crossDeliveries[0]?.sessionID} flag-off router=${offRouterA} created=${off.created.length}`,
   )
 
   return {
@@ -777,6 +839,15 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
       deliveriesToB: toB.length,
       leakedToA: toA[0]?.text.includes(workerB) === true,
       leakedToB: toB[0]?.text.includes(workerA) === true,
+    },
+    crossDirectory: {
+      worker: crossWorker,
+      workerDirectory: crossRecord.directory,
+      ownerDirKey: crossRecord.ownerDirKey,
+      deliveries: crossDeliveries.length,
+      deliveredTo: crossDeliveries[0]?.sessionID,
+      ticketOwner: crossTicket.ticket.dirKey,
+      visibleInBeta: ticketModule.listTickets({}, keyB).filter((ticket) => ticket.id === crossTicket.ticket.id).length,
     },
     flagOff: {
       routerA: offRouterA,

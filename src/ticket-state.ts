@@ -53,6 +53,16 @@ export interface Ticket {
   workerSessionID?: string
   readonly attempts: Array<TicketAttempt>
   readonly priority: TicketPriority
+  /**
+   * Partition that owns this work order: the partition of the Router that
+   * created it. Never derived from `directory` — a ticket may be dispatched
+   * into any working directory.
+   */
+  dirKey?: string
+  /**
+   * Working directory of the work order (display/audit, and the default target
+   * `dispatch` uses). It does **not** decide the partition.
+   */
   directory?: string
   readonly dedupeKey: string
   readonly parentTicketID?: string

@@ -358,7 +358,7 @@ export const registerRecall = Effect.fn("superagent.registerRecall")(function* (
       if (worker === undefined) return
       const parsed = parseTriggerHeader(event.prompt.text)
       if (parsed === undefined) return
-      // 直投 worker 的 trigger 进该 worker 自己的分区。
+      // 直投 worker 的 trigger 进派发它的那个分区（`ownerDirKey`），不是它跑的目录。
       const dirKey = dirKeyForWorker(worker)
       const record = upsertDirectTrigger(parsed, event.sessionID, dirKey)
       yield* saveTrigger(ctx, record, dirKey)

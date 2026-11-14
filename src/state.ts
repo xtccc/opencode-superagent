@@ -5,10 +5,11 @@ import {
   DEFAULT_DIR_KEY,
   canonicalDirectory,
   dirKeyFor,
-  dirKeyOf,
   effectiveDirKey,
   rememberDirDirectory,
   resetDirDirectories,
+  workerHomeDirectory,
+  workerOwnerDirKey,
 } from "./dirs.js"
 import { buildReport, lastAssistantText, reportSummary, saveReport } from "./report.js"
 import { dirScopedKey, scanDirScoped, scanEntries } from "./scope.js"
@@ -311,9 +312,15 @@ export function dirState(target: Store, key?: string, directory?: string): DirSt
 
 // ── directory partitioning helpers（阶段 2a：每目录一个 Router） ──────────────
 
-/** 某个 worker 记录所属的分区（开关关闭时恒为默认分区）。 */
-export function dirKeyForWorker(worker: { readonly directory?: string } | undefined): string {
-  return dirKeyFor(worker?.directory)
+/**
+ * 某个 worker 记录所属的分区（开关关闭时恒为默认分区）。
+ *
+ * 归属看 `ownerDirKey`（派发方 Router 的分区），不是 `directory`：跨目录派发时
+ * worker 的会话落在别的目录里，但它仍然属于派发它的那个 Router。旧记录没有
+ * `ownerDirKey`，回退到按 `directory` 推导（升级前的口径）。
+ */
+export function dirKeyForWorker(worker: { readonly ownerDirKey?: string; readonly directory?: string } | undefined): string {
+  return workerOwnerDirKey(worker)
 }
 
 /** 取（必要时创建）某个目录的分区，并把目录登记到分区上。 */
@@ -707,6 +714,7 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
     updatedAt: optionalNumber(value, "updatedAt") ?? createdAt,
     lastReport: optionalString(value, "lastReport"),
     ...(optionalString(value, "directory") === undefined ? {} : { directory: optionalString(value, "directory") }),
+    ...(optionalString(value, "ownerDirKey") === undefined ? {} : { ownerDirKey: optionalString(value, "ownerDirKey") }),
     ...(execution === undefined ? {} : { execution }),
     ...(notified === undefined || notified.length === 0 ? {} : { notified }),
   }
@@ -760,6 +768,7 @@ export function encodeWorker(record: WorkerRecord): Schema.Json {
     ...(record.updatedAt === undefined ? {} : { updatedAt: record.updatedAt }),
     ...(record.lastReport === undefined ? {} : { lastReport: record.lastReport }),
     ...(record.directory === undefined ? {} : { directory: record.directory }),
+    ...(record.ownerDirKey === undefined ? {} : { ownerDirKey: record.ownerDirKey }),
     ...(record.execution === undefined ? {} : { execution: record.execution }),
     ...(record.notified === undefined || record.notified.length === 0 ? {} : { notified: [...record.notified] }),
   } as unknown as Schema.Json
@@ -1007,12 +1016,15 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
     dirState(store, entry.dirKey).threads.set(record.threadID, alive)
   }
   // 分区必须知道自己的目录，才能把该目录的 Router 会话创建在正确位置。
-  // worker 记录带 `directory`，这是重启后最可靠的目录来源（Router 会话可能
-  // 还没建过，或已被用户删除）。
+  // 只有**确实是该分区自己的目录**才会被登记（旧记录按 `directory` 推导归属，
+  // 新记录只在 `dirKeyOf(directory) === dirKey` 时命中）：`directory` 是工作目录，
+  // 把一个跨目录派发的 worker 的目录登记给派发方分区，会让 A 分区的 Router 被
+  // 创建在 B 的工作目录里。
   if (perDirectoryRouterEnabled()) {
     for (const worker of store.workers.values()) {
-      if (worker.directory === undefined) continue
-      dirState(store, dirKeyOf(worker.directory), canonicalDirectory(worker.directory))
+      const dirKey = dirKeyForWorker(worker)
+      const home = workerHomeDirectory(worker, dirKey)
+      dirState(store, dirKey, home === undefined ? undefined : canonicalDirectory(home))
     }
   }
   // Trigger 历史按分区读回：旧前缀 `trigger:` 归默认分区，`dir:<k>:trigger:` 归

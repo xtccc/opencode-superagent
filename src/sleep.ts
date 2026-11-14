@@ -3,7 +3,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Duration, Effect, Schema } from "effect"
 import { requireRouter } from "./guard.js"
 import { flushPending } from "./router.js"
-import { dirState, store, type PendingTrigger } from "./state.js"
+import { dirKeyForWorker, dirState, store, type PendingTrigger } from "./state.js"
 import { specFor, toolPermission } from "./tools.js"
 import { isWorkerTerminal } from "./worker-state.js"
 
@@ -96,10 +96,16 @@ function triggerIdentity(trigger: TriggerIdentityInput, arrivedAt: number): stri
  * queue length misses a trigger when an idle flush drains one while a new one
  * arrives. Both are real concurrent paths (watcher resumes workers; the idle
  * hook flushes the queue), and either would silently sleep the full time.
+ *
+ * `dirKey` scopes the worker half to one partition (by `ownerDirKey`): a worker
+ * another Router dispatched — even one running in this Router's directory —
+ * must not wake this sleep, exactly as its completion is not steered here.
+ * `undefined` keeps the process-wide view.
  */
-function snapshotWork(pendingQueue: ReadonlyArray<PendingTrigger> = store.pending): WorkSnapshot {
+function snapshotWork(pendingQueue: ReadonlyArray<PendingTrigger> = store.pending, dirKey?: string): WorkSnapshot {
   const terminal = new Map<string, string>()
   for (const worker of store.workers.values()) {
+    if (dirKey !== undefined && dirKeyForWorker(worker) !== dirKey) continue
     if (isWorkerTerminal(worker.state)) {
       terminal.set(worker.sessionID, `${worker.state}@${worker.updatedAt ?? 0}`)
     }
@@ -170,13 +176,13 @@ export const runSleep = Effect.fn("superagent.sleep")(function* (
   const startedAt = now()
   // Baseline before the first wait: pre-existing terminal workers or queued
   // triggers must not wake this sleep.
-  const baseline = snapshotWork(pendingQueue)
+  const baseline = snapshotWork(pendingQueue, callerDirKey)
   let wake: Wake | undefined
   for (;;) {
     const elapsedMs = now() - startedAt
     if (elapsedMs >= totalMs) break
     yield* poll(Math.min(SLEEP_POLL_MS, totalMs - elapsedMs))
-    wake = wakeFor(baseline, snapshotWork(pendingQueue))
+    wake = wakeFor(baseline, snapshotWork(pendingQueue, callerDirKey))
     if (wake !== undefined) break
   }
 

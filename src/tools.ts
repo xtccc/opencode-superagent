@@ -118,7 +118,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     name: "ticket_create",
     group: "dispatch",
     description:
-      "Create a work ticket before dispatching: title, objective, acceptance criteria (1-10) and an absolute directory are required. Returns the ticket id and reuses an open ticket with the same dedupe key in the same thread. Only the router may call it.",
+      "Create a work ticket before dispatching: title, objective, acceptance criteria (1-10) and an absolute working directory are required. The ticket belongs to the calling Router's partition whatever the directory is: you can dispatch it into any directory later. Returns the ticket id and reuses an open ticket with the same dedupe key in the same thread. Only the router may call it.",
     summary: "建工单：写清目标、验收标准与目录，重复任务自动复用。",
     params: [
       { name: "threadID", required: true, type: "string", note: "thread 标识" },

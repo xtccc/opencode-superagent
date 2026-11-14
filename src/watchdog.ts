@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { DateTime, Effect, Option, Stream } from "effect"
+import { workerHomeDirectory } from "./dirs.js"
 import { ensureRouter } from "./router.js"
 import { dirKeyForWorker, store, toSessionID } from "./state.js"
 
@@ -70,12 +71,13 @@ export const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
   const minutes = Math.floor(stalledMs / 60_000)
   const title = worker.title ?? "-"
   const text = `Worker ${sessionID}（${title}）已停滞 ${minutes} 分钟，建议：stop 后重派或人工介入`
-  // The alert belongs to the stalled worker's own Router: with per-directory
-  // routers, sending it to the default one would tell the wrong directory.
-  const routerID = yield* ensureRouter(ctx, {
-    dirKey: dirKeyForWorker(worker),
-    ...(worker.directory === undefined ? {} : { directory: worker.directory }),
-  }).pipe(
+  // The alert belongs to the Router that dispatched the worker
+  // (`ownerDirKey`), not to the directory the session happens to run in: a
+  // cross-directory dispatch must not warn another directory's Router. Only a
+  // directory that really is that partition's own may host its Router.
+  const dirKey = dirKeyForWorker(worker)
+  const home = workerHomeDirectory(worker, dirKey)
+  const routerID = yield* ensureRouter(ctx, { dirKey, ...(home === undefined ? {} : { directory: home }) }).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("superagent watchdog cannot report without a router", { cause }).pipe(Effect.as(undefined)),
     ),

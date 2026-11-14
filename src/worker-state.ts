@@ -31,7 +31,18 @@ export interface WorkerRecord {
   /** Last persisted write. Refreshed by `saveWorker`, so an aborted record keeps a traceable timestamp. */
   updatedAt?: number
   lastReport?: string
+  /**
+   * Working directory this worker's session was created in. It is **not** the
+   * partition: one Router may dispatch into any directory.
+   */
   directory?: string
+  /**
+   * Partition of the Router that dispatched this worker. Completion/stall/wake
+   * notifications go back here, never to the Router that owns `directory`.
+   * Absent on records written before this field existed; those fall back to
+   * deriving the partition from `directory` (`workerOwnerDirKey`).
+   */
+  ownerDirKey?: string
   /**
    * Durable sequence of the current execution's `session.execution.started`
    * event. A replay of the same start event keeps it; a real follow-up prompt
