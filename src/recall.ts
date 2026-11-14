@@ -6,6 +6,9 @@ import { requireRouter } from "./guard.js"
 import { loadReport, REPORT_DEFAULT_LIMIT, REPORT_MAX_LIMIT, REPORT_TEXT_LIMIT, sliceReport } from "./report.js"
 import {
   decodeTrigger,
+  dirKeyForWorker,
+  dirScopedKey,
+  dirState,
   saveTrigger,
   store,
   toSessionID,
@@ -101,13 +104,14 @@ export const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (
   input: ThreadDetailInput,
   caller: string,
 ) {
-  yield* requireRouter(caller, "thread_detail")
+  const dirKey = yield* requireRouter(caller, "thread_detail")
   const take = Math.min(
     MAX_THREAD_TAKE,
     input.limit === undefined ? DEFAULT_THREAD_LIMIT : Math.max(1, Math.floor(input.limit)),
   )
   const offset = input.offset === undefined ? 0 : Math.max(0, Math.floor(input.offset))
-  const memory = [...store.triggers.values()]
+  // 只读本分区的 trigger 历史：另一个目录里同名 thread 的对话不该出现在这里。
+  const memory = [...dirState(store, dirKey).triggers.values()]
     .filter((record) => record.threadID === input.threadID)
     .sort((left, right) => left.createdAt - right.createdAt)
   // Memory keeps only the newest 200 triggers. When the requested window
@@ -127,7 +131,7 @@ export const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (
     // the most recent triggers of the thread.
     while (scanned < KV_SCAN_MAX_ENTRIES) {
       const page = yield* ctx.storage
-        .scan({ prefix: TRIGGER_PREFIX, after, limit: KV_SCAN_PAGE })
+        .scan({ prefix: dirScopedKey(TRIGGER_PREFIX, dirKey), after, limit: KV_SCAN_PAGE })
         .pipe(Effect.catch(() => Effect.succeed({ entries: [], next: undefined })))
       if (page.entries.length === 0) break
       scanned += page.entries.length
@@ -152,9 +156,9 @@ export const runThreadDetail = Effect.fn("superagent.threadDetail")(function* (
   const end = Math.max(0, total - offset)
   const start = Math.max(0, end - take)
   const shown = triggers.slice(start, end)
-  const workers = [...store.workers.values()].filter(
-    (worker) => worker.threadID === input.threadID || worker.threads.includes(input.threadID),
-  )
+  const workers = [...store.workers.values()]
+    .filter((worker) => dirKeyForWorker(worker) === dirKey)
+    .filter((worker) => worker.threadID === input.threadID || worker.threads.includes(input.threadID))
   const source = kvFilled > 0 ? `memory ${memory.length} + KV ${kvFilled}` : `memory ${memory.length}`
   const lines = [
     `thread ${input.threadID}: ${total} trigger(s) (${source}), ${workers.length} worker(s)`,
@@ -350,11 +354,14 @@ export const registerRecall = Effect.fn("superagent.registerRecall")(function* (
   })
   yield* ctx.session.hook("prompt", (event) =>
     Effect.gen(function* () {
-      if (!store.workers.has(event.sessionID)) return
+      const worker = store.workers.get(event.sessionID)
+      if (worker === undefined) return
       const parsed = parseTriggerHeader(event.prompt.text)
       if (parsed === undefined) return
-      const record = upsertDirectTrigger(parsed, event.sessionID)
-      yield* saveTrigger(ctx, record)
+      // 直投 worker 的 trigger 进该 worker 自己的分区。
+      const dirKey = dirKeyForWorker(worker)
+      const record = upsertDirectTrigger(parsed, event.sessionID, dirKey)
+      yield* saveTrigger(ctx, record, dirKey)
     }).pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to record direct trigger", { cause }))),
   )
 })

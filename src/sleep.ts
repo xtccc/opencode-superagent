@@ -3,7 +3,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Duration, Effect, Schema } from "effect"
 import { requireRouter } from "./guard.js"
 import { flushPending } from "./router.js"
-import { store } from "./state.js"
+import { dirState, store, type PendingTrigger } from "./state.js"
 import { specFor, toolPermission } from "./tools.js"
 import { isWorkerTerminal } from "./worker-state.js"
 
@@ -97,7 +97,7 @@ function triggerIdentity(trigger: TriggerIdentityInput, arrivedAt: number): stri
  * arrives. Both are real concurrent paths (watcher resumes workers; the idle
  * hook flushes the queue), and either would silently sleep the full time.
  */
-function snapshotWork(): WorkSnapshot {
+function snapshotWork(pendingQueue: ReadonlyArray<PendingTrigger> = store.pending): WorkSnapshot {
   const terminal = new Map<string, string>()
   for (const worker of store.workers.values()) {
     if (isWorkerTerminal(worker.state)) {
@@ -105,7 +105,7 @@ function snapshotWork(): WorkSnapshot {
     }
   }
   const pending = new Set<string>()
-  for (const item of store.pending) pending.add(triggerIdentity(item.trigger, item.arrivedAt))
+  for (const item of pendingQueue) pending.add(triggerIdentity(item.trigger, item.arrivedAt))
   return { pending, terminal }
 }
 
@@ -141,7 +141,10 @@ export const runSleep = Effect.fn("superagent.sleep")(function* (
   caller: string,
   deps: SleepDeps = {},
 ) {
-  yield* requireRouter(caller, "sleep")
+  // The caller's partition owns the queue this sleep watches: a trigger queued
+  // for another directory must not wake (or be flushed into) this router.
+  const callerDirKey = yield* requireRouter(caller, "sleep")
+  const pendingQueue = dirState(store, callerDirKey).pending
   const seconds = input.seconds ?? SLEEP_DEFAULT_SECONDS
   // The registered schema already rejects non-numbers at the tool boundary;
   // this re-check keeps direct/RPC-style callers from bypassing validation.
@@ -167,13 +170,13 @@ export const runSleep = Effect.fn("superagent.sleep")(function* (
   const startedAt = now()
   // Baseline before the first wait: pre-existing terminal workers or queued
   // triggers must not wake this sleep.
-  const baseline = snapshotWork()
+  const baseline = snapshotWork(pendingQueue)
   let wake: Wake | undefined
   for (;;) {
     const elapsedMs = now() - startedAt
     if (elapsedMs >= totalMs) break
     yield* poll(Math.min(SLEEP_POLL_MS, totalMs - elapsedMs))
-    wake = wakeFor(baseline, snapshotWork())
+    wake = wakeFor(baseline, snapshotWork(pendingQueue))
     if (wake !== undefined) break
   }
 
@@ -190,7 +193,8 @@ export const runSleep = Effect.fn("superagent.sleep")(function* (
   if (wake.flush) {
     const ctx = deps.ctx
     const flush =
-      deps.flush ?? (ctx === undefined ? undefined : () => flushPending(ctx, { delivery: "steer" }))
+      deps.flush ??
+      (ctx === undefined ? undefined : () => flushPending(ctx, { delivery: "steer", dirKey: callerDirKey }))
     if (flush === undefined) {
       yield* Effect.logWarning("superagent sleep woke on pending triggers without a host context to flush")
     } else {

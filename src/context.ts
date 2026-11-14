@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import { directorySummary } from "./dirs.js"
 import { ROUTER_PROMPT } from "./prompts.js"
 import { registerRecall } from "./recall.js"
-import { store, type WorkerRecord } from "./state.js"
+import { dirKeyForWorker, dirState, effectiveDirKey, isRouterSession, store, type WorkerRecord } from "./state.js"
 import { activeTicketSummary, ticketStats } from "./ticket.js"
 import { displayWidth, ROUTER_TOOLS } from "./tools.js"
 
@@ -39,9 +39,11 @@ function workerLine(worker: WorkerRecord): string {
  * `ticket_list` fetch the bodies on demand. The whole block is capped so a
  * long summary cannot crowd out the router prompt.
  */
-export function buildRecallInjection(threadID: string | undefined): string {
+export function buildRecallInjection(threadID: string | undefined, dirKey?: string): string {
   if (threadID === undefined) return ""
-  const active = activeTicketSummary(threadID, 3)
+  // 分区内的召回：B 目录的 worker 不该出现在 A 目录 Router 的上下文里。
+  const scope = effectiveDirKey(dirKey)
+  const active = activeTicketSummary(threadID, 3, scope)
   const lines: Array<string> = ["## 链式召回（只给 ID 与摘要，正文按需取）"]
   if (active === "") {
     lines.push("进行中工单（当前 thread）：无")
@@ -50,6 +52,7 @@ export function buildRecallInjection(threadID: string | undefined): string {
     for (const entry of active.split("; ")) lines.push(clip(`- ${entry}`, RECALL_LINE_MAX))
   }
   const workers = [...store.workers.values()]
+    .filter((worker) => dirKeyForWorker(worker) === scope)
     .filter((worker) => worker.threadID === threadID || worker.threads.includes(threadID))
     .sort((left, right) => right.createdAt - left.createdAt)
     .slice(0, RECALL_WORKER_LIMIT)
@@ -77,24 +80,34 @@ export function buildRecallInjection(threadID: string | undefined): string {
  * ticket/recall part to the batch's target thread; `pending` is the queue size
  * *after* the delivered batch so the number matches what is still waiting.
  */
-export function buildStatusInjection(threadID: string | undefined, pending: number = store.pending.length): string {
-  const stats = ticketStats()
-  const active = activeTicketSummary(threadID)
+export function buildStatusInjection(
+  threadID: string | undefined,
+  pending: number = store.pending.length,
+  dirKey?: string,
+): string {
+  // 每个分区一行状态：工单计数、trigger 计数、召回都只读本分区。
+  // `dirKey === undefined` 落在默认分区，开关关闭时与阶段 2a 逐字节一致。
+  const scope = effectiveDirKey(dirKey)
+  const stats = ticketStats(scope)
+  const active = activeTicketSummary(threadID, 3, scope)
   const tickets = `tickets=open${stats.open}/in_progress${stats.inProgress}/blocked${stats.blocked}/closed${stats.closed}`
   const focus = active === "" ? "" : `\n进行中工单（当前 thread）：${active}`
-  const recall = buildRecallInjection(threadID)
+  const recall = buildRecallInjection(threadID, scope)
   const chain = recall === "" ? "" : `\n\n${recall}`
-  return `Status: workers=${store.workers.size} pending=${pending} triggers=${store.triggerTotal} ${tickets}. ${directorySummary()}.${focus}${chain}`
+  const workers = [...store.workers.values()].filter((worker) => dirKeyForWorker(worker) === scope).length
+  const triggers = dirState(store, scope).triggerTotal
+  return `Status: workers=${workers} pending=${pending} triggers=${triggers} ${tickets}. ${directorySummary()}.${focus}${chain}`
 }
 
 /**
- * Narrow one request's toolset by session role. The Router keeps only the
- * catalog tools; a tracked Worker loses every router-only tool (dispatch,
- * sleep, tickets, recall, abort_session), so those tools are not listed to
- * the worker model at all. User sessions are left untouched.
+ * Narrow one request's toolset by session role. The Router (of any directory
+ * partition) keeps only the catalog tools; a tracked Worker loses every
+ * router-only tool (dispatch, sleep, tickets, recall, abort_session), so those
+ * tools are not listed to the worker model at all. User sessions are left
+ * untouched.
  */
 export function filterSessionTools(sessionID: string, tools: Record<string, unknown>): void {
-  const router = store.routerID !== undefined && sessionID === store.routerID
+  const router = isRouterSession(sessionID)
   const worker = store.workers.has(sessionID)
   if (!router && !worker) return
   for (const name of Object.keys(tools)) {
@@ -116,7 +129,7 @@ export function filterSessionTools(sessionID: string, tools: Record<string, unkn
 export const registerContext = Effect.fn("superagent.registerContext")(function* (ctx: Plugin.Context) {
   yield* ctx.session.hook("context", (event) =>
     Effect.sync(() => {
-      const router = store.routerID !== undefined && event.sessionID === store.routerID
+      const router = isRouterSession(event.sessionID)
       if (!router && !store.workers.has(event.sessionID)) return
       filterSessionTools(event.sessionID, event.tools)
       if (!router) return

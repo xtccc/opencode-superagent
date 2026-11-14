@@ -21,11 +21,24 @@ export const Definition = Rpc.define({
   id: "opencode.superagent",
   methods: {
     router: {
-      input: Schema.toStandardSchemaV1(Schema.Struct({})),
+      // Optional `directory` (stage 3): the TUI opens the Router of the session's
+      // own directory under `perDirectoryRouter`; with the flag off it falls back
+      // to the single default Router, so old callers are unaffected.
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          directory: Schema.optionalKey(Schema.String),
+        }),
+      ),
       output: Schema.toStandardSchemaV1(Schema.Struct({ sessionID: Schema.String })),
     },
     status: {
-      input: Schema.toStandardSchemaV1(Schema.Struct({})),
+      // No `directory` = process-wide aggregate; with `directory` = that
+      // directory's partition only. See `src/status.ts`.
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          directory: Schema.optionalKey(Schema.String),
+        }),
+      ),
       output: Schema.toStandardSchemaV1(
         Schema.Struct({
           // Optional so an older server that predates the version notice still
@@ -41,6 +54,22 @@ export const Definition = Rpc.define({
               state: Schema.Literals(["running", "idle", "failed", "done", "aborted"]),
             }),
           ),
+          // Stage 3 additions. Both are optional so the pre-3 shape still
+          // validates (older clients keep working against a new server).
+          partitions: Schema.optionalKey(
+            Schema.Array(
+              Schema.Struct({
+                dirKey: Schema.String,
+                directory: Schema.optionalKey(Schema.String),
+                router: Schema.optionalKey(Schema.String),
+                pending: Schema.Number,
+                workers: Schema.Number,
+                running: Schema.Number,
+              }),
+            ),
+          ),
+          dirKey: Schema.optionalKey(Schema.String),
+          directory: Schema.optionalKey(Schema.String),
         }),
       ),
     },
@@ -50,6 +79,9 @@ export const Definition = Rpc.define({
           threadID: Schema.optionalKey(Schema.String),
           status: Schema.optionalKey(Schema.Literals(TICKET_STATES)),
           limit: Schema.optionalKey(Schema.Number),
+          // Stage 3: scope the list to one directory's partition. Omitted =
+          // process-wide list, exactly the pre-3 behaviour.
+          directory: Schema.optionalKey(Schema.String),
         }),
       ),
       output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),

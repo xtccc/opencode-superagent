@@ -1,12 +1,29 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import type { Session } from "@opencode/schema/session"
 import { DateTime, Effect, type Schema } from "effect"
+import {
+  DEFAULT_DIR_KEY,
+  canonicalDirectory,
+  dirKeyFor,
+  dirKeyOf,
+  effectiveDirKey,
+  rememberDirDirectory,
+  resetDirDirectories,
+} from "./dirs.js"
 import { buildReport, lastAssistantText, reportSummary, saveReport } from "./report.js"
+import { dirScopedKey, scanDirScoped, scanEntries } from "./scope.js"
+import { perDirectoryRouterEnabled } from "./settings.js"
 import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
 import { WORKER_STATES, workers, type WorkerRecord, type WorkerState } from "./worker-state.js"
 
 export type { WorkerRecord, WorkerState } from "./worker-state.js"
+
+/**
+ * 分区 key 的两个纯函数定义在 `dirs.ts`（工单层也要用，而工单层不能 import 本模块）。
+ * 这里重新导出，旧调用点 `from "./state.js"` 的写法继续成立。
+ */
+export { dirKeyFor, effectiveDirKey }
 
 export interface ThreadRecord {
   readonly threadID: string
@@ -71,16 +88,36 @@ function normalizeTrigger(input: TriggerInput): TriggerInput {
   }
 }
 
-function schedulePersist(record: TriggerRecord): void {
+function schedulePersist(record: TriggerRecord, dirKey: string): void {
   const host = persistHost
   if (host === undefined) return
   const snapshot: TriggerRecord = { ...record }
-  Effect.runFork(persistTrigger(host, snapshot).pipe(Effect.catchCause(() => Effect.void)))
+  const scope = effectiveDirKey(dirKey)
+  Effect.runFork(persistTrigger(host, snapshot, scope).pipe(Effect.catchCause(() => Effect.void)))
 }
 
-function rememberQueued(input: TriggerInput): void {
+/** 某个分区的 trigger 历史表（开关关闭时恒为默认分区的那张）。 */
+function triggerStore(dirKey: string): DirState {
+  return dirState(store, effectiveDirKey(dirKey))
+}
+
+/**
+ * 按 id 在所有已加载的分区里找 trigger 记录（连同它所属的分区）。
+ * trigger id 在分区内唯一；跨分区同名只可能来自同一线程被两个目录复用，
+ * 此时返回第一个命中的分区，反查补链不会因此丢记录。
+ */
+function findTrigger(id: string): { record: TriggerRecord; dirKey: string } | undefined {
+  for (const [dirKey, dir] of store.dirs) {
+    const record = dir.triggers.get(id)
+    if (record !== undefined) return { record, dirKey }
+  }
+  return undefined
+}
+
+function rememberQueued(input: TriggerInput, dirKey: string): void {
+  const partition = triggerStore(dirKey)
   const id = input.id ?? triggerIdFor(input)
-  const delivered = store.triggers.get(id)
+  const delivered = partition.triggers.get(id)
   const record: TriggerRecord = {
     id,
     source: input.source,
@@ -92,19 +129,21 @@ function rememberQueued(input: TriggerInput): void {
     ...(delivered !== undefined && delivered.route !== undefined ? { route: delivered.route } : {}),
     ...(delivered !== undefined && delivered.sessionID !== undefined ? { sessionID: delivered.sessionID } : {}),
   }
-  if (!store.triggers.has(id)) store.triggerTotal += 1
-  store.triggers.set(id, record)
-  schedulePersist(record)
+  if (!partition.triggers.has(id)) partition.triggerTotal += 1
+  partition.triggers.set(id, record)
+  schedulePersist(record, partition.dirKey)
 }
 
-function markFlushed(removed: Array<PendingTrigger>): void {
+function markFlushed(removed: Array<PendingTrigger>, dirKey: string): void {
+  const partition = triggerStore(dirKey)
+  const routerID = routerIDForDir(partition.dirKey)
   for (const item of removed) {
     const id = item.trigger.id ?? triggerIdFor(item.trigger)
-    const record = store.triggers.get(id)
+    const record = partition.triggers.get(id)
     if (record === undefined) continue
     record.route = "router"
-    if (store.routerID !== undefined) record.sessionID = store.routerID
-    schedulePersist(record)
+    if (routerID !== undefined) record.sessionID = routerID
+    schedulePersist(record, partition.dirKey)
   }
 }
 
@@ -113,16 +152,27 @@ function markFlushed(removed: Array<PendingTrigger>): void {
  * `router.ts` keep using plain `push`/`splice`; interception here writes
  * the memory map synchronously and persists to KV in the background, so
  * no caller changes are needed.
+ *
+ * 每个分区一份队列，实例自己记得 `dirKey`：历史记录里的 `sessionID` 必须是
+ * **该分区**的 Router，否则跨目录投递看起来像是同一个 Router 处理的。
  */
 export class PendingQueue extends Array<PendingTrigger> {
+  /** 所属分区。`Array` 的 species 构造会传数字长度，非字符串一律回落到默认分区。 */
+  readonly dirKey: string
+
+  constructor(dirKey: unknown = DEFAULT_DIR_KEY) {
+    super()
+    this.dirKey = typeof dirKey === "string" ? dirKey : DEFAULT_DIR_KEY
+  }
+
   override push(...items: Array<PendingTrigger>): number {
     const normalized = items.map((item) => ({ trigger: normalizeTrigger(item.trigger), arrivedAt: item.arrivedAt }))
-    for (const item of normalized) rememberQueued(item.trigger)
+    for (const item of normalized) rememberQueued(item.trigger, this.dirKey)
     return super.push(...normalized)
   }
   override splice(start: number, deleteCount?: number, ...items: Array<PendingTrigger>): Array<PendingTrigger> {
     const removed = deleteCount === undefined ? super.splice(start) : super.splice(start, deleteCount, ...items)
-    if (removed.length > 0) markFlushed(removed)
+    if (removed.length > 0) markFlushed(removed, this.dirKey)
     return removed
   }
 }
@@ -132,13 +182,21 @@ export class PendingQueue extends Array<PendingTrigger> {
  * pending queue). The text comes from the admitted prompt, so it carries
  * the same truncation as the worker-visible format; queued triggers keep
  * their full text via `rememberQueued`.
+ *
+ * `dirKey` is the partition of the worker that received it: a direct trigger
+ * recorded from worker A's prompt must never appear in directory B's history.
  */
-export function upsertDirectTrigger(input: DirectTriggerInput, sessionID: string): TriggerRecord {
-  const existing = store.triggers.get(input.id)
+export function upsertDirectTrigger(
+  input: DirectTriggerInput,
+  sessionID: string,
+  dirKey: string = DEFAULT_DIR_KEY,
+): TriggerRecord {
+  const partition = triggerStore(dirKey)
+  const existing = partition.triggers.get(input.id)
   if (existing !== undefined) {
     if (existing.route === undefined) existing.route = "worker"
     if (existing.sessionID === undefined) existing.sessionID = sessionID
-    schedulePersist(existing)
+    schedulePersist(existing, partition.dirKey)
     return existing
   }
   const record: TriggerRecord = {
@@ -151,22 +209,331 @@ export function upsertDirectTrigger(input: DirectTriggerInput, sessionID: string
     route: "worker",
     sessionID,
   }
-  store.triggers.set(input.id, record)
-  store.triggerTotal += 1
-  schedulePersist(record)
+  partition.triggers.set(input.id, record)
+  partition.triggerTotal += 1
+  schedulePersist(record, partition.dirKey)
   return record
 }
 
+/**
+ * 单个目录的状态切片：一个分区拥有自己的 Router、未投递队列和 thread 亲和。
+ * 开关关闭时这张表里永远只有 `DEFAULT_DIR_KEY` 一条，读写行为与改造前完全一致。
+ */
+export interface DirState {
+  /** 分区 key。分区自己知道落在哪一格，遍历/索引时不必反查。 */
+  readonly dirKey: string
+  /**
+   * 该分区对应的绝对目录。创建分区的 Router 会话时用它作为
+   * `location.directory`；默认分区或目录未知时为 `undefined`。
+   */
+  directory?: string
+  routerID: string | undefined
+  routerBusy: boolean
+  readonly threads: Map<string, Array<string>>
+  /**
+   * 未投递队列。**必须**是 `PendingQueue`：它的 `push`/`splice` 拦截负责 trigger
+   * 历史的同步与异步落盘，普通 Array 会静默丢掉这段行为。类型写成 Array 是为了
+   * 让 `adoptLegacyStore` 保留旧 store 里那个普通数组的对象身份（升级不换队列）。
+   */
+  readonly pending: Array<PendingTrigger>
+  /**
+   * 目录内的 trigger 历史（阶段 2b 起按分区隔离）。`PendingQueue` 的 push/splice
+   * 与 `upsertDirectTrigger` 都写这里；读写它的调用方必须自己带上分区。
+   */
+  readonly triggers: Map<string, TriggerRecord>
+  /**
+   * 该分区在 KV 里的 trigger 记录数（不是内存里保留的最近 200 条）。
+   * `status`/`buildStatusInjection` 读本分区的这个计数。
+   */
+  triggerTotal: number
+}
+
 export interface Store {
+  /**
+   * 「当前分区」视图的落点。阶段 2a 恒为 `DEFAULT_DIR_KEY`（运行期不改写）：
+   * 有目录感知的代码显式传 `dirKey`，不靠这个全局游标。
+   */
+  dirKey: string
+  /** 目录分区表，由 `dirState` 懒创建。 */
+  readonly dirs: Map<string, DirState>
+  // 以下字段是「当前分区」的视图（accessor），不是独立状态：所有既有调用点
+  // 继续写 `store.routerID` / `store.threads` / `store.pending` / `store.triggers`，
+  // 落点由 `dirState` 决定。分区的代码路径显式传 `dirKey`，不依赖这个游标。
   routerID: string | undefined
   routerBusy: boolean
   readonly workers: Map<string, WorkerRecord>
   readonly threads: Map<string, Array<string>>
   readonly pending: Array<PendingTrigger>
+  /** 「当前分区」的 trigger 历史视图（accessor，落点由 `dirState` 决定）。 */
   readonly triggers: Map<string, TriggerRecord>
+  /** 「当前分区」的 trigger 记录数（accessor）。 */
   triggerTotal: number
   /** Pending triggers dropped as stale at hydrate (see the router replay TTL); surfaced by `status`. */
   pendingDropped: number
+}
+
+/**
+ * 一个空的分区。`pending` 必须是 `PendingQueue`：它的 `push`/`splice` 拦截负责
+ * trigger 历史的同步与异步落盘，普通 Array 会静默丢掉这段行为。
+ */
+export function createDirState(dirKey: string = DEFAULT_DIR_KEY, directory?: string): DirState {
+  return {
+    dirKey,
+    ...(directory === undefined ? {} : { directory }),
+    routerID: undefined,
+    routerBusy: false,
+    threads: new Map(),
+    pending: new PendingQueue(dirKey),
+    triggers: new Map<string, TriggerRecord>(),
+    triggerTotal: 0,
+  }
+}
+
+/**
+ * 取（必要时创建）某个目录的分区。`key` 缺省是当前分区，因此默认开关下
+ * 所有既有读写都落在同一张图上，`store.dirs.size` 恒为 1。
+ *
+ * `directory` 只在创建时（或原分区还不知道自己的目录时）写入：它是运行期
+ * 提示，不是身份，分区身份始终是 `dirKey`。
+ */
+export function dirState(target: Store, key?: string, directory?: string): DirState {
+  const dirKey = key ?? target.dirKey ?? DEFAULT_DIR_KEY
+  const existing = target.dirs.get(dirKey)
+  if (existing !== undefined) {
+    if (directory !== undefined && existing.directory === undefined) existing.directory = directory
+    return existing
+  }
+  const created = createDirState(dirKey, directory)
+  target.dirs.set(dirKey, created)
+  if (directory !== undefined) rememberDirDirectory(dirKey, directory)
+  return created
+}
+
+// ── directory partitioning helpers（阶段 2a：每目录一个 Router） ──────────────
+
+/** 某个 worker 记录所属的分区（开关关闭时恒为默认分区）。 */
+export function dirKeyForWorker(worker: { readonly directory?: string } | undefined): string {
+  return dirKeyFor(worker?.directory)
+}
+
+/** 取（必要时创建）某个目录的分区，并把目录登记到分区上。 */
+export function dirStateForDirectory(directory: string | undefined): DirState {
+  const canonical = directory === undefined ? undefined : canonicalDirectory(directory)
+  const dir = dirState(store, dirKeyFor(directory), canonical)
+  if (canonical !== undefined) rememberDirDirectory(dir.dirKey, canonical)
+  return dir
+}
+
+/** 某个分区的 Router id（未创建时 `undefined`）。 */
+export function routerIDForDir(dirKey: string): string | undefined {
+  return store.dirs.get(dirKey)?.routerID
+}
+
+/** 所有已存在 Router 的分区（`status`/`session-meta` 用）。 */
+export function routerPartitions(): Array<{ dirKey: string; routerID: string }> {
+  const out: Array<{ dirKey: string; routerID: string }> = []
+  for (const [dirKey, dir] of store.dirs) {
+    if (dir.routerID !== undefined) out.push({ dirKey, routerID: dir.routerID })
+  }
+  return out
+}
+
+/**
+ * Router 会话 → 分区的 O(1) 反查索引。`routerID` 的 accessor 每次赋值都会维护
+ * 它（包括 hydrate 与测试直接赋值），miss 时退回一次分区扫描并补登记：旧版
+ * store、被 adopt 的 legacy store 或重复加载的插件副本都不会因此丢路由。
+ */
+const ROUTER_DIRS_KEY = Symbol.for("opencode-superagent.router-dirs.v1")
+
+type GlobalWithRouterDirs = typeof globalThis & { [ROUTER_DIRS_KEY]?: Map<string, string> }
+
+const routerDirGlobals = globalThis as GlobalWithRouterDirs
+
+const routerDirs: Map<string, string> = routerDirGlobals[ROUTER_DIRS_KEY] ?? new Map<string, string>()
+
+routerDirGlobals[ROUTER_DIRS_KEY] = routerDirs
+
+/** 登记 routerID → dirKey，并清掉该分区上已被替换的旧 id。 */
+function indexRouter(routerID: string, dirKey: string): void {
+  for (const [known, key] of routerDirs) {
+    if (key === dirKey && known !== routerID) routerDirs.delete(known)
+  }
+  routerDirs.set(routerID, dirKey)
+}
+
+/** 分区丢掉 Router 时清掉索引（否则被删会话的事件仍会被当成 Router 事件）。 */
+function unindexRouter(dirKey: string): void {
+  for (const [known, key] of routerDirs) {
+    if (key === dirKey) routerDirs.delete(known)
+  }
+}
+
+/** 把某个分区的 Router 设为 `routerID`（`undefined` = 忘记它），同时维护反查索引。 */
+export function rememberRouter(dirKey: string, routerID: string | undefined): void {
+  const dir = dirState(store, dirKey)
+  dir.routerID = routerID
+  if (routerID === undefined) unindexRouter(dirKey)
+  else indexRouter(routerID, dirKey)
+}
+
+/** Router 会话所属的分区；不是 Router 返回 `undefined`。 */
+export function dirKeyForRouter(sessionID: string | undefined): string | undefined {
+  if (sessionID === undefined) return undefined
+  const indexed = routerDirs.get(sessionID)
+  if (indexed !== undefined) return indexed
+  for (const [dirKey, dir] of store.dirs) {
+    if (dir.routerID === sessionID) {
+      routerDirs.set(sessionID, dirKey)
+      return dirKey
+    }
+  }
+  return undefined
+}
+
+/**
+ * 该会话是不是（当前配置下的）Router。开关关闭时只有默认分区的 Router 算数，
+ * 这样升级期间残留的非默认分区绝不可能被当成 Router 而拿到 router-only 工具。
+ */
+export function isRouterSession(sessionID: string | undefined): boolean {
+  const dirKey = dirKeyForRouter(sessionID)
+  if (dirKey === undefined) return false
+  return perDirectoryRouterEnabled() || dirKey === DEFAULT_DIR_KEY
+}
+
+/** 所有分区的未投递 trigger 总数（`status`/RPC 用；开关关闭时等于旧行为）。 */
+export function totalPending(): number {
+  if (!perDirectoryRouterEnabled()) return store.pending.length
+  let total = 0
+  for (const dir of store.dirs.values()) total += dir.pending.length
+  return total
+}
+
+/**
+ * 测试用：回到「只有默认分区、且默认分区是空的」状态，并清掉 Router 反查索引。
+ * 单纯 `store.dirs.delete(key)` 会留下索引里的脏映射，后续用例就会把一个已
+ * 不存在的 Router 当成真的。
+ */
+export function resetPartitions(): void {
+  for (const key of [...store.dirs.keys()]) {
+    if (key !== DEFAULT_DIR_KEY) store.dirs.delete(key)
+  }
+  const def = dirState(store, DEFAULT_DIR_KEY)
+  def.routerID = undefined
+  def.routerBusy = false
+  def.directory = undefined
+  def.threads.clear()
+  // 直接截断（不走 `splice`）：清场不应写 trigger 历史。
+  def.pending.length = 0
+  def.triggers.clear()
+  def.triggerTotal = 0
+  routerDirs.clear()
+  resetDirDirectories()
+}
+
+/**
+ * 把扁平字段接到「当前分区」上。用 accessor 而不是让每个调用点改成
+ * `dirState(store).x`：`state.ts` 之外有 ~40 处 `store.routerID` /
+ * `store.threads` / `store.pending` / `store.triggers` 读写，逐个改写既容易漏，
+ * 也把阶段 2 的改动面放大。accessor 让旧写法继续成立，同时把真正的存储收敛到一处
+ * （也保证测试里 `store.triggers.clear()` 清的仍是默认分区那张表）。
+ */
+function bindDirPartition(target: Store): void {
+  Object.defineProperties(target, {
+    routerID: {
+      configurable: true,
+      enumerable: true,
+      get: () => dirState(target).routerID,
+      set: (value: string | undefined) => {
+        const dir = dirState(target)
+        dir.routerID = value
+        if (value === undefined) unindexRouter(dir.dirKey)
+        else indexRouter(value, dir.dirKey)
+      },
+    },
+    routerBusy: {
+      configurable: true,
+      enumerable: true,
+      get: () => dirState(target).routerBusy,
+      set: (value: boolean) => {
+        dirState(target).routerBusy = value
+      },
+    },
+    threads: {
+      configurable: true,
+      enumerable: true,
+      get: () => dirState(target).threads,
+    },
+    pending: {
+      configurable: true,
+      enumerable: true,
+      get: () => dirState(target).pending,
+    },
+    triggers: {
+      configurable: true,
+      enumerable: true,
+      get: () => dirState(target).triggers,
+    },
+    triggerTotal: {
+      configurable: true,
+      enumerable: true,
+      get: () => dirState(target).triggerTotal,
+      set: (value: number) => {
+        dirState(target).triggerTotal = value
+      },
+    },
+  })
+}
+
+/**
+ * 把一个由旧版插件创建的 store 迁移到分区结构：旧 store 的扁平字段（以及它
+ * 可能已经写进去的 router/线程/队列）原样搬进默认分区，再重新绑定 accessor。
+ * 跨版本共享 store 实际上很罕见（旧版没有同一个 `Symbol.for`），但升级时如果
+ * 发生了，绝不能让 Router id 或未投递队列凭空消失。
+ */
+export function adoptLegacyStore(target: Store): void {
+  // 先读旧值：`bindDirPartition` 会把它们换成 accessor，之后读到的就是新分区的空表。
+  const previousTriggers: unknown = (target as { triggers?: unknown }).triggers
+  const previousTotal: unknown = (target as { triggerTotal?: unknown }).triggerTotal
+  if (!(target.dirs instanceof Map)) {
+    const legacy = target as Store & { dirs?: Map<string, DirState>; dirKey?: string }
+    const flat: DirState = {
+      dirKey: DEFAULT_DIR_KEY,
+      routerID: target.routerID,
+      routerBusy: target.routerBusy === true,
+      threads: target.threads instanceof Map ? target.threads : new Map<string, Array<string>>(),
+      pending: Array.isArray(target.pending) ? target.pending : new PendingQueue(DEFAULT_DIR_KEY),
+      triggers: previousTriggers instanceof Map ? (previousTriggers as Map<string, TriggerRecord>) : new Map(),
+      triggerTotal: typeof previousTotal === "number" ? previousTotal : 0,
+    }
+    const dirs = new Map<string, DirState>()
+    dirs.set(DEFAULT_DIR_KEY, flat)
+    legacy.dirs = dirs
+    legacy.dirKey = DEFAULT_DIR_KEY
+  }
+  if (typeof target.dirKey !== "string" || target.dirKey === "") target.dirKey = DEFAULT_DIR_KEY
+  if (!target.dirs.has(target.dirKey)) target.dirs.set(target.dirKey, createDirState(target.dirKey))
+  // A store created by an intermediate copy has `dirs` but no per-partition
+  // trigger history: adopt its flat trigger map into the default partition (the
+  // one a pre-2b copy wrote to) and default the counter, so nothing is dropped
+  // and later arithmetic never yields NaN.
+  for (const dir of target.dirs.values()) {
+    if (!(dir.triggers instanceof Map)) {
+      const adopt =
+        dir.dirKey === DEFAULT_DIR_KEY && previousTriggers instanceof Map
+          ? (previousTriggers as Map<string, TriggerRecord>)
+          : new Map<string, TriggerRecord>()
+      ;(dir as { triggers: Map<string, TriggerRecord> }).triggers = adopt
+    }
+    if (typeof dir.triggerTotal !== "number") {
+      dir.triggerTotal = dir.dirKey === DEFAULT_DIR_KEY && typeof previousTotal === "number" ? previousTotal : 0
+    }
+  }
+  bindDirPartition(target)
+  // 被 adopt 的 store 是「赋值已经发生过」的旧对象，accessor 的 setter 没机会
+  // 维护反向索引：这里补一次，否则 dirKeyForRouter 只能走兜底扫描。
+  for (const [dirKey, dir] of target.dirs) {
+    if (dir.routerID !== undefined) indexRouter(dir.routerID, dirKey)
+  }
 }
 
 /**
@@ -187,22 +554,27 @@ type GlobalWithStore = typeof globalThis & { [STORE_KEY]?: Store }
 const globals = globalThis as GlobalWithStore
 
 function createStore(): Store {
-  return {
-    routerID: undefined,
-    routerBusy: false,
+  const dirs = new Map<string, DirState>()
+  dirs.set(DEFAULT_DIR_KEY, createDirState(DEFAULT_DIR_KEY))
+  // `routerID`/`routerBusy`/`threads`/`pending`/`triggers`/`triggerTotal` 由
+  // `bindDirPartition` 装成 accessor，所以这里先只构造其余字段，再补上分区视图。
+  const created = {
+    dirKey: DEFAULT_DIR_KEY,
+    dirs,
     workers,
-    threads: new Map(),
-    pending: new PendingQueue(),
-    triggers: new Map(),
-    triggerTotal: 0,
     pendingDropped: 0,
-  }
+  } as unknown as Store
+  bindDirPartition(created)
+  return created
 }
 
 export const store: Store = globals[STORE_KEY] ?? createStore()
 // A store created by an older copy of this plugin may predate a field added
 // here; default it once so later arithmetic never yields `NaN`.
 if (typeof store.pendingDropped !== "number") store.pendingDropped = 0
+// A store shared with an older copy has no `dirs`; fold its flat fields into the
+// default partition before anything else touches it.
+adoptLegacyStore(store)
 globals[STORE_KEY] = store
 
 export const ROUTER_KEY = "router"
@@ -210,6 +582,55 @@ export const WORKER_PREFIX = "worker:"
 export const THREAD_PREFIX = "thread:"
 export const TRIGGER_PREFIX = "trigger:"
 
+/**
+ * 非默认目录的 KV 命名空间（`dir:<dirKey>:`）与扫描工具定义在 `scope.ts`：
+ * 工单层 `ticket.ts` 也要用同一份实现，而它不能 import 本模块。
+ *
+ * **兼容策略**：`router` / `worker:` / `thread:` / `trigger:` / `pending:` /
+ * `ticket…` 这些 key 在默认分区全部保持原样，hydrate 也扫描这些旧前缀——
+ * 升级后的进程因此读到与升级前完全相同的 KV，不存在「状态孤岛」。
+ * 只有当 `perDirectoryRouter` 打开**且**分区不是默认目录时，才在前面加
+ * `dir:<dirKey>:`；默认分区永远走旧格式，避免把已有数据搬来搬去。
+ *
+ * 阶段 2a 分区 Router / thread 亲和 / pending 队列；阶段 2b 追加 trigger 历史
+ * 与工单（worker 记录仍挂在进程级表上，靠记录里的 `directory` 归位）。
+ */
+export { DIR_SCOPE_PREFIX, dirScopedKey } from "./scope.js"
+export type { ScannedEntry, ScopedEntry } from "./scope.js"
+export { scanDirScoped, scanEntries }
+
+/**
+ * 从一个分区的 thread 亲和表里摘掉 worker，并把变化写回该分区的 KV key。
+ * 派发回滚与 abort 共用：两侧各写一份已经漂移过，跨目录时尤其危险。
+ */
+export const detachWorkerThreads = Effect.fn("superagent.detachWorkerThreads")(function* (
+  ctx: Plugin.Context,
+  sessionID: string,
+  threadIDs: ReadonlyArray<string>,
+  dirKey: string,
+) {
+  const threads = dirState(store, dirKey).threads
+  const detached: Array<string> = []
+  for (const threadID of threadIDs) {
+    const current = threads.get(threadID)
+    if (current === undefined || !current.includes(sessionID)) continue
+    const next = current.filter((id) => id !== sessionID)
+    if (next.length === 0) {
+      threads.delete(threadID)
+      yield* ctx.storage.remove(dirScopedKey(threadKey(threadID), dirKey)).pipe(Effect.catch(() => Effect.void))
+    } else {
+      threads.set(threadID, next)
+      yield* ctx.storage
+        .set(dirScopedKey(threadKey(threadID), dirKey), encodeThread({ threadID, workers: next, updatedAt: Date.now() }))
+        .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
+    }
+    detached.push(threadID)
+  }
+  return detached
+})
+
+// 阶段 1：以下 key 构造器仍输出旧格式（默认分区），阶段 2 再把非默认分区接到
+// `dirScopedKey` 上；保持单一入口，避免读写两侧各改一半。
 const RECENT_TRIGGER_LIMIT = 200
 
 export const workerKey = (sessionID: string) => `${WORKER_PREFIX}${sessionID}`
@@ -225,6 +646,15 @@ export function isRunning(info: Session.Info): boolean {
   if (busy === undefined) return false
   const idle = info.time.idle
   return idle === undefined || DateTime.toEpochMillis(busy) > DateTime.toEpochMillis(idle)
+}
+
+/** A session's directory, tolerant of hosts/test doubles that omit `location`. */
+function sessionDirectory(info: unknown): string | undefined {
+  if (typeof info !== "object" || info === null) return undefined
+  const location = (info as { location?: unknown }).location
+  if (typeof location !== "object" || location === null) return undefined
+  const directory = (location as { directory?: unknown }).directory
+  return typeof directory === "string" ? directory : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -364,9 +794,13 @@ const persistWorker = Effect.fn("superagent.persistWorker")(function* (ctx: Plug
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist worker", { cause })))
 })
 
-const persistTrigger = Effect.fn("superagent.persistTrigger")(function* (ctx: Plugin.Context, record: TriggerRecord) {
+const persistTrigger = Effect.fn("superagent.persistTrigger")(function* (
+  ctx: Plugin.Context,
+  record: TriggerRecord,
+  dirKey: string = DEFAULT_DIR_KEY,
+) {
   yield* ctx.storage
-    .set(triggerKey(record.id), encodeTrigger(record))
+    .set(dirScopedKey(triggerKey(record.id), effectiveDirKey(dirKey)), encodeTrigger(record))
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist trigger", { cause })))
 })
 
@@ -467,6 +901,10 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
   persistHost = ctx
   const sessions = ctx.session
   const storage = ctx.storage
+  // 旧 KV 只有一套扁平 key：读回的 Router / thread 亲和一律归入默认目录。
+  // 分区读写（`dir:<dirKey>:`）留给阶段 2，因此这里永远显式指向默认分区，
+  // 而不是依赖 `store.dirKey`——升级时不会把状态写进一个空分区。
+  const defaultDir = dirState(store, DEFAULT_DIR_KEY)
   const storedRouter = yield* storage.get(ROUTER_KEY).pipe(Effect.catch(() => Effect.succeed(undefined)))
   if (typeof storedRouter === "string") {
     const info = yield* sessions.get({ sessionID: toSessionID(storedRouter) }).pipe(
@@ -476,8 +914,30 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
     if (info === undefined) {
       yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
     } else {
-      store.routerID = info.id
+      rememberRouter(DEFAULT_DIR_KEY, info.id)
+      const directory = sessionDirectory(info)
+      if (directory !== undefined) defaultDir.directory = directory
     }
+  }
+  // 非默认分区的 Router 存在 `dir:<dirKey>:router`。开关关闭时 scanDirScoped
+  // 返回空数组，旧路径一个字节都不变。
+  for (const entry of yield* scanDirScoped(ctx, "router")) {
+    if (entry.suffix !== "router") continue
+    const id = typeof entry.value === "string" ? entry.value : undefined
+    if (id === undefined) {
+      yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
+      continue
+    }
+    const info = yield* sessions.get({ sessionID: toSessionID(id) }).pipe(
+      Effect.map((session) => session as Session.Info | undefined),
+      Effect.catch(() => Effect.succeed(undefined)),
+    )
+    if (info === undefined) {
+      yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
+      continue
+    }
+    dirState(store, entry.dirKey, sessionDirectory(info))
+    rememberRouter(entry.dirKey, info.id)
   }
   const records: Array<WorkerRecord> = []
   let after: string | undefined
@@ -528,30 +988,64 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
         yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
         continue
       }
-      store.threads.set(record.threadID, alive)
+      defaultDir.threads.set(record.threadID, alive)
     }
     threadAfter = page.next
   } while (threadAfter !== undefined)
-  const collected: Array<TriggerRecord> = []
-  let triggerAfter: string | undefined
-  do {
-    const page = yield* storage
-      .scan({ prefix: TRIGGER_PREFIX, after: triggerAfter, limit: 100 })
-      .pipe(Effect.catch(() => Effect.succeed({ entries: [], next: undefined })))
-    for (const entry of page.entries) {
+  // 分区 thread 亲和（`dir:<dirKey>:thread:<threadID>`）：开关关闭时为空。
+  for (const entry of yield* scanDirScoped(ctx, THREAD_PREFIX)) {
+    const record = decodeThread(entry.value)
+    if (record === undefined) {
+      yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
+      continue
+    }
+    const alive = record.workers.filter((sessionID) => store.workers.has(sessionID))
+    if (alive.length === 0) {
+      yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
+      continue
+    }
+    dirState(store, entry.dirKey).threads.set(record.threadID, alive)
+  }
+  // 分区必须知道自己的目录，才能把该目录的 Router 会话创建在正确位置。
+  // worker 记录带 `directory`，这是重启后最可靠的目录来源（Router 会话可能
+  // 还没建过，或已被用户删除）。
+  if (perDirectoryRouterEnabled()) {
+    for (const worker of store.workers.values()) {
+      if (worker.directory === undefined) continue
+      dirState(store, dirKeyOf(worker.directory), canonicalDirectory(worker.directory))
+    }
+  }
+  // Trigger 历史按分区读回：旧前缀 `trigger:` 归默认分区，`dir:<k>:trigger:` 归
+  // 各自分区。开关关闭时 `scanDirScoped` 返回空数组，这段就退化成原来的单表读取。
+  const triggerGroups: Array<{
+    dirKey: string
+    entries: ReadonlyArray<{ key: string; value: Schema.Json | undefined }>
+  }> = [{ dirKey: DEFAULT_DIR_KEY, entries: yield* scanEntries(ctx, TRIGGER_PREFIX) }]
+  for (const entry of yield* scanDirScoped(ctx, TRIGGER_PREFIX)) {
+    triggerGroups.push({ dirKey: entry.dirKey, entries: [entry] })
+  }
+  for (const group of triggerGroups) {
+    const partition = dirState(store, group.dirKey)
+    const decoded: Array<TriggerRecord> = []
+    const seen = new Set<string>()
+    for (const entry of group.entries) {
       const record = decodeTrigger(entry.value)
       if (record === undefined) {
         yield* storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
         continue
       }
-      collected.push(record)
+      if (seen.has(record.id)) continue
+      seen.add(record.id)
+      decoded.push(record)
     }
-    triggerAfter = page.next
-  } while (triggerAfter !== undefined)
-  collected.sort((left, right) => right.createdAt - left.createdAt)
-  store.triggerTotal = collected.length
-  for (const record of collected.slice(0, RECENT_TRIGGER_LIMIT)) {
-    if (!store.triggers.has(record.id)) store.triggers.set(record.id, record)
+    decoded.sort((left, right) => right.createdAt - left.createdAt)
+    // 计数是整个 KV 里的记录数，内存只保留最近 200 条。
+    partition.triggerTotal = decoded.length
+    for (const record of decoded.slice(0, RECENT_TRIGGER_LIMIT)) {
+      // 不覆盖内存里已有的同 id 记录：内存可能比 KV 更新（上次写盘失败时
+      // 记录只是排进重试队列），重复 hydrate 不该把它回滚成旧值。
+      if (!partition.triggers.has(record.id)) partition.triggers.set(record.id, record)
+    }
   }
   // ── reference graph backfill (idempotent) ──────────────────────────────────
   // New records carry `threadID`/`triggerID`/`workerIDs`; legacy records only
@@ -560,13 +1054,15 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
   // records, so a second hydrate writes nothing and only a stat line is logged.
   let backfilledWorkers = 0
   let backfilledTriggers = 0
-  for (const [threadID, workerIDs] of store.threads) {
-    for (const sessionID of workerIDs) {
-      const worker = store.workers.get(sessionID)
-      if (worker === undefined || worker.threadID !== "") continue
-      worker.threadID = threadID
-      backfilledWorkers += 1
-      yield* persistWorker(ctx, worker)
+  for (const dir of store.dirs.values()) {
+    for (const [threadID, workerIDs] of dir.threads) {
+      for (const sessionID of workerIDs) {
+        const worker = store.workers.get(sessionID)
+        if (worker === undefined || worker.threadID !== "") continue
+        worker.threadID = threadID
+        backfilledWorkers += 1
+        yield* persistWorker(ctx, worker)
+      }
     }
   }
   for (const worker of store.workers.values()) {
@@ -577,25 +1073,28 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
     backfilledWorkers += 1
     yield* persistWorker(ctx, worker)
   }
+  for (const dir of store.dirs.values()) {
+    for (const trigger of dir.triggers.values()) {
+      const triggerID = trigger.id
+      for (const sessionID of trigger.workerIDs ?? []) {
+        const worker = store.workers.get(sessionID)
+        if (worker === undefined || worker.triggerID !== undefined) continue
+        worker.triggerID = triggerID
+        backfilledWorkers += 1
+        yield* persistWorker(ctx, worker)
+      }
+    }
+  }
   for (const worker of store.workers.values()) {
     const triggerID = worker.triggerID
     if (triggerID === undefined) continue
-    const trigger = store.triggers.get(triggerID)
-    if (trigger === undefined) continue
-    const ids = trigger.workerIDs ?? []
+    const found = findTrigger(triggerID)
+    if (found === undefined) continue
+    const ids = found.record.workerIDs ?? []
     if (ids.includes(worker.sessionID)) continue
-    trigger.workerIDs = [...ids, worker.sessionID]
+    found.record.workerIDs = [...ids, worker.sessionID]
     backfilledTriggers += 1
-    yield* persistTrigger(ctx, trigger)
-  }
-  for (const trigger of store.triggers.values()) {
-    for (const sessionID of trigger.workerIDs ?? []) {
-      const worker = store.workers.get(sessionID)
-      if (worker === undefined || worker.triggerID !== undefined) continue
-      worker.triggerID = trigger.id
-      backfilledWorkers += 1
-      yield* persistWorker(ctx, worker)
-    }
+    yield* persistTrigger(ctx, found.record, found.dirKey)
   }
   if (backfilledWorkers > 0 || backfilledTriggers > 0) {
     yield* Effect.logInfo("superagent reference graph backfilled", {
@@ -618,26 +1117,44 @@ export const saveTrigger = persistTrigger
  * completing the reverse edge of `WorkerRecord.triggerID`. Memory holds only
  * the newest triggers, so an older trigger is read from KV once; a missing
  * trigger is not invented. Repeating the call is a no-op.
+ *
+ * `dirKey` is the partition the trigger belongs to (the dispatcher's own): a
+ * trigger id is only meaningful inside one partition's history.
  */
 export const linkTriggerToWorker = Effect.fn("superagent.linkTriggerToWorker")(function* (
   ctx: Plugin.Context,
   triggerID: string,
   sessionID: string,
+  dirKey: string = DEFAULT_DIR_KEY,
 ) {
-  const existing = store.triggers.get(triggerID)
+  const partition = triggerStore(dirKey)
+  const existing = partition.triggers.get(triggerID)
   const record =
     existing ??
-    decodeTrigger(yield* ctx.storage.get(triggerKey(triggerID)).pipe(Effect.catch(() => Effect.succeed(undefined))))
+    decodeTrigger(
+      yield* ctx.storage
+        .get(dirScopedKey(triggerKey(triggerID), partition.dirKey))
+        .pipe(Effect.catch(() => Effect.succeed(undefined))),
+    )
   if (record === undefined) return false
   const workerIDs = record.workerIDs ?? []
   if (workerIDs.includes(sessionID)) return false
   record.workerIDs = [...workerIDs, sessionID]
-  yield* persistTrigger(ctx, record)
+  yield* persistTrigger(ctx, record, partition.dirKey)
   return true
 })
 
-export const saveThread = Effect.fn("superagent.saveThread")(function* (ctx: Plugin.Context, record: ThreadRecord) {
+/**
+ * Persist one partition's thread affinity record. `dirKey` is required in
+ * spirit (a thread id is only meaningful inside a partition): it defaults to
+ * the default partition so a pre-2b caller keeps writing the legacy key.
+ */
+export const saveThread = Effect.fn("superagent.saveThread")(function* (
+  ctx: Plugin.Context,
+  record: ThreadRecord,
+  dirKey: string = DEFAULT_DIR_KEY,
+) {
   yield* ctx.storage
-    .set(threadKey(record.threadID), encodeThread(record))
+    .set(dirScopedKey(threadKey(record.threadID), effectiveDirKey(dirKey)), encodeThread(record))
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
 })

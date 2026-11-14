@@ -5,9 +5,37 @@ import { createHash } from "node:crypto"
 import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport } from "./report.js"
 import { ensureRouter } from "./router.js"
 import { clipCodePoints } from "./format.js"
-import { saveWorker, store, toSessionID, type WorkerRecord } from "./state.js"
+import { perDirectoryRouterEnabled } from "./settings.js"
+import {
+  dirKeyForRouter,
+  dirKeyForWorker,
+  dirState,
+  isRouterSession,
+  saveWorker,
+  store,
+  toSessionID,
+  type WorkerRecord,
+} from "./state.js"
 import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
+
+/**
+ * Degradation warnings that must not spam: the same directory-less worker
+ * completion is retried on every duplicate delivery, and a warning per attempt
+ * would bury the one line the operator needs. Keyed by warning topic.
+ */
+const warnedOnce = new Set<string>()
+
+function warnOnce(key: string, message: string, fields: Record<string, unknown>): Effect.Effect<void> {
+  if (warnedOnce.has(key)) return Effect.void
+  warnedOnce.add(key)
+  return Effect.logWarning(message, fields)
+}
+
+/** Test hook: forget every one-shot degradation warning. */
+export function resetPartitionWarnings(): void {
+  warnedOnce.clear()
+}
 
 /**
  * Capture one finished report: the complete text goes to `report:<sessionID>`
@@ -227,7 +255,7 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
     report !== undefined && captured !== undefined
       ? [`${label} finished (${state}):`, reportSummary(captured), "---", reportNotice(captured)].join("\n")
       : `${label} finished (${state}) with no report (outcome: ${outcome}).${detail === undefined ? "" : ` Cause: ${detail}.`} Suggest: 可换模型重派.`
-  const routerID = yield* ensureRouter(ctx).pipe(
+  const routerID = yield* ensureRouterForWorker(ctx, worker).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("superagent cannot report without a router", { cause }).pipe(Effect.as(undefined)),
     ),
@@ -261,6 +289,39 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   }
 })
 
+/**
+ * The Router a worker's notification belongs to: the one of the worker's own
+ * directory partition.
+ *
+ * Degradation is explicit, never silent: with the switch on, a worker record
+ * without a directory has no partition of its own, so its completion falls
+ * back to the default partition and warns **once** — dropping it would lose
+ * the only signal the Router gets that the work finished. A partition whose
+ * router cannot be created keeps the `notified` marker released (the caller
+ * retries on the next delivery) instead of misrouting the report elsewhere.
+ */
+const ensureRouterForWorker = Effect.fn("superagent.ensureRouterForWorker")(function* (
+  ctx: Plugin.Context,
+  worker: WorkerRecord,
+) {
+  const dirKey = dirKeyForWorker(worker)
+  if (perDirectoryRouterEnabled() && worker.directory === undefined) {
+    yield* warnOnce("worker-without-directory", "superagent worker has no directory; reporting to the default router", {
+      sessionID: worker.sessionID,
+      dirKey,
+    })
+  }
+  return yield* ensureRouter(ctx, {
+    dirKey,
+    ...(worker.directory === undefined ? {} : { directory: worker.directory }),
+  })
+})
+
+/** Partition whose Router this session is, or `undefined` when it is not a router. */
+function routerPartitionOf(sessionID: string): string | undefined {
+  return isRouterSession(sessionID) ? dirKeyForRouter(sessionID) : undefined
+}
+
 export const registerWatcher = Effect.fn("superagent.registerWatcher")(function* (ctx: Plugin.Context) {
   yield* ctx.event
     .subscribe({
@@ -281,29 +342,33 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
           const execution = (event as { durable?: { seq?: number } }).durable?.seq
           switch (event.type) {
             case "session.execution.started": {
-              if (store.routerID !== undefined && event.data.sessionID === store.routerID) store.routerBusy = true
+              const routerDirKey = routerPartitionOf(sessionID)
+              if (routerDirKey !== undefined) dirState(store, routerDirKey).routerBusy = true
               yield* handleStarted(ctx, sessionID, execution)
               return
             }
             case "session.execution.succeeded": {
-              if (store.routerID !== undefined && event.data.sessionID === store.routerID) {
-                store.routerBusy = false
+              const routerDirKey = routerPartitionOf(sessionID)
+              if (routerDirKey !== undefined) {
+                dirState(store, routerDirKey).routerBusy = false
                 return
               }
               yield* handleEnded(ctx, sessionID, "done", undefined, execution)
               return
             }
             case "session.execution.failed": {
-              if (store.routerID !== undefined && event.data.sessionID === store.routerID) {
-                store.routerBusy = false
+              const routerDirKey = routerPartitionOf(sessionID)
+              if (routerDirKey !== undefined) {
+                dirState(store, routerDirKey).routerBusy = false
                 return
               }
               yield* handleEnded(ctx, sessionID, "failed", errorDetail(event.data as unknown), execution)
               return
             }
             case "session.execution.interrupted": {
-              if (store.routerID !== undefined && event.data.sessionID === store.routerID) {
-                store.routerBusy = false
+              const routerDirKey = routerPartitionOf(sessionID)
+              if (routerDirKey !== undefined) {
+                dirState(store, routerDirKey).routerBusy = false
                 return
               }
               yield* handleEnded(ctx, sessionID, "idle", interruptReason(event.data as unknown), execution)

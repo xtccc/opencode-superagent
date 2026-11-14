@@ -1,5 +1,8 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
+import { createHash } from "node:crypto"
+import { realpathSync } from "node:fs"
+import { perDirectoryRouterEnabled } from "./settings.js"
 
 /**
  * Router 自管目录记忆：单网关进程服务多目录，Router 从自然语言推断
@@ -92,6 +95,114 @@ export function normalizeDirectory(dir: string): string | undefined {
 export function directoryError(dir: string | undefined): string | undefined {
   if (dir === undefined || dir.trim() === "") return DIRECTORY_ERROR
   return normalizeDirectory(dir) === undefined ? DIRECTORY_ERROR : undefined
+}
+
+// ── directory partition keys（一目录一实例的地基） ────────────────────────────
+
+/**
+ * 没有目录（非法目录、相对路径、未指定）时使用的分区 key。固定字面量，
+ * 这样升级前后默认分区永远是同一个，旧 KV 状态可以原地归入其中。
+ */
+export const DEFAULT_DIR_KEY = "default"
+
+/** slug 段上限：可读性由 slug 负责，唯一性由后面的短 hash 负责。 */
+const DIR_KEY_SLUG_MAX = 40
+
+/**
+ * 目录 → 分区 key（`<slug>-<sha1[0:8]>`），只含 `[a-z0-9-]`：
+ * KV key 里不能出现 `/`、`:`、空白，也不能和 `dir:` / `worker:` 这类前缀分段混淆。
+ *
+ * - 先 `canonicalDirectory` 归一（`C:\x`、`C:/x`、`/c/x`、尾斜杠都收敛）；
+ * - 再尝试 `realpathSync`：符号链接与目标目录共用一个分区，大小写不敏感的
+ *   文件系统上（Windows / macOS）同一目录的不同写法也在此合并；失败（路径不存在、
+ *   权限不足、跨平台路径）就用 canonical 结果；
+ * - hash 覆盖**保留大小写**的路径，所以 `App` 与 `app` 在大小写敏感的文件系统上
+ *   不会共用一个分区（slug 本身仍小写，只做可读性）。
+ *
+ * 空串、`undefined`、相对路径等都归到 `DEFAULT_DIR_KEY`，调用方不需要自己判断。
+ */
+export function dirKeyOf(directory: string | undefined): string {
+  if (directory === undefined) return DEFAULT_DIR_KEY
+  const canonical = canonicalDirectory(directory)
+  if (canonical === undefined) return DEFAULT_DIR_KEY
+  const resolved = resolveRealPath(canonical)
+  const digest = createHash("sha1").update(resolved).digest("hex").slice(0, 8)
+  const key = `${slugFor(resolved)}-${digest}`
+  // Reverse index: a partition must be able to answer "which directory am I?"
+  // without it, a per-directory Router session could not be created *in* that
+  // directory (`location.directory` needs a real path, not a key).
+  rememberDirDirectory(key, resolved)
+  return key
+}
+
+/**
+ * 分区 key → 目录的进程内反向索引。
+ *
+ * 只服务运行期（创建该分区的 Router 会话要用真实路径）：不持久化，重启后由
+ * `dirKeyOf` 的再次命中、hydrate 到的 Router 会话 `location.directory` 或该分区
+ * worker 的 `directory` 重新填充。首次写入优先，避免符号链接与其目标互相覆盖。
+ */
+const dirKeyDirectories = new Map<string, string>()
+
+/** 登记（首次优先）某个分区的目录。 */
+export function rememberDirDirectory(dirKey: string, directory: string): void {
+  if (dirKey === DEFAULT_DIR_KEY) return
+  if (dirKeyDirectories.has(dirKey)) return
+  const canonical = canonicalDirectory(directory)
+  if (canonical === undefined) return
+  dirKeyDirectories.set(dirKey, canonical)
+}
+
+/** 某个分区对应的目录；未知返回 `undefined`。 */
+export function directoryOfDirKey(dirKey: string): string | undefined {
+  return dirKeyDirectories.get(dirKey)
+}
+
+/** 测试用：清空反向索引（分区表被清空时同步调用）。 */
+export function resetDirDirectories(): void {
+  dirKeyDirectories.clear()
+}
+
+/**
+ * 目录 → 分区 key，受 `perDirectoryRouter` 开关控制：关闭时一切归入默认分区，
+ * 所以阶段 1 的单实例行为不会因为某个调用点忘了判断开关而被绕开。
+ *
+ * 定义放在 `dirs.ts`（而不是 `state.ts`）是为了让**不能** import `state.ts` 的模块
+ * （工单层 `ticket.ts`，它与 `state.ts` 互相引用）用同一份实现，而不是各自复制
+ * 一份"开关关闭就落到默认分区"的判断。
+ */
+export function dirKeyFor(directory: string | undefined): string {
+  if (!perDirectoryRouterEnabled()) return DEFAULT_DIR_KEY
+  return dirKeyOf(directory)
+}
+
+/**
+ * 把「调用方给的分区」收敛成生效分区：开关关闭时一切归默认分区。
+ * 关闭意味着单实例，接受第二个 key 只会把状态写进一个没人读的命名空间。
+ */
+export function effectiveDirKey(dirKey: string | undefined): string {
+  if (!perDirectoryRouterEnabled()) return DEFAULT_DIR_KEY
+  return dirKey ?? DEFAULT_DIR_KEY
+}
+
+/** realpath 优先，失败或结果非法时退回规范形式（磁盘上不存在的目录很常见）。 */
+function resolveRealPath(canonical: string): string {
+  try {
+    return canonicalDirectory(realpathSync(canonical)) ?? canonical
+  } catch {
+    return canonical
+  }
+}
+
+/** 小写 slug：非 `[a-z0-9]` 连续段压成一个 `-`，空结果用 `dir` 兜底（如根目录）。 */
+function slugFor(path: string): string {
+  const slug = path
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, DIR_KEY_SLUG_MAX)
+    .replace(/-+$/g, "")
+  return slug === "" ? "dir" : slug
 }
 
 /** 目录 basename 小写即默认别名（`/opt/ai-gw` -> `ai-gw`，`C:\work\App` -> `app`）。 */

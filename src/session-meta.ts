@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import type { Session } from "@opencode/schema/session"
 import { Effect, Option, type Schema } from "effect"
-import { HYDRATE_CONCURRENCY, store, toSessionID } from "./state.js"
+import { HYDRATE_CONCURRENCY, routerPartitions, store, toSessionID } from "./state.js"
 
 /**
  * Session identity for the Super-agent prototype.
@@ -90,7 +90,10 @@ export function workerTitle(input: {
  */
 export const hydrateSessionMeta = Effect.fn("superagent.hydrateSessionMeta")(function* (ctx: Plugin.Context) {
   const targets: Array<{ sessionID: string; role: SuperagentRole }> = []
-  if (store.routerID !== undefined) targets.push({ sessionID: store.routerID, role: "router" })
+  // Every partition's Router is a router session: with the switch on there is
+  // one per directory, and a backfill that only knew `store.routerID` would
+  // leave the others without `metadata.superagent.role`.
+  for (const { routerID } of routerPartitions()) targets.push({ sessionID: routerID, role: "router" })
   for (const worker of store.workers.values()) targets.push({ sessionID: worker.sessionID, role: "worker" })
   // One `session.get` per owned session is unavoidable, but issuing them
   // back-to-back made startup O(n) round trips on top of `hydrate`'s own pass.

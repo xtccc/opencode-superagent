@@ -5,7 +5,83 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
-Nothing yet — see `0.5.1` below.
+### Added
+
+- **Groundwork for one-instance-per-directory (stage 1, no behaviour change).**
+  `dirKeyOf()` turns a directory into a KV-safe partition key (`<slug>-<sha1[0:8]>`,
+  canonicalized, symlink-resolved), `DEFAULT_DIR_KEY` names the no-directory
+  partition, `store.dirs` holds one `DirState` per partition with the flat
+  `routerID`/`routerBusy`/`threads`/`pending` fields as views on the active one,
+  and the new `perDirectoryRouter` option (default `false`, strict `true` only)
+  gates the `dir:<dirKey>:` KV namespace. With the option off there is exactly one
+  partition, every KV key keeps its old shape, legacy state hydrates into the
+  default partition, and `status` output is byte-identical to before. A gateway
+  restart is needed to load the new code (no hot reload).
+- **One Router per directory behind `perDirectoryRouter` (stage 2a).** With the
+  option on, each directory partition owns its Router session (created *in* that
+  directory, so its model/cwd resolution matches the workers it dispatches), its
+  undelivered-trigger queue, its `flush`/`router` semaphores and its thread
+  affinity. Worker terminal events, watchdog stalls and `sleep` wake-ups are
+  routed by the worker's `directory` → `dirKey` → that partition's Router, so one
+  directory's reports never reach another directory's Router; the idle hook
+  drains only the queue of the Router that went idle. Router identity checks
+  (`requireRouter`, `dispatch`, `abort_session`, `worker_prompt`, the context
+  tool filter, `session-meta` backfill, the RPC `status` view) now accept every
+  partition's Router, and `dispatch` refuses a ticket whose directory belongs to
+  another partition. Non-default partitions keep their Router, thread affinity
+  and pending triggers under `dir:<dirKey>:` (the default partition keeps the
+  legacy keys), and startup replays them back into their own partition. A worker
+  record without a `directory` degrades to the default partition with a
+  one-shot warning instead of losing its completion. New optional
+  `maxWorkersPerDirectory` caps live workers per directory (default: unlimited;
+  the slot is taken in the same synchronous block as the ticket claim). Still
+  process-wide and left for 2b: worker records, trigger history and tickets
+  (including `ticket_create`/`ticket_list` partitioning), and one threadID bound
+  to two directories. With the option off the behaviour and KV keys are
+  byte-identical to the previous release (`test/store-partition.test.ts`,
+  `test/per-directory-router.test.ts`).
+- **Tickets, trigger history and thread affinity partitioned by directory (stage
+  2b).** With `perDirectoryRouter` on, a ticket now belongs to the partition of
+  its own `directory` — the same rule `requireRouterFor` uses — and its KV keys
+  follow: the default partition keeps `ticket:<id>` / `ticketidx:*`, every other
+  partition uses `dir:<dirKey>:ticket:<id>` / `dir:<dirKey>:ticketidx:*`.
+  `ticket_create`/`ticket_list`/`ticket_update`/`ticket_close`, the `dispatch`
+  gate (`requireDispatchTicket`), `status`, the recall/status injection and
+  `thread_detail` are all scoped to the caller's Router, so a work order of
+  another directory is neither listed nor operable (the refusal names both
+  partitions). Startup scans both layouts: a legacy `ticket:<id>` whose directory
+  belongs to another partition gets a scoped copy, the legacy key is **kept** so
+  a rollback still reads its own data, and a re-run changes nothing (memory is
+  keyed by ticket id, and the scoped copy is adopted before the legacy scan, so
+  no duplicate record and no repeat write; `dirtyTicketIDs()` stays empty).
+  Trigger history (`trigger:` → per-partition `DirState.triggers`) and the
+  "newest trigger delivered to the Router" note are per partition too, so one
+  directory's `trigger_detail`/ticket authorization can never quote another's
+  conversation, and the same `threadID` used in two directories keeps two
+  independent affinity lists (dispatch writes, `runTrigger` reads and
+  `detachWorkerThreads` all take the partition explicitly). `status` reports the
+  caller's partition only. `maxWorkersPerDirectory` is documented in `settings`
+  and covered by tests: with `1`, a second dispatch of the same directory is
+  refused while another directory is unaffected, and two dispatches gated inside
+  `sessions.create` cannot oversell the last slot. With the option off nothing
+  is partitioned: same KV keys, same `status`/injection bytes
+  (`test/ticket-partition.test.ts`).
+- **Directory visibility for RPC and the TUI (stage 3).** `status`, `tickets`
+  and `router` accept an optional `directory`. `status` without it keeps the
+  pre-3 payload byte-for-byte and, when `perDirectoryRouter` is on, adds a
+  `partitions` summary (`dirKey`, `directory`, `router`, `pending`, `workers`,
+  `running`); with it, `status` answers for that partition only and echoes
+  `dirKey`/`directory`, never another partition's workers. `tickets` scopes the
+  rendered list to that directory (omitted = process-wide, as before) and
+  `router` opens/reuses that directory's Router. The TUI sends the session
+  directory on every call, and the sidebar renders a compact per-partition
+  router/pending/running summary once more than one partition exists; with a
+  single partition the panel is visually unchanged. The pure view model lives in
+  `src/status.ts` so the payload and the protocol schemas are tested together
+  (`test/rpc-directory.test.ts`), and a standalone `e2e/per-directory.e2e.ts`
+  drives two isolated directories end to end (two routers, two workers, isolated
+  completion delivery, flag-off control) without touching the user's real
+  config, data or gateway.
 
 ## 0.5.1 — 2026-11-14
 

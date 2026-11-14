@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Schema } from "effect"
-import { requireRouter } from "./guard.js"
+import { requireRouter, requireRouterFor } from "./guard.js"
 import {
   closeTicket,
   createTicket,
@@ -96,8 +96,11 @@ const runTicketCreate = Effect.fn("superagent.ticketCreate")(function* (
   input: TicketCreateInput,
   caller: string,
 ) {
-  yield* requireRouter(caller, "ticket_create")
-  const trigger = currentTrigger()
+  // A Router only creates work orders for its own directory. With the switch
+  // off `requireRouterFor` always returns the single default partition, so this
+  // is the historical behaviour.
+  const dirKey = yield* requireRouterFor(caller, input.directory, "ticket_create")
+  const trigger = currentTrigger(dirKey)
   const threadID = input.threadID.trim()
   const requester = trigger?.threadID === threadID ? trigger : undefined
   const result = yield* createTicket(ctx, {
@@ -106,6 +109,7 @@ const runTicketCreate = Effect.fn("superagent.ticketCreate")(function* (
     objective: input.objective,
     acceptance: input.acceptance,
     directory: input.directory,
+    dirKey,
     source: requester?.source ?? "router",
     ...(requester?.author === undefined ? {} : { author: requester.author }),
     ...(input.priority === undefined ? {} : { priority: input.priority }),
@@ -127,14 +131,18 @@ const runTicketList = Effect.fn("superagent.ticketList")(function* (
   input: TicketListInput,
   caller: string,
 ) {
-  yield* requireRouter(caller, "ticket_list")
+  const dirKey = yield* requireRouter(caller, "ticket_list")
   const text = renderTicketList(
-    yield* listTicketRecords(ctx, {
-      ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
-      ...(input.status === undefined ? {} : { status: input.status }),
-      ...(input.since === undefined ? {} : { since: input.since }),
-      ...(input.limit === undefined ? {} : { limit: input.limit }),
-    }),
+    yield* listTicketRecords(
+      ctx,
+      {
+        ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+        ...(input.status === undefined ? {} : { status: input.status }),
+        ...(input.since === undefined ? {} : { since: input.since }),
+        ...(input.limit === undefined ? {} : { limit: input.limit }),
+      },
+      dirKey,
+    ),
   )
   return { output: { text }, content: text }
 })
@@ -144,9 +152,10 @@ const runTicketUpdate = Effect.fn("superagent.ticketUpdate")(function* (
   input: TicketUpdateInput,
   caller: string,
 ) {
-  yield* requireRouter(caller, "ticket_update")
+  const dirKey = yield* requireRouter(caller, "ticket_update")
   const ticket = yield* updateTicket(ctx, {
     ticketID: input.ticketID,
+    dirKey,
     ...(input.status === undefined ? {} : { state: input.status }),
     ...(input.note === undefined ? {} : { note: input.note }),
   })
@@ -159,11 +168,12 @@ const runTicketClose = Effect.fn("superagent.ticketClose")(function* (
   input: TicketCloseInput,
   caller: string,
 ) {
-  yield* requireRouter(caller, "ticket_close")
+  const dirKey = yield* requireRouter(caller, "ticket_close")
   const ticket = yield* closeTicket(ctx, {
     ticketID: input.ticketID,
     outcome: input.outcome,
     summary: input.summary,
+    dirKey,
   })
   const content = `工单 ${ticket.id} 已结单（${ticket.state}）：${ticket.closeReason ?? input.summary}`
   return { output: { ticketID: ticket.id, state: ticket.state, reused: false }, content }
@@ -192,13 +202,24 @@ export function renderTicketText(ticketID: string): string {
  * trimmed to the newest `MEMORY_LIMIT` tickets). The TUI reads through these
  * so a closed ticket that still exists in KV is never reported as missing.
  */
-export const renderTicketsTextDeep = (ctx: Plugin.Context, input: TicketListInput = {}) =>
-  listTicketRecords(ctx, {
-    ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
-    ...(input.status === undefined ? {} : { status: input.status }),
-    ...(input.since === undefined ? {} : { since: input.since }),
-    ...(input.limit === undefined ? {} : { limit: input.limit }),
-  }).pipe(Effect.map(renderTicketList))
+export const renderTicketsTextDeep = (
+  ctx: Plugin.Context,
+  input: TicketListInput = {},
+  // Stage 3: `dirKey` scopes the read to one directory's partition (the RPC
+  // passes it when the TUI sends its session directory). Omitted = the
+  // process-wide list that the sidebar used before the split.
+  dirKey?: string,
+) =>
+  listTicketRecords(
+    ctx,
+    {
+      ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.since === undefined ? {} : { since: input.since }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    },
+    dirKey,
+  ).pipe(Effect.map(renderTicketList))
 
 export const renderTicketTextDeep = (ctx: Plugin.Context, ticketID: string) =>
   loadTicket(ctx, ticketID).pipe(

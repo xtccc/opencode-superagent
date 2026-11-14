@@ -2,7 +2,16 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Option, Schema } from "effect"
 import { requireRouter } from "./guard.js"
-import { encodeThread, isRunning, saveWorker, store, threadKey, toSessionID } from "./state.js"
+import { perDirectoryRouterEnabled } from "./settings.js"
+import {
+  detachWorkerThreads,
+  dirKeyForWorker,
+  isRouterSession,
+  isRunning,
+  saveWorker,
+  store,
+  toSessionID,
+} from "./state.js"
 import { closeTicketsForWorker } from "./ticket.js"
 import { specFor, toolPermission } from "./tools.js"
 
@@ -44,28 +53,12 @@ function abortNote(reason: string | undefined, detail: string, previous: string 
  * Drop the session from every thread affinity list it subscribed to, so later
  * messages on those threads no longer target a terminated worker. An empty
  * thread falls back to the router on the next message. The worker record keeps
- * its `threads` for tracing.
+ * its `threads` for tracing. The lists belong to the worker's own partition.
  */
 const detachThreads = Effect.fn("superagent.detachThreads")(function* (ctx: Plugin.Context, sessionID: string) {
   const worker = store.workers.get(sessionID)
   if (worker === undefined) return [] as Array<string>
-  const detached: Array<string> = []
-  for (const threadID of worker.threads) {
-    const current = store.threads.get(threadID)
-    if (current === undefined || !current.includes(sessionID)) continue
-    const next = current.filter((id) => id !== sessionID)
-    if (next.length === 0) {
-      store.threads.delete(threadID)
-      yield* ctx.storage.remove(threadKey(threadID)).pipe(Effect.catch(() => Effect.void))
-    } else {
-      store.threads.set(threadID, next)
-      yield* ctx.storage
-        .set(threadKey(threadID), encodeThread({ threadID, workers: next, updatedAt: Date.now() }))
-        .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
-    }
-    detached.push(threadID)
-  }
-  return detached
+  return yield* detachWorkerThreads(ctx, sessionID, worker.threads, dirKeyForWorker(worker))
 })
 
 /**
@@ -165,7 +158,12 @@ export const runAbort = Effect.fn("superagent.abort")(function* (
   input: AbortInput,
   caller?: string,
 ) {
-  if (caller !== undefined) yield* requireRouter(caller, "abort_session")
+  // A router can only touch workers of its own directory; the TUI passes no
+  // caller and keeps its process-wide reach. Flag off -> every worker is in
+  // the default partition, so this is the historical behaviour.
+  const callerDirKey = caller === undefined ? undefined : yield* requireRouter(caller, "abort_session")
+  const inCallerPartition = (sessionID: string | undefined): boolean =>
+    callerDirKey === undefined || dirKeyForWorker(store.workers.get(sessionID ?? "")) === callerDirKey
   const batch = input.all === true || input.stale === true
   if (batch && input.sessionID !== undefined) {
     return yield* new Tool.Error({ message: "pass either sessionID or all/stale, not both" })
@@ -179,12 +177,17 @@ export const runAbort = Effect.fn("superagent.abort")(function* (
     if (input.sessionID === caller) {
       return yield* new Tool.Error({ message: "cannot abort the calling session" })
     }
-    if (store.routerID !== undefined && input.sessionID === store.routerID) {
+    if (isRouterSession(input.sessionID)) {
       return yield* new Tool.Error({ message: "cannot abort the router session" })
     }
     if (!store.workers.has(input.sessionID)) {
       return yield* new Tool.Error({
         message: `${input.sessionID} is not tracked by the superagent router; refusing to abort a session the plugin does not own`,
+      })
+    }
+    if (perDirectoryRouterEnabled() && !inCallerPartition(input.sessionID)) {
+      return yield* new Tool.Error({
+        message: `${input.sessionID} belongs to another directory's router; abort it from that router (or from the TUI)`,
       })
     }
     const result = yield* abortWorker(ctx, input.sessionID, input.reason)
@@ -193,6 +196,7 @@ export const runAbort = Effect.fn("superagent.abort")(function* (
   // Batch mode never includes the router: it is not a worker record. `stale`
   // only cleans records with no live work; `all` also interrupts running ones.
   const targets = [...store.workers.values()]
+    .filter((worker) => inCallerPartition(worker.sessionID))
     .filter((worker) => input.all === true || worker.state !== "running")
     .map((worker) => worker.sessionID)
   const results: Array<AbortResult> = []

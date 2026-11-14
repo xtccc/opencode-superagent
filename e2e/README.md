@@ -74,3 +74,37 @@ generated credential.
 
 The test always kills the detached process group, verifies the port can be bound
 again, and removes the temporary directory.
+
+## `e2e/per-directory.e2e.ts` (stage 3)
+
+Balanced on two independent layers, both under one `mkdtemp` root and one
+`OPENCODE_CONFIG_DIR`:
+
+1. **Real host.** Writes an isolated `opencode.json` with
+   `options: { perDirectoryRouter: true }`, boots `opencode serve` against a
+   throw-away `HOME`/`XDG_*`, creates two Routers through the public
+   `router({ directory })` RPC for two temp directories, and asserts that
+   `status({})` lists two partitions whose `router` ids differ and whose
+   `directory` fields are the two real paths. When the host exposes session
+   endpoints it also checks each Router session's `location.directory`.
+2. **Built artifact internals.** Imports `dist/src/*.js` and drives
+   `ensureRouter` + `runDispatch` + `handleEnded` with an in-memory host. This is
+   the deterministic part a real host cannot provide without a model: two
+   workers are dispatched, their records carry the right `directory`, each
+   completion is delivered only to its own directory's Router, and with the flag
+   off both directories collapse onto one Router.
+
+Isolation is checked positively and negatively: the host's DB appears under the
+temp root, while the user's real `opencode.json` / `package.json` / `auth.json`
+(size+mtime) and `opencode.db` (device+inode) are unchanged. The DB is compared
+by inode rather than mtime because the user's own gateway writes it continuously;
+mtime would be noise, an inode change would mean our run replaced the file.
+
+Run locally with:
+
+```sh
+bun run e2e/per-directory.e2e.ts
+```
+
+Like `plugin-load.e2e.ts` it is not a `*.test.ts`, so `bun test` does not pick it
+up; it needs the `opencode` CLI and boots a real host.

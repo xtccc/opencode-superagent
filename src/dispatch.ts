@@ -5,10 +5,29 @@ import { AbsolutePath } from "@opencode/schema/schema"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Schema } from "effect"
 import { WORKER_AGENT } from "./agents.js"
-import { directoryError, normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
+import { DEFAULT_DIR_KEY, directoryError, normalizeDirectory, rememberDirectory, resolveDirectory } from "./dirs.js"
 import { DISPATCH_EFFORTS, type DispatchEffort } from "./effort.js"
+import { requireRouter, requireRouterFor } from "./guard.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
-import { encodeThread, linkTriggerToWorker, saveWorker, store, threadKey, toSessionID, workerKey } from "./state.js"
+import { perDirectoryRouterEnabled, maxWorkersPerDirectorySetting, parseWorkerLimit } from "./settings.js"
+import {
+  detachWorkerThreads,
+  dirKeyFor,
+  dirKeyForRouter,
+  dirKeyForWorker,
+  dirScopedKey,
+  dirState,
+  effectiveDirKey,
+  encodeThread,
+  linkTriggerToWorker,
+  routerPartitions,
+  saveWorker,
+  store,
+  threadKey,
+  toSessionID,
+  totalPending,
+  workerKey,
+} from "./state.js"
 import {
   activeTicketForWorker,
   activeTicketSummary,
@@ -78,6 +97,11 @@ const STATUS_TITLE_LIMIT = 24
 export interface StatusOptions {
   /** Also list finished workers (max 20, newest first, reports shortened). */
   readonly includeFinished?: boolean
+  /**
+   * 调用方 Router 的分区：只统计/列出该目录的 worker 与工单。
+   * `undefined`＝进程级视图（TUI/测试），输出与阶段 2a 逐字节一致。
+   */
+  readonly dirKey?: string
 }
 
 /**
@@ -114,6 +138,66 @@ function releaseDispatch(ticketID: string): void {
   inFlightTickets.delete(ticketID)
 }
 
+/**
+ * Per-directory worker slots (`maxWorkersPerDirectory`).
+ *
+ * The slot is taken in the same synchronous block as the ticket claim, before
+ * any `Effect` step (agent lookup, `sessions.create`), so two concurrent
+ * dispatches into one directory cannot both observe "one free slot" and
+ * oversell it. The slot is released on success, failure and interruption via
+ * `Effect.ensuring`, exactly like the claim. Default (`0`) is unlimited, so
+ * the flag-off path behaves as before.
+ */
+const SLOTS_KEY = Symbol.for("opencode-superagent.dir-slots.v1")
+
+type GlobalWithSlots = typeof globalThis & { [SLOTS_KEY]?: Map<string, number> }
+
+const slotGlobals = globalThis as GlobalWithSlots
+
+const reservedSlots: Map<string, number> = slotGlobals[SLOTS_KEY] ?? new Map<string, number>()
+
+slotGlobals[SLOTS_KEY] = reservedSlots
+
+/** Configured cap for one directory; non-positive/absent means unlimited. */
+export function maxWorkersPerDirectory(ctx: Plugin.Context): number {
+  // `options` is optional in every test/older host context: an absent cap means
+  // "unlimited", never a crash. The process-wide mirror (set by `applySettings`)
+  // is the fallback so a caller holding a context without options still sees the
+  // configured limit.
+  const options = (ctx as { options?: Readonly<Record<string, unknown>> }).options
+  const fromContext = parseWorkerLimit(options?.["maxWorkersPerDirectory"])
+  return fromContext > 0 ? fromContext : maxWorkersPerDirectorySetting()
+}
+
+/** Live (non-terminal) workers of one partition. */
+function partitionWorkerCount(dirKey: string): number {
+  let live = 0
+  for (const worker of store.workers.values()) {
+    if (isWorkerTerminal(worker.state)) continue
+    if (dirKeyFor(worker.directory) === dirKey) live += 1
+  }
+  return live
+}
+
+/** Synchronous check-and-reserve; only the caller that gets `true` may create a worker. */
+function reserveWorkerSlot(dirKey: string, limit: number): boolean {
+  const used = partitionWorkerCount(dirKey) + (reservedSlots.get(dirKey) ?? 0)
+  if (used >= limit) return false
+  reservedSlots.set(dirKey, (reservedSlots.get(dirKey) ?? 0) + 1)
+  return true
+}
+
+function releaseWorkerSlot(dirKey: string): void {
+  const next = (reservedSlots.get(dirKey) ?? 0) - 1
+  if (next <= 0) reservedSlots.delete(dirKey)
+  else reservedSlots.set(dirKey, next)
+}
+
+/** Test hook: slots currently reserved per partition. */
+export function reservedSlotCount(dirKey: string): number {
+  return reservedSlots.get(dirKey) ?? 0
+}
+
 /** The ticket header a worker sees first: objective and acceptance, verbatim. */
 function ticketHeader(ticket: Ticket): string {
   const acceptance = ticket.acceptance.map((item, index) => `${index + 1}. ${item}`).join("\n")
@@ -136,15 +220,32 @@ function workerPrompt(threadID: string, title: string | undefined, task: string,
  * tail of finished workers with shortened reports.
  */
 export function statusText(options: StatusOptions = {}): string {
-  const stats = ticketStats()
-  const activeTickets = activeTicketSummary(undefined, 5)
-  const workers = [...store.workers.values()]
+  // A partitioned status shows its own directory only; `undefined` keeps the
+  // process-wide view (byte-identical to stage 2a with the flag off).
+  const scope = options.dirKey === undefined ? undefined : effectiveDirKey(options.dirKey)
+  const stats = ticketStats(scope)
+  const activeTickets = activeTicketSummary(undefined, 5, scope)
+  const all = [...store.workers.values()]
+  const workers = scope === undefined ? all : all.filter((worker) => dirKeyForWorker(worker) === scope)
   const live = workers.filter((worker) => !isWorkerTerminal(worker.state))
   const finished = workers.filter((worker) => isWorkerTerminal(worker.state))
+  // A partitioned status reports its own queue depth; the process-wide view
+  // (TUI/tests) keeps summing every partition, which is the pre-2b number.
+  const pending = scope === undefined ? totalPending() : dirState(store, scope).pending.length
   const lines = [
     `superagent ${pluginVersion()} — restart the gateway after upgrading (no hot reload)`,
-    `router: ${store.routerID ?? "none"} pending: ${store.pending.length} workers=${workers.length} active=${live.length} tickets: open=${stats.open} in_progress=${stats.inProgress} blocked=${stats.blocked} closed=${stats.closed}`,
+    `router: ${routerSummary()} pending: ${pending} workers=${workers.length} active=${live.length} tickets: open=${stats.open} in_progress=${stats.inProgress} blocked=${stats.blocked} closed=${stats.closed}`,
   ]
+  // Only when directory partitioning is switched on: with the default `false`
+  // this reply stays byte-identical to the pre-partition format.
+  if (perDirectoryRouterEnabled()) {
+    const partitions = routerPartitions()
+    const detail =
+      partitions.length > 0 && store.dirs.size > 1
+        ? ` [${partitions.map((entry) => `${entry.dirKey}=${entry.routerID}`).join(", ")}]`
+        : ""
+    lines.push(`directories: ${store.dirs.size} partition(s) active=${store.dirKey}${detail}`)
+  }
   if (activeTickets !== "") lines.push(`active tickets: ${activeTickets}`)
   // Only shown when startup actually dropped something: a replayed trigger that
   // outlived its TTL is invisible otherwise, and the Router would wonder why the
@@ -171,6 +272,13 @@ export function statusText(options: StatusOptions = {}): string {
     lines.push(`... ${finished.length} finished worker(s) hidden (pass includeFinished=true to list up to ${STATUS_FINISHED_LIMIT})`)
   }
   return clampStatus(lines)
+}
+
+/** Router column of the status line: one id with the switch off, per-partition ids with it on. */
+function routerSummary(): string {
+  if (!perDirectoryRouterEnabled()) return store.routerID ?? "none"
+  const entries = routerPartitions().map((entry) => `${entry.dirKey}=${entry.routerID}`)
+  return entries.length === 0 ? "none" : entries.join(",")
 }
 
 /** Live worker row: where it runs and which threads it serves; never its report. */
@@ -234,12 +342,17 @@ const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (
 ) {
   // Fail the ticket while the worker → ticket edge still exists, so the
   // Router sees why the dispatch never started instead of a stuck in_progress.
+  // The worker record is the only thing that knows the partition here; a
+  // rollback must never close another directory's ticket.
+  const worker = store.workers.get(sessionID)
+  const rollbackDirKey = worker === undefined ? undefined : dirKeyForWorker(worker)
   const ticket = activeTicketForWorker(sessionID)
   if (ticket !== undefined) {
     yield* closeTicket(ctx, {
       ticketID: ticket.id,
       outcome: "failed",
       summary: `dispatch rollback: ${reason}`,
+      ...(rollbackDirKey === undefined ? {} : { dirKey: rollbackDirKey }),
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("superagent failed to fail ticket for rolled-back worker", {
@@ -251,23 +364,10 @@ const rollbackDispatch = Effect.fn("superagent.rollbackDispatch")(function* (
     )
   }
   // Thread affinity is written before the prompt; drop the worker from every
-  // list it was added to so the thread falls back to the Router.
-  const worker = store.workers.get(sessionID)
+  // list it was added to so the thread falls back to the Router. The list lives
+  // in the worker's own partition, so a rollback never edits another directory.
   if (worker !== undefined) {
-    for (const threadID of worker.threads) {
-      const current = store.threads.get(threadID)
-      if (current === undefined || !current.includes(sessionID)) continue
-      const next = current.filter((id) => id !== sessionID)
-      if (next.length === 0) {
-        store.threads.delete(threadID)
-        yield* ctx.storage.remove(threadKey(threadID)).pipe(Effect.catch(() => Effect.void))
-      } else {
-        store.threads.set(threadID, next)
-        yield* ctx.storage
-          .set(threadKey(threadID), encodeThread({ threadID, workers: next, updatedAt: Date.now() }))
-          .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
-      }
-    }
+    yield* detachWorkerThreads(ctx, sessionID, worker.threads, dirKeyForWorker(worker))
   }
   store.workers.delete(sessionID)
   yield* ctx.storage
@@ -437,14 +537,17 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   input: DispatchInput,
   caller: string,
 ) {
-  if (store.routerID === undefined || caller !== store.routerID) {
-    return yield* new Tool.Error({ message: "dispatch is only available to the router session" })
-  }
-  const routerID = store.routerID
+  // The caller must be a router; `callerDirKey` is the partition it owns.
+  const callerDirKey = yield* requireRouter(caller, "dispatch")
+  const routerID = caller
   // Every dispatch is backed by a ticket: the gate refuses a missing ticket,
   // an unknown/closed one, a thread mismatch and a ticket whose worker is
   // still running, so no dispatch can bypass the work-order record.
-  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID)
+  const ticket = yield* requireDispatchTicket(input.ticketID, input.threadID, callerDirKey)
+  // A router only dispatches work orders of its own directory: with the switch
+  // on, router A can never create a worker in directory B. A ticket with no
+  // directory falls into the default partition, matching `requireRouterFor`.
+  yield* requireRouterFor(caller, ticket.directory, "dispatch")
   // Claim the ticket synchronously before any further dispatch step. Check
   // and insert happen in one uninterrupted block, so two concurrent calls can
   // never both see the ticket as free and race into `sessions.create`; the
@@ -452,9 +555,26 @@ export const runDispatch = Effect.fn("superagent.dispatch")(function* (
   if (!claimDispatch(ticket.id)) {
     return yield* new Tool.Error({ message: `dispatch already in progress for ticket ${ticket.id}` })
   }
-  return yield* completeDispatch(ctx, input, routerID, ticket).pipe(
-    // Success, failure and interruption all release the claim.
-    Effect.ensuring(Effect.sync(() => releaseDispatch(ticket.id))),
+  // Per-directory cap, taken in the same synchronous block as the claim so two
+  // dispatches cannot both pass the last free slot.
+  const limit = maxWorkersPerDirectory(ctx)
+  if (limit > 0 && !reserveWorkerSlot(callerDirKey, limit)) {
+    // Report both numbers: the configured cap and what is actually occupying
+    // the partition (live workers + dispatches already holding a slot).
+    const running = partitionWorkerCount(callerDirKey) + reservedSlotCount(callerDirKey)
+    releaseDispatch(ticket.id)
+    return yield* new Tool.Error({
+      message: `dispatch: directory partition ${callerDirKey} already has ${running} live worker(s) (maxWorkersPerDirectory=${limit}); wait for one to finish, abort_session it, or raise the option`,
+    })
+  }
+  return yield* completeDispatch(ctx, input, routerID, ticket, callerDirKey).pipe(
+    // Success, failure and interruption all release the claim and the slot.
+    Effect.ensuring(
+      Effect.sync(() => {
+        releaseDispatch(ticket.id)
+        if (limit > 0) releaseWorkerSlot(callerDirKey)
+      }),
+    ),
   )
 })
 
@@ -467,6 +587,7 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
   input: DispatchInput,
   routerID: string,
   ticket: Ticket,
+  dirKey: string = DEFAULT_DIR_KEY,
 ) {
   const agents = ctx.agent
   const sessions = ctx.session
@@ -514,6 +635,18 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
     requested: requestedDir ?? ticketDir,
   })
   const targetDirectory = rememberedDir ?? routerDirectory
+  // With the switch on the worker must land in the caller's own directory:
+  // `resolveDirectory` can still return a thread binding from another
+  // directory, and creating the worker there would put it under a Router that
+  // never dispatched it (its completion would then be routed elsewhere).
+  if (perDirectoryRouterEnabled()) {
+    const targetDirKey = dirKeyFor(targetDirectory ?? routerDirectory)
+    if (targetDirKey !== dirKey) {
+      return yield* new Tool.Error({
+        message: `dispatch: resolved directory ${targetDirectory ?? routerDirectory ?? "(unknown)"} belongs to partition ${targetDirKey}, not this router's ${dirKey}; pass directory of this router's directory or use that directory's router`,
+      })
+    }
+  }
   // An explicit agent keeps its own model priority, so there is no model to
   // attach a variant to: refuse instead of silently dropping the effort.
   if (input.effort !== undefined && input.agent !== undefined) {
@@ -535,7 +668,7 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
           directory: targetDirectory,
         })
   const threads = [threadID]
-  const current = currentTrigger()
+  const current = currentTrigger(dirKey)
   const authorizing =
     current !== undefined && current.threadID === threadID ? current.id : ticket.authorization.triggerID
   const triggerID = authorizing === "" || authorizing === "unknown" ? undefined : authorizing
@@ -590,6 +723,7 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
   const linkFailure = yield* linkTicketToWorker(ctx, {
     ticketID: ticket.id,
     sessionID: created.id,
+    dirKey,
     ...(targetDirectory === undefined ? {} : { note: targetDirectory }),
     ...(resolved.note === undefined ? {} : { effort: resolved.note }),
   }).pipe(
@@ -602,14 +736,18 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
       message: `dispatch aborted: could not bind ticket ${ticket.id} to the new worker (${linkFailure})`,
     })
   }
-  const existing = store.threads.get(threadID) ?? []
+  const partitionThreads = dirState(store, dirKey).threads
+  const existing = partitionThreads.get(threadID) ?? []
   if (!existing.includes(created.id)) existing.push(created.id)
   // Affinity lists persist after workers end; cap them so long-lived
   // threads don't grow unbounded in memory and KV.
   if (existing.length > 20) existing.splice(0, existing.length - 20)
-  store.threads.set(threadID, existing)
+  partitionThreads.set(threadID, existing)
   yield* ctx.storage
-    .set(threadKey(threadID), encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }))
+    .set(
+      dirScopedKey(threadKey(threadID), dirKey),
+      encodeThread({ threadID, workers: [...existing], updatedAt: Date.now() }),
+    )
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist thread", { cause })))
   // Prompt delivery is part of the dispatch: if the worker never receives its
   // task, the ticket, thread affinity and worker record must not stay behind.
@@ -657,8 +795,14 @@ export const registerTools = Effect.fn("superagent.registerTools")(function* (ct
       description: specFor("status").description,
       input: StatusInput,
       output: StatusOutput,
-      execute: (input) => {
-        const text = statusText({ includeFinished: input.includeFinished === true })
+      execute: (input, context) => {
+        // The status tool is router-only; scoping it to the caller's partition
+        // keeps one directory's counters out of another's reply.
+        const dirKey = dirKeyForRouter(context.sessionID)
+        const text = statusText({
+          includeFinished: input.includeFinished === true,
+          ...(dirKey === undefined ? {} : { dirKey }),
+        })
         return Effect.succeed({ output: { text }, content: text })
       },
     })

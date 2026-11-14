@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { DateTime, Effect, Option, Stream } from "effect"
 import { ensureRouter } from "./router.js"
-import { store, toSessionID } from "./state.js"
+import { dirKeyForWorker, store, toSessionID } from "./state.js"
 
 /** Default interval between stall checks. Overridable with the `watchdogIntervalMs` plugin option. */
 export const WATCHDOG_INTERVAL_MS = 60_000
@@ -70,7 +70,12 @@ export const checkWorker = Effect.fn("superagent.watchdogCheck")(function* (
   const minutes = Math.floor(stalledMs / 60_000)
   const title = worker.title ?? "-"
   const text = `Worker ${sessionID}（${title}）已停滞 ${minutes} 分钟，建议：stop 后重派或人工介入`
-  const routerID = yield* ensureRouter(ctx).pipe(
+  // The alert belongs to the stalled worker's own Router: with per-directory
+  // routers, sending it to the default one would tell the wrong directory.
+  const routerID = yield* ensureRouter(ctx, {
+    dirKey: dirKeyForWorker(worker),
+    ...(worker.directory === undefined ? {} : { directory: worker.directory }),
+  }).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("superagent watchdog cannot report without a router", { cause }).pipe(Effect.as(undefined)),
     ),

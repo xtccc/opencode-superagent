@@ -3,7 +3,8 @@ import { Tool } from "@opencode/schema/tool"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import { Effect, Schema } from "effect"
 import { requireRouter } from "./guard.js"
-import { store, toSessionID } from "./state.js"
+import { perDirectoryRouterEnabled } from "./settings.js"
+import { dirKeyForWorker, isRouterSession, store, toSessionID } from "./state.js"
 import { isTerminalState } from "./ticket-state.js"
 import { ticketForWorker } from "./ticket.js"
 import { specFor, toolPermission } from "./tools.js"
@@ -73,7 +74,7 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
   input: WorkerPromptInput,
   caller: string,
 ) {
-  yield* requireRouter(caller, "worker_prompt")
+  const callerDirKey = yield* requireRouter(caller, "worker_prompt")
 
   const sessionID = input.sessionID
   const text = input.text.trim()
@@ -87,7 +88,8 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
 
   // The router itself is not a worker and must never be prompted through this
   // tool, even though `requireRouter` already proved the caller's identity.
-  if (sessionID === caller || (store.routerID !== undefined && sessionID === store.routerID)) {
+  // Any partition's router is refused, not just the caller's own.
+  if (sessionID === caller || isRouterSession(sessionID)) {
     return yield* new Tool.Error({
       message: "cannot prompt the router session; worker_prompt only targets tracked worker sessions",
     })
@@ -96,6 +98,13 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
   if (worker === undefined) {
     return yield* new Tool.Error({
       message: `${sessionID} is not tracked by the superagent router; refusing to prompt a session the plugin does not own`,
+    })
+  }
+  // A router only drives workers of its own directory: prompting another
+  // directory's worker would inject instructions from the wrong context.
+  if (perDirectoryRouterEnabled() && dirKeyForWorker(worker) !== callerDirKey) {
+    return yield* new Tool.Error({
+      message: `worker ${sessionID} belongs to another directory's router; prompt it from that router`,
     })
   }
 

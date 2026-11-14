@@ -1,13 +1,30 @@
 import { Agent, type Plugin } from "@opencode/plugin/effect"
 import type { SessionMessage } from "@opencode/schema/session-message"
+import { AbsolutePath } from "@opencode/schema/schema"
 import { Effect, Option, Semaphore, type Schema } from "effect"
 import { createHash } from "node:crypto"
 import { ROUTER_AGENT } from "./agents.js"
 import { buildStatusInjection } from "./context.js"
-import { threadDirHint } from "./dirs.js"
+import { DEFAULT_DIR_KEY, threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
-import { ROUTER_KEY, store, toSessionID, type PendingTrigger, type TriggerInput } from "./state.js"
+import { perDirectoryRouterEnabled } from "./settings.js"
+import {
+  ROUTER_KEY,
+  dirKeyFor,
+  dirKeyForRouter,
+  effectiveDirKey,
+  dirScopedKey,
+  dirState,
+  isRouterSession,
+  rememberRouter,
+  scanDirScoped,
+  scanEntries,
+  store,
+  toSessionID,
+  type PendingTrigger,
+  type TriggerInput,
+} from "./state.js"
 import { noteRouterTrigger } from "./ticket.js"
 import { ROUTER_PERMISSIONS } from "./tools.js"
 
@@ -28,37 +45,50 @@ export const DEFAULT_PENDING_TTL_MS = 24 * 60 * 60 * 1000
  */
 export type FlushDelivery = "queue" | "steer"
 
-/**
- * Serialise flushes. A second caller waits for the in-flight flush to finish,
- * then observes the drained queue and only flushes events enqueued meanwhile,
- * so the same batch is never injected twice. Effect releases the permit on
- * success, failure and interruption.
- */
-const flushLock = Semaphore.makeUnsafe(1)
+type Lock = ReturnType<typeof Semaphore.makeUnsafe>
 
 /**
- * Serialise router creation. `ensureRouter` has several concurrent callers (a
- * trigger, the `router` RPC, a flush), and its check → create → persist
- * sequence is not atomic: two callers could both see "no router" and create a
- * session each, with the KV write of one silently orphaning the other.
+ * Per-partition locks. A flush must never interleave with another flush *of
+ * the same queue*, and router creation must never run twice *for the same
+ * directory*; but two directories are independent, so one directory's slow
+ * `sessions.create` must not block the other's flush.
  *
- * The permit is process-wide (shared on `globalThis` like the store), because
- * a duplicate plugin copy would otherwise hold its own semaphore and race the
- * first copy. Effect releases the permit on success, failure and
- * interruption, so a failed create never blocks the next attempt.
+ * Both registries live on `globalThis` (like the store): a duplicate plugin
+ * copy would otherwise hold its own semaphore and race the first copy. The
+ * symbol version is bumped from the pre-partition single-lock symbol because a
+ * stale copy expects a bare `Semaphore`, not this registry; cross-version
+ * copies already cannot share state, and `versionNotice` says a restart is
+ * required. Effect releases a permit on success, failure and interruption.
  */
-const ROUTER_LOCK_KEY = Symbol.for("opencode-superagent.router-lock.v1")
+const LOCK_REGISTRY_KEY = Symbol.for("opencode-superagent.dir-locks.v2")
 
-type GlobalWithRouterLock = typeof globalThis & {
-  [ROUTER_LOCK_KEY]?: ReturnType<typeof Semaphore.makeUnsafe>
+interface DirLocks {
+  readonly flush: Map<string, Lock>
+  readonly router: Map<string, Lock>
 }
 
-const routerGlobals = globalThis as GlobalWithRouterLock
+type GlobalWithDirLocks = typeof globalThis & { [LOCK_REGISTRY_KEY]?: DirLocks }
 
-const routerLock: ReturnType<typeof Semaphore.makeUnsafe> =
-  routerGlobals[ROUTER_LOCK_KEY] ?? Semaphore.makeUnsafe(1)
+const lockGlobals = globalThis as GlobalWithDirLocks
 
-routerGlobals[ROUTER_LOCK_KEY] = routerLock
+const dirLocks: DirLocks = lockGlobals[LOCK_REGISTRY_KEY] ?? { flush: new Map(), router: new Map() }
+
+lockGlobals[LOCK_REGISTRY_KEY] = dirLocks
+
+/** The lock for one (kind, partition); created on first use and kept. */
+function lockFor(kind: keyof DirLocks, dirKey: string): Lock {
+  const locks = dirLocks[kind]
+  const existing = locks.get(dirKey)
+  if (existing !== undefined) return existing
+  const created = Semaphore.makeUnsafe(1)
+  locks.set(dirKey, created)
+  return created
+}
+
+/** Test hook: number of partitions holding a flush / router lock. */
+export function lockPartitions(): { readonly flush: number; readonly router: number } {
+  return { flush: dirLocks.flush.size, router: dirLocks.router.size }
+}
 
 /** KV prefix for crash-safe pending triggers. Owned by the router; `state.ts` stays untouched. */
 export const PENDING_PREFIX = "pending:"
@@ -147,21 +177,27 @@ function encodePending(item: PendingTrigger): Schema.Json {
  * Enqueue a trigger in memory and in KV. The trigger gets a stable id when
  * the caller did not supply one, so a crash-restarted process can dedupe and
  * rehydrate it. Same-id enqueues are ignored.
+ *
+ * `dirKey` names the partition queue; it defaults to the default partition so
+ * the flag-off path (and every pre-partition caller) is unchanged.
  */
 export const enqueuePending = Effect.fn("superagent.enqueuePending")(function* (
   ctx: Plugin.Context,
   input: TriggerInput,
+  dirKey: string = DEFAULT_DIR_KEY,
 ) {
+  const partition = effectiveDirKey(dirKey)
   const arrivedAt = Date.now()
   const id = pendingID(input, arrivedAt)
-  if (store.pending.some((item) => pendingID(item.trigger, item.arrivedAt) === id)) return
+  const pending = dirState(store, partition).pending
+  if (pending.some((item) => pendingID(item.trigger, item.arrivedAt) === id)) return
   const item: PendingTrigger = {
     trigger: input.id === undefined ? { ...input, id } : { ...input },
     arrivedAt,
   }
-  store.pending.push(item)
+  pending.push(item)
   yield* ctx.storage
-    .set(keyOf(item), encodePending(item))
+    .set(dirScopedKey(keyOf(item), partition), encodePending(item))
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist pending trigger", { cause })))
 })
 
@@ -194,18 +230,24 @@ function isExpiredPending(item: PendingTrigger, now: number, ttl: number): boole
  * Entries older than the replay TTL are dropped from KV instead of replayed:
  * a restart days later must not inject a follow-up the thread has moved past.
  * The count is logged and kept on the store so `status` can show it.
+ *
+ * Both namespaces are read: the legacy `pending:` (default partition) and, when
+ * the switch is on, `dir:<dirKey>:pending:` per partition. Each entry returns to
+ * the partition that owns it — a replayed trigger must never land in another
+ * directory's queue.
  */
 export const hydratePending = Effect.fn("superagent.hydratePending")(function* (ctx: Plugin.Context) {
   const ttl = pendingTTLMs(ctx)
   const now = Date.now()
   let dropped = 0
   let oldestDroppedAge = 0
-  let after: string | undefined
-  do {
-    const page = yield* ctx.storage
-      .scan({ prefix: PENDING_PREFIX, after, limit: 100 })
-      .pipe(Effect.catch(() => Effect.succeed({ entries: [], next: undefined })))
-    for (const entry of page.entries) {
+  const groups: Array<{ dirKey: string; entries: ReadonlyArray<{ key: string; value: Schema.Json | undefined }> }> = [
+    { dirKey: DEFAULT_DIR_KEY, entries: yield* scanEntries(ctx, PENDING_PREFIX) },
+  ]
+  for (const entry of yield* scanDirScoped(ctx, PENDING_PREFIX)) groups.push({ dirKey: entry.dirKey, entries: [entry] })
+  for (const group of groups) {
+    const pending = dirState(store, group.dirKey).pending
+    for (const entry of group.entries) {
       const item = decodePending(entry.value)
       if (item === undefined) {
         yield* ctx.storage.remove(entry.key).pipe(Effect.catch(() => Effect.void))
@@ -218,13 +260,10 @@ export const hydratePending = Effect.fn("superagent.hydratePending")(function* (
         continue
       }
       const id = pendingID(item.trigger, item.arrivedAt)
-      if (store.pending.some((existing) => pendingID(existing.trigger, existing.arrivedAt) === id)) continue
-      store.pending.push(
-        item.trigger.id === undefined ? { trigger: { ...item.trigger, id }, arrivedAt: item.arrivedAt } : item,
-      )
+      if (pending.some((existing) => pendingID(existing.trigger, existing.arrivedAt) === id)) continue
+      pending.push(item.trigger.id === undefined ? { trigger: { ...item.trigger, id }, arrivedAt: item.arrivedAt } : item)
     }
-    after = page.next
-  } while (after !== undefined)
+  }
   if (dropped > 0) {
     store.pendingDropped += dropped
     yield* Effect.logWarning("superagent dropped expired pending triggers on hydrate", {
@@ -235,41 +274,62 @@ export const hydratePending = Effect.fn("superagent.hydratePending")(function* (
   }
 })
 
+/** Which directory a Router is being requested for. Defaults to the default partition. */
+export interface RouterTarget {
+  readonly dirKey?: string
+  readonly directory?: string
+}
+
 /**
- * Return the live router session, creating it when missing. A router id
- * whose session no longer exists is forgotten before creating a new one,
- * so a user-deleted router is recovered automatically.
+ * Return the live router session of a partition, creating it when missing. A
+ * router id whose session no longer exists is forgotten before creating a new
+ * one, so a user-deleted router is recovered automatically.
  *
- * Every caller goes through `routerLock` (see `ensureRouterUnlocked`), so the
- * check → create → persist sequence below is never executed concurrently.
+ * Every caller goes through the partition's router lock (see
+ * `ensureRouterUnlocked`), so the check → create → persist sequence below is
+ * never executed concurrently *for the same directory*. Different directories
+ * hold different permits and never wait on each other.
  */
-export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (ctx: Plugin.Context) {
-  return yield* routerLock.withPermit(ensureRouterUnlocked(ctx))
+export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (
+  ctx: Plugin.Context,
+  target: RouterTarget = {},
+) {
+  const dirKey = effectiveDirKey(target.dirKey ?? dirKeyFor(target.directory))
+  const directory = target.directory ?? dirState(store, dirKey).directory
+  return yield* lockFor("router", dirKey).withPermit(ensureRouterUnlocked(ctx, dirKey, directory))
 })
 
 /**
- * Body of `ensureRouter`, run while the router permit is held. Re-reading
- * `store.routerID` and the KV id here is what makes the loser of a race adopt
- * the winner's session instead of creating an orphan.
+ * Body of `ensureRouter`, run while the partition's router permit is held.
+ * Re-reading the partition's router id and the KV id here is what makes the
+ * loser of a race adopt the winner's session instead of creating an orphan.
  */
-const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(function* (ctx: Plugin.Context) {
+const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(function* (
+  ctx: Plugin.Context,
+  dirKey: string,
+  directory: string | undefined,
+) {
   const sessions = ctx.session
   const storage = ctx.storage
-  if (store.routerID !== undefined) {
-    const cached = yield* sessions.get({ sessionID: toSessionID(store.routerID) }).pipe(Effect.option)
-    if (Option.isSome(cached)) return store.routerID
-    store.routerID = undefined
-    store.routerBusy = false
-    yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
+  const dir = dirState(store, dirKey, directory)
+  // Non-default partitions keep their router under their own KV namespace; the
+  // default partition keeps the legacy `router` key so upgrades read old state.
+  const routerKey = dirScopedKey(ROUTER_KEY, dirKey)
+  if (dir.routerID !== undefined) {
+    const cached = yield* sessions.get({ sessionID: toSessionID(dir.routerID) }).pipe(Effect.option)
+    if (Option.isSome(cached)) return dir.routerID
+    rememberRouter(dirKey, undefined)
+    dir.routerBusy = false
+    yield* storage.remove(routerKey).pipe(Effect.catch(() => Effect.void))
   }
-  const stored = yield* storage.get(ROUTER_KEY).pipe(Effect.catch(() => Effect.succeed(undefined)))
+  const stored = yield* storage.get(routerKey).pipe(Effect.catch(() => Effect.succeed(undefined)))
   if (typeof stored === "string") {
     const info = yield* sessions.get({ sessionID: toSessionID(stored) }).pipe(Effect.option)
     if (Option.isSome(info)) {
-      store.routerID = info.value.id
-      return store.routerID
+      rememberRouter(dirKey, info.value.id)
+      return info.value.id
     }
-    yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
+    yield* storage.remove(routerKey).pipe(Effect.catch(() => Effect.void))
   }
   const agents = ctx.agent
   const routerAgent = yield* agents.get({ agentID: Agent.ID.make(ROUTER_AGENT) }).pipe(
@@ -280,19 +340,31 @@ const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(functi
       ),
     ),
   )
+  // Each partition's Router lives in that partition's directory: its model
+  // resolution, tool cwd and injected directory context then match the workers
+  // it dispatches (`dispatch` creates workers the same way). The default
+  // partition keeps the host default (`location` omitted), which is what the
+  // pre-partition code always did.
+  const where = perDirectoryRouterEnabled() && dirKey !== DEFAULT_DIR_KEY ? dir.directory : undefined
+  if (perDirectoryRouterEnabled() && dirKey !== DEFAULT_DIR_KEY && where === undefined) {
+    yield* Effect.logWarning("superagent router created without a directory: partition has no known path", {
+      dirKey,
+    })
+  }
   const created = yield* sessions.create({
     title: ROUTER_TITLE,
     ...(routerAgent === undefined ? {} : { agent: routerAgent }),
+    ...(where === undefined ? {} : { location: { directory: AbsolutePath.make(where) } }),
     metadata: superagentMetadata("router"),
     // Derived from the tool catalog: a tool whose permission action is not
     // allowed here is dropped from the Router's toolset by `Tool.snapshot`,
     // so adding a tool without its action would hide it silently.
     permissions: ROUTER_PERMISSIONS,
   })
-  store.routerID = created.id
-  store.routerBusy = false
+  rememberRouter(dirKey, created.id)
+  dir.routerBusy = false
   yield* storage
-    .set(ROUTER_KEY, created.id)
+    .set(routerKey, created.id)
     .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist router", { cause })))
   return created.id
 })
@@ -312,17 +384,23 @@ const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(functi
 const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(function* (
   ctx: Plugin.Context,
   delivery: FlushDelivery = "queue",
+  dirKey: string = DEFAULT_DIR_KEY,
 ) {
-  if (store.pending.length === 0) return
-  const routerID = yield* ensureRouter(ctx)
-  const batch = store.pending.slice(0, MAX_FLUSH)
+  const dir = dirState(store, dirKey)
+  const pending = dir.pending
+  if (pending.length === 0) return
+  const routerID = yield* ensureRouter(ctx, {
+    dirKey,
+    ...(dir.directory === undefined ? {} : { directory: dir.directory }),
+  })
+  const batch = pending.slice(0, MAX_FLUSH)
   // Identity snapshot of this delivery. Removal below matches these ids
   // instead of the queue prefix, so events enqueued while the injection is
   // in flight survive.
   const batchIDs = new Set(batch.map((item) => pendingID(item.trigger, item.arrivedAt)))
   const newest = batch[batch.length - 1]
   // `pending` counts what is still waiting: this batch is being delivered now.
-  const pendingAfter = store.pending.filter((item) => !batchIDs.has(pendingID(item.trigger, item.arrivedAt))).length
+  const pendingAfter = pending.filter((item) => !batchIDs.has(pendingID(item.trigger, item.arrivedAt))).length
   const events = [
     `${batch.length} new event(s) for the router:`,
     ...batch.map((item) => {
@@ -334,7 +412,7 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
   // Status sits at the very end of the injected message: it is the only part
   // that changes between turns, so keeping it here (and out of `system`)
   // leaves every earlier byte of the request cacheable.
-  const text = `${events}\n\n${buildStatusInjection(newest?.trigger.threadID, pendingAfter)}`
+  const text = `${events}\n\n${buildStatusInjection(newest?.trigger.threadID, pendingAfter, dirKey)}`
   const delivered = yield* ctx.session
     .synthetic({
       sessionID: toSessionID(routerID),
@@ -347,48 +425,59 @@ const flushPendingUnlocked = Effect.fn("superagent.flushPendingUnlocked")(functi
   if (Option.isNone(delivered)) {
     yield* Effect.logWarning("superagent failed to flush pending triggers, keeping them queued", {
       count: batch.length,
+      dirKey,
     })
     return
   }
   // Remove by delivered id, never by position: the queue may have grown at
   // the tail (or been trimmed elsewhere) while `synthetic` was awaited.
-  for (let index = store.pending.length - 1; index >= 0; index -= 1) {
-    const item = store.pending[index]
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]
     if (item !== undefined && batchIDs.has(pendingID(item.trigger, item.arrivedAt))) {
-      store.pending.splice(index, 1)
+      pending.splice(index, 1)
     }
   }
   // Remember what the Router was just told: `ticket_create` copies this
   // trigger into the ticket's authorization (id + quote).
-  if (newest !== undefined) noteRouterTrigger(newest.trigger)
+  if (newest !== undefined) noteRouterTrigger(newest.trigger, dirKey)
   for (const item of batch) {
-    yield* ctx.storage.remove(keyOf(item)).pipe(Effect.catch(() => Effect.void))
+    yield* ctx.storage
+      .remove(dirScopedKey(keyOf(item), dirKey))
+      .pipe(Effect.catch(() => Effect.void))
   }
 })
 
 /**
  * Serialised entry point for every flush caller (idle hook, RPC, tests).
- * Concurrent calls wait on `flushLock`, so one batch is delivered once.
- * `delivery` defaults to `queue`; `sleep` passes `steer` for its wake flush.
+ * Concurrent calls wait on their partition's `flush` lock, so one batch is
+ * delivered once; another directory's queue is a different lock and keeps
+ * flushing in parallel. `delivery` defaults to `queue`; `sleep` passes `steer`
+ * for its wake flush. `dirKey` defaults to the default partition.
  */
 export const flushPending = Effect.fn("superagent.flushPending")(function* (
   ctx: Plugin.Context,
-  options: { readonly delivery?: FlushDelivery } = {},
+  options: { readonly delivery?: FlushDelivery; readonly dirKey?: string } = {},
 ) {
-  yield* flushLock.withPermit(flushPendingUnlocked(ctx, options.delivery ?? "queue"))
+  const dirKey = effectiveDirKey(options.dirKey)
+  yield* lockFor("flush", dirKey).withPermit(flushPendingUnlocked(ctx, options.delivery ?? "queue", dirKey))
 })
 
 /**
- * Router idle hook: when the router goes idle with nothing pending in the
- * background, flush queued triggers into the same execution. An empty queue
- * returns without admitting input, so the hook never loops on its own.
+ * Router idle hook: when a router goes idle with nothing pending in the
+ * background, flush *its own* queue into the same execution. An empty queue
+ * returns without admitting input, so the hook never loops on its own. The
+ * event is matched against every partition's router, so one directory's idle
+ * never flushes another directory's triggers.
  */
 export const registerRouterIdle = Effect.fn("superagent.registerRouterIdle")(function* (ctx: Plugin.Context) {
   yield* ctx.session.hook("experimental.idle", (event) =>
     Effect.gen(function* () {
-      if (store.routerID === undefined || event.sessionID !== store.routerID) return
+      const dirKey = isRouterSession(event.sessionID)
+        ? (dirKeyForRouter(event.sessionID) ?? DEFAULT_DIR_KEY)
+        : undefined
+      if (dirKey === undefined) return
       if (event.background.length > 0) return
-      yield* flushPending(ctx)
+      yield* flushPending(ctx, { dirKey })
     }).pipe(Effect.catch((cause) => Effect.logWarning("superagent router idle flush failed", { cause }))),
   )
 })

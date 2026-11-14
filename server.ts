@@ -4,20 +4,22 @@ import { Effect } from "effect"
 import { registerAbort, runAbort } from "./src/abort.js"
 import { registerAgents } from "./src/agents.js"
 import { registerContext } from "./src/context.js"
-import { hydrateDirs } from "./src/dirs.js"
+import { hydrateDirs, dirKeyFor, resolveDirectory } from "./src/dirs.js"
 import { registerTools } from "./src/dispatch.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { hydrateReports } from "./src/report.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
 import { hydrateSessionMeta } from "./src/session-meta.js"
+import { applySettings, perDirectoryRouterEnabled } from "./src/settings.js"
 import { registerSleep } from "./src/sleep.js"
-import { hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
+import { statusSnapshot } from "./src/status.js"
+import { dirStateForDirectory, hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { hydrateTickets, TICKET_STATES, type TicketState } from "./src/ticket.js"
 import { registerTicketTools, renderTicketTextDeep, renderTicketsTextDeep } from "./src/ticket-tools.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
-import { pluginVersion, versionNotice } from "./src/version.js"
+import { versionNotice } from "./src/version.js"
 import { registerWorkerPrompt } from "./src/worker-prompt.js"
 
 const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Context, input: TriggerInput) {
@@ -25,6 +27,13 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
   if (Array.isArray(sources) && !sources.includes(input.source)) return { route: "dropped" as const }
   if (input.text.trim() === "") return { route: "dropped" as const }
   const formatted = formatTrigger(input)
+  // Which directory this trigger belongs to: with per-directory routers the
+  // thread binding / alias match decides the partition, otherwise everything
+  // stays in the default partition (the pre-partition behaviour).
+  const directory = perDirectoryRouterEnabled()
+    ? resolveDirectory({ threadID: input.threadID, task: input.text })
+    : undefined
+  const partition = dirStateForDirectory(directory)
   // Sticky thread affinity: follow-ups on a known thread go straight back to
   // its worker instead of spawning a fresh session per message. Running
   // workers get everything; otherwise the most recent idle/done worker is
@@ -32,7 +41,7 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
   // the watcher flips it back to running). Failed workers are skipped so the
   // next message gets a fresh dispatch through the Router. A genuinely new
   // thread (no affinity record) starts with the Router.
-  const subscribed = store.threads.get(input.threadID) ?? []
+  const subscribed = partition.threads.get(input.threadID) ?? []
   const running = subscribed.filter((sessionID) => store.workers.get(sessionID)?.state === "running")
   const resumed = [...subscribed].reverse().find((sessionID) => {
     const state = store.workers.get(sessionID)?.state
@@ -55,9 +64,12 @@ const runTrigger = Effect.fn("superagent.runTrigger")(function* (ctx: Plugin.Con
     }
     if (delivered > 0) return { route: "worker" as const, sessionID: targets[0] }
   }
-  yield* enqueuePending(ctx, input)
-  const routerID = yield* ensureRouter(ctx)
-  if (!store.routerBusy) yield* flushPending(ctx)
+  yield* enqueuePending(ctx, input, partition.dirKey)
+  const routerID = yield* ensureRouter(ctx, {
+    dirKey: partition.dirKey,
+    ...(directory === undefined ? {} : { directory }),
+  })
+  if (!partition.routerBusy) yield* flushPending(ctx, { dirKey: partition.dirKey })
   return { route: "router" as const, sessionID: routerID }
 })
 
@@ -109,6 +121,10 @@ export default Plugin.define({
     // Version only: no paths, options or tokens. Makes a stale gateway obvious
     // in the log right after an upgrade (the plugin has no hot reload).
     yield* Effect.logInfo(versionNotice())
+    // Resolve plugin options once, before any hydrate: the directory-partition
+    // switch decides where state is read and written, so it must not be read
+    // lazily per call after some state has already been routed.
+    applySettings(ctx.options)
     // Tickets first: hydrating workers reconciles finished `running` records
     // and closes their tickets, so the ticket store must already be loaded.
     yield* hydrateTickets(ctx)
@@ -130,8 +146,11 @@ export default Plugin.define({
     yield* registerWatchdog(ctx)
     yield* ctx.rpc
       .register(ServerDefinition, {
-        router: () =>
-          ensureRouter(ctx).pipe(
+        router: (input) =>
+          // Stage 3: the TUI passes its session directory so a per-directory
+          // install opens (or reuses) that directory's Router. With the flag off
+          // `ensureRouter` collapses every directory onto the default partition.
+          ensureRouter(ctx, input.directory === undefined ? {} : { directory: input.directory }).pipe(
             Effect.map((sessionID) => ({ sessionID })),
             Effect.catch((cause) =>
               Effect.logWarning("superagent router handler failed", { cause }).pipe(
@@ -139,22 +158,10 @@ export default Plugin.define({
               ),
             ),
           ),
-        status: () =>
-          Effect.sync(() => ({
-            // Reported alongside the runtime state so the TUI/diagnostics can
-            // show which plugin build the gateway actually loaded.
-            version: pluginVersion(),
-            // Omit the key entirely when no router exists: an explicit
-            // `undefined` value fails output validation.
-            ...(store.routerID === undefined ? {} : { router: store.routerID }),
-            pending: store.pending.length,
-            workers: [...store.workers.values()].map((worker) => ({
-              sessionID: worker.sessionID,
-              ...(worker.title === undefined ? {} : { title: worker.title }),
-              threads: [...worker.threads],
-              state: worker.state,
-            })),
-          })),
+        status: (input) =>
+          Effect.sync(() =>
+            statusSnapshot(input.directory === undefined ? {} : { directory: input.directory }),
+          ),
         tickets: (input, context) => {
           // The protocol literal already rejects unknown states with
           // `rpc.invalid_input`; keep an explicit RPC error as a second line of
@@ -167,13 +174,22 @@ export default Plugin.define({
               }),
             )
           }
+          // Stage 3: a directory argument scopes the read to that partition;
+          // omitting it keeps the process-wide list (the pre-3 behaviour).
+          // `dirKeyFor` already collapses to the default partition when the
+          // flag is off, so old TUI builds see the same list as before.
+          const dirKey = input.directory === undefined ? undefined : dirKeyFor(input.directory)
           // Read through the ticket store's KV fallback: memory only keeps the
           // newest tickets, and a trimmed one must not look missing here.
-          return renderTicketsTextDeep(ctx, {
-            ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
-            ...(input.status === undefined ? {} : { status: input.status }),
-            ...(input.limit === undefined ? {} : { limit: input.limit }),
-          }).pipe(Effect.map((text) => ({ text })))
+          return renderTicketsTextDeep(
+            ctx,
+            {
+              ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+              ...(input.status === undefined ? {} : { status: input.status }),
+              ...(input.limit === undefined ? {} : { limit: input.limit }),
+            },
+            dirKey,
+          ).pipe(Effect.map((text) => ({ text })))
         },
         ticket: (input) => renderTicketTextDeep(ctx, input.ticketID).pipe(Effect.map((text) => ({ text }))),
         ...rejectedRouterRpc,

@@ -16,6 +16,7 @@ import {
 } from "./src/picker-nav"
 import { detailRows, parseTicketDetail, type TicketDetail } from "./src/ticket-detail"
 import { resolveTicketQuery, searchPickerOptions } from "./src/ticket-search"
+import type { StatusPartitionView } from "./src/status"
 import {
   computeDialogSize,
   layoutHelp,
@@ -104,6 +105,8 @@ function ticketStateColor(theme: Theme, state: TicketState) {
 function SidebarTickets(props: { context: Plugin.Context }) {
   const theme = props.context.theme
   const [rows, setRows] = createSignal<ReadonlyArray<TicketRow>>([])
+  const [partitions, setPartitions] = createSignal<ReadonlyArray<StatusPartitionView>>([])
+  const [currentDirKey, setCurrentDirKey] = createSignal<string | undefined>(undefined)
   const [failed, setFailed] = createSignal(false)
   let disposed = false
   let running = false
@@ -113,9 +116,24 @@ function SidebarTickets(props: { context: Plugin.Context }) {
     running = true
     try {
       const rpc = props.context.client.rpc(Definition)
-      const { text } = await rpc.tickets({ limit: TICKET_PANEL_LIMIT }, options(props.context))
+      const call = options(props.context)
+      const directory = directoryOf(props.context)
+      // Aggregate status drives the partition list; the scoped call tells us
+      // which row is the session's own directory (so it can be highlighted).
+      // Scoping the ticket list keeps another directory's work orders out of
+      // this panel under `perDirectoryRouter`.
+      const [status, scoped, tickets] = await Promise.all([
+        rpc.status({}, call),
+        directory === undefined ? Promise.resolve(undefined) : rpc.status({ directory }, call).catch(() => undefined),
+        rpc.tickets(
+          { limit: TICKET_PANEL_LIMIT, ...(directory === undefined ? {} : { directory }) },
+          call,
+        ),
+      ])
       if (disposed) return
-      setRows(parseTicketList(text))
+      setPartitions(status.partitions ?? [])
+      setCurrentDirKey(scoped?.dirKey)
+      setRows(parseTicketList(tickets.text))
       setFailed(false)
     } catch {
       if (!disposed) setFailed(true)
@@ -136,13 +154,52 @@ function SidebarTickets(props: { context: Plugin.Context }) {
   })
 
   const panel = createMemo(() => ticketPanel(rows()))
+  // One partition = the pre-2b view; hide the summary entirely so the sidebar
+  // looks exactly as it did before this stage.
+  const showPartitions = createMemo(() => partitions().length > 1)
 
   return (
-    <Show when={panel().items.length > 0 || failed()}>
+    <Show when={panel().items.length > 0 || failed() || showPartitions()}>
       <box>
+        <Show when={showPartitions()}>
+          <box>
+            <text fg={theme.text.base} wrapMode="none" truncate>
+              <b>目录 {partitions().length}</b>
+              <span style={{ fg: theme.text.muted }}> · 每区 router/pending/run</span>
+            </text>
+            <For each={partitions()}>
+              {(partition) => (
+                <text wrapMode="none" truncate>
+                  <span
+                    style={{
+                      fg:
+                        partition.router === undefined
+                          ? theme.text.muted
+                          : theme.text.feedback.success.base,
+                    }}
+                  >
+                    {partition.router === undefined ? "○" : "●"}
+                  </span>
+                  <span
+                    style={{
+                      fg: partition.dirKey === currentDirKey() ? theme.text.base : theme.text.muted,
+                    }}
+                  >
+                    {" "}
+                    {partitionLabel(partition)}
+                  </span>
+                </text>
+              )}
+            </For>
+          </box>
+        </Show>
         <Show
           when={panel().items.length > 0}
-          fallback={<text fg={theme.text.feedback.warning.base}>工单 读取失败</text>}
+          fallback={
+            <Show when={failed()}>
+              <text fg={theme.text.feedback.warning.base}>工单 读取失败</text>
+            </Show>
+          }
         >
           <text fg={theme.text.base} wrapMode="none" truncate>
             <b>工单 {panel().total}</b>
@@ -171,6 +228,19 @@ function SidebarTickets(props: { context: Plugin.Context }) {
       </box>
     </Show>
   )
+}
+
+/** Show the directory's basename; fall back to the partition key when unknown. */
+function partitionLabel(partition: StatusPartitionView): string {
+  const name = partition.directory === undefined ? partition.dirKey : basenameOf(partition.directory)
+  const label = name.length > 14 ? `${name.slice(0, 13)}…` : name
+  return `${label} p${partition.pending} ${partition.running}/${partition.workers}`
+}
+
+function basenameOf(path: string): string {
+  const parts = path.split(/[\\/]+/).filter((part) => part !== "")
+  const last = parts[parts.length - 1]
+  return last === undefined || last === "" ? path : last
 }
 
 /** One picker row: the columns it draws plus the value it resolves to. */
@@ -838,7 +908,7 @@ function browseTickets(
 async function open(context: Plugin.Context) {
   try {
     const rpc = context.client.rpc(Definition)
-    const { sessionID } = await rpc.router({}, options(context))
+    const { sessionID } = await rpc.router(directoryInput(context), options(context))
     gotoSession(context, sessionID)
   } catch (error) {
     context.ui.toast.show({ title: "Superagent", message: message(error), variant: "error" })
@@ -867,7 +937,7 @@ async function tickets(context: Plugin.Context) {
   try {
     const rpc = context.client.rpc(Definition)
     const call = options(context)
-    const status = await rpc.status({}, call)
+    const status = await rpc.status(directoryInput(context), call)
     // A broken ticket list must not hide the worker list (and vice versa).
     const rows = await loadTickets(context).catch(() => [])
     if (status.workers.length === 0 && rows.length === 0) {
@@ -982,7 +1052,7 @@ async function abort(context: Plugin.Context) {
   try {
     const rpc = context.client.rpc(Definition)
     const call = options(context)
-    const status = await rpc.status({}, call)
+    const status = await rpc.status(directoryInput(context), call)
     const selection = await context.ui.dialog.select({
       title: "Superagent abort",
       options: [
@@ -1090,7 +1160,7 @@ async function showTicketDetail(context: Plugin.Context, ticketID: string) {
 /** Every ticket the `tickets` RPC can return (the server clamps `limit` at 100). */
 async function loadTickets(context: Plugin.Context): Promise<Array<TicketRow>> {
   const rpc = context.client.rpc(Definition)
-  const { text } = await rpc.tickets({ limit: TICKET_PICKER_LIMIT }, options(context))
+  const { text } = await rpc.tickets({ limit: TICKET_PICKER_LIMIT, ...directoryInput(context) }, options(context))
   return parseTicketList(text)
 }
 
@@ -1154,6 +1224,22 @@ function gotoSession(context: Plugin.Context, sessionID: string) {
 
 function options(context: Plugin.Context): RpcCallOptions {
   return context.location ? { location: { directory: context.location.directory } } : {}
+}
+
+/** The session location's directory, when the host knows it. */
+function directoryOf(context: Plugin.Context): string | undefined {
+  return context.location?.directory
+}
+
+/**
+ * Stage 3: the `status` / `tickets` / `router` inputs carry the session's
+ * directory, so a `perDirectoryRouter` gateway shows and opens that partition.
+ * With the flag off the server collapses it onto the default partition, so the
+ * request is byte-identical to the pre-3 one.
+ */
+function directoryInput(context: Plugin.Context): { readonly directory?: string } {
+  const directory = directoryOf(context)
+  return directory === undefined ? {} : { directory }
 }
 
 function message(error: unknown) {

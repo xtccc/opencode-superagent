@@ -19,6 +19,7 @@
   - [工单 Ticket](#工单-ticket)
   - [侧栏工单面板](#侧栏工单面板)
   - [单网关多目录 Router 自管](#单网关多目录-router-自管)
+  - [单网关多目录（perDirectoryRouter）](#单网关多目录perdirectoryrouter)
   - [终止会话 abort_session](#终止会话-abort_session)
   - [会话区分 title 与 metadata](#会话区分-title-与-metadata)
   - [Watchdog](#watchdog)
@@ -228,12 +229,13 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 
 - **位置**：`append: "sidebar.content"`，排在内置 Todo / MCP / Limit 模块之后；侧栏只有 42 列（`SESSION_SIDEBAR_WIDTH`），`sidebar.content` 的 slot input 只有 `sessionID`、没有宽度，所以面板按固定 36 cell 布局（42 − 4 padding − 1 滚动条列，再留 1 cell 余量）。
 - **渲染**：
+  - 目录摘要（阶段 3）：当 RPC `status` 返回超过一个活跃分区时，标题行上方多一块 `目录 N · 每区 router/pending/run`，每行是该分区的 `●`/`○`（Router 是否在线）+ basename + `p<待投递> <running>/<workers>`；当前会话所在分区用正文色高亮。只有一个分区时整块不渲染，视觉与之前完全一致。
   - 标题行：`工单 <总数>`，有未结单时追加 ` · <N> 未结`（`open`/`in_progress`/`blocked` 计为未结）。
   - 每行：状态符号 + 标题 + 4 位短 ID（`tk_mw7tqs9a_ximd` → `ximd`）。符号与颜色按语义取 theme token：`●` 进行中（info）、`◆` 阻塞（warning）、`○` 待办、`✓` 完成（success）、`✗` 失败（error）、`⊘`/`·` 取消/被取代（muted）。
   - 排序：`in_progress` → `blocked` → `open` → 终态；同一状态内保持服务端 `listTickets` 的 `updatedAt` 倒序（稳定排序）。
   - 终态最多显示 3 条，其余折成 `… 另有 N 条已结`。
   - 截断：标题按**终端显示宽度**截断（CJK 算 2 cell），宽度预算 `36 − 符号1 − 空格1 − 短ID4 − 空格1 = 29`，再保守封顶 26 cell，超出用 `…`；`<text wrapMode="none" truncate>` 再兜一层，保证任何一行都不超宽。
-- **数据与刷新**：数据来自既有 RPC `tickets({ limit: 20 })`（`ticket_list` 的渲染版），启动即拉一次，之后每 4s 轮询（`TICKET_PANEL_REFRESH_MS`）。面板只在侧栏可见时挂载（侧栏 `Show` 控制），组件 `onMount`/`onCleanup` 起停定时器，切到终端面板或隐藏侧栏后不再轮询；同一时刻只有一个请求在飞。
+- **数据与刷新**：数据来自 RPC `tickets({ limit: 20, directory? })`（`ticket_list` 的渲染版）与 `status({})` / `status({ directory })`（阶段 3 的分区摘要，后者只用来标记当前分区）。启动即拉一次，之后每 4s 轮询（`TICKET_PANEL_REFRESH_MS`）。面板只在侧栏可见时挂载（侧栏 `Show` 控制），组件 `onMount`/`onCleanup` 起停定时器，切到终端面板或隐藏侧栏后不再轮询；同一时刻只有一轮请求在飞。
 - **空态**：没有任何工单时整块不渲染（与内置 sidebar 模块一致），不占侧栏空间、不留空标题。
 - **失败降级**：RPC 抛错时显示 `工单 读取失败`（warning 色）；已有列表时降级为标题行追加 ` · 读取失败`，保留上一次的旧数据，不抛错、不影响其他 sidebar 模块。
 - **交互**：点击任意一行等同 `/ticket <id>`，弹窗显示该工单详情。slot 只提供渲染，不接管键盘，所以没有回车跳转。
@@ -267,6 +269,69 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
   "plugins": ["/abs/path/to/opencode-superagent"],
 }
 ```
+
+### 单网关多目录（perDirectoryRouter）
+
+默认情况下，一个网关进程只维护一份 Router、未投递队列、thread 亲和、trigger 历史与工单：所有目录共享它们，KV key 也保持旧格式。打开 `perDirectoryRouter` 后，网关变成「一目录一分区」：每个目录有自己的 Router、队列、锁、thread 亲和、trigger 历史和工单，一次升级只改一个开关，关闭时行为与升级前逐字节一致。
+
+#### 开关与默认值
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `perDirectoryRouter` | `false` | 只有严格的布尔 `true` 才打开；字符串 `"true"`、数字 `1` 一律按关闭处理。 |
+| `maxWorkersPerDirectory` | `0`（不限制） | 每个目录同时存活的 worker 上限（`running`/`idle`）。`0` 或非正整数视为不限制。开关关闭时它计算的是默认分区，等于全进程上限。 |
+
+开关是**进程启动时读取一次**的（`server.ts` 的 `applySettings`）：热改配置不会切换分区，必须重启网关；升级到带此功能的版本同样需要重启网关（插件不支持热加载）。
+
+#### 开启后的语义
+
+- **一目录一 Router**：每个目录分区有自己的 Router 会话，创建在该目录的 `location.directory` 里，因此它的模型解析、工具 cwd 和注入的目录上下文与它派出的 Worker 一致。Router 的 id 按分区保存在 `dir:<dirKey>:router`，默认分区仍写旧的 `router`。
+- **队列与锁按目录**：每个分区有独立的 pending 队列、flush 信号量和 router 创建锁。一个目录的慢 `sessions.create` 不会阻塞另一个目录的 flush。
+- **thread 亲和按目录隔离**：同一个 `threadID` 在两个目录下各有一张亲和表与 trigger 历史，互不串台；`runTrigger`、`dispatch` 和 `detachWorkerThreads` 都显式带 `dirKey`。
+- **终态与提醒回本目录 Router**：Worker 的终态事件、watchdog 停滞告警和 `sleep` 唤醒按 worker 记录里的 `directory` → `dirKey` 投递到该分区的 Router，跨目录绝不串台；没有 `directory` 的旧记录降级到默认分区并只告警一次。
+- **工单按目录**：工单归属由它自己的 `directory` 推导（与 `requireRouterFor` 同一条规则）；`ticket_create` / `ticket_list` / `ticket_update` / `ticket_close` / `dispatch` 的工单闸门都只作用于调用方 Router 的分区，操作另一目录的工单会被明确拒绝（错误里同时给出两个分区）。
+- **限额按目录**：`maxWorkersPerDirectory` 在 `dispatch` 的 claim 之后、`sessions.create` 之前同步占位（含并发在途预留），两个并发 dispatch 不会同时看到最后一个空位而超卖；另一目录不受影响。
+- **RPC 可见性**：`status` / `tickets` / `router` 都接受可选 `directory`。`status` 不传时返回聚合视图；当开关打开且存在**两个以上活跃分区**时额外返回 `partitions`（每个分区的 `dirKey`/`directory`/`router`/`pending`/`workers`/`running`），传了只返回该目录分区（并回显 `dirKey`/`directory`）。`tickets` 传 `directory` 只列该分区；不传仍是进程级列表。`router` 传 `directory` 会打开/复用该目录的 Router。TUI 把当前会话目录传给这三个方法，侧栏在存在多个分区时显示「目录」摘要，单分区时视觉与输出都与以前一致。
+- **目录解析**：有显式 `directory` 用显式值；否则按 thread 绑定、已知别名解析；都解析不出时落入默认分区。默认分区的 Router 没有目录，因此不能派发带目录的工单（会报错提示用对应目录的 Router），此时先用 `/dir` 或让别名/thread 绑定解析出目录。
+
+#### KV 键布局对照
+
+非默认分区才加 `dir:<dirKey>:` 前缀；默认分区**永远**保持旧 key，这样升级时旧数据原地落在默认分区，不需要搬运。
+
+| 数据 | 默认分区（开关开/关都一样） | 非默认分区（仅开关打开） |
+| --- | --- | --- |
+| Router | `router` | `dir:<dirKey>:router` |
+| 未投递队列 | `pending:<id>` | `dir:<dirKey>:pending:<id>` |
+| thread 亲和 | `thread:<threadID>` | `dir:<dirKey>:thread:<threadID>` |
+| trigger 历史 | `trigger:<id>` | `dir:<dirKey>:trigger:<id>` |
+| 工单 | `ticket:<id>` | `dir:<dirKey>:ticket:<id>` |
+| 工单索引 | `ticketidx:*` | `dir:<dirKey>:ticketidx:*` |
+| worker 记录 | `worker:<sessionID>` | 不变（进程级；记录里带 `directory`，事件按它归位） |
+| thread→目录提示 | `dir:thread:<threadID>` | 不变（全局提示表，见「已知限制」） |
+| 别名 | `dir:alias:<小写别名>` | 不变（全局提示表） |
+
+`dirKey` 由 `dirKeyOf(directory)` 生成：先跨平台规范化路径，再优先 `realpathSync`，最后是 `<小写 slug>-<sha1[0:8]>`（只含 `[a-z0-9-]`）。空目录、相对路径和非法路径都归到固定的 `default`。
+
+#### 迁移策略
+
+- **旧工单**：启动时 `hydrateTickets` 先读分区命名空间，再扫旧的 `ticket:<id>`。目录属于非默认分区的旧单会写一份 `dir:<dirKey>:ticket:<id>` 副本，**旧 key 保留**。迁移是幂等的：内存按工单 id 去重，scoped 副本先于 legacy 扫描被采用，重复启动不会产生重复记录或重复写入（`dirtyTicketIDs()` 为空）。
+- **旧 Router / thread / trigger / pending**：默认分区的旧 key 原样读回默认分区；非默认分区的数据本来就在 `dir:<dirKey>:` 下，启动时按命名空间回放到各自分区。
+- **不需要手工迁移**：开关关闭时连扫描都走旧路径；打开时默认分区仍是旧 key，只有非默认分区使用新前缀。
+
+#### 回滚注意事项
+
+- **关闭开关即可回滚到单实例行为**：默认分区的数据就是旧版本的数据，旧版本读到的 KV 与升级前一致。
+- 回滚后旧版本只看到**迁移那一刻的快照**：开关打开期间写进 `dir:<dirKey>:` 的 Router、队列、工单、trigger 与 thread 亲和，旧版本完全看不到；不要为了「干净」删除 `dir:<dirKey>:` 键，否则重新打开开关会丢失这些状态。
+- 降级二进制同样安全：旧代码不识别 `dir:` 前缀，会忽略这些键，不会误读成默认分区的数据。
+- 回滚/升级都需要重启网关（无热加载）；TUI 需要重开才能显示新的分区摘要。
+
+#### 已知限制
+
+- **worker 记录仍是进程级**：`worker:<sessionID>` 不分区，靠记录里的 `directory` 归位。没有 `directory` 的旧记录一律降级到默认分区（只告警一次），不会丢完成事件，但也无法自动判断它原本属于哪个目录。
+- **thread→目录提示表是全局的**：`src/dirs.ts` 的 `threadDirs`（`dir:thread:<threadID>`）是目录路由的提示，不随分区隔离。同一个 `threadID` 在两个目录复用时，提示值保留**最后写入者**；真正的分区归属仍由 Router/worker 的 `directory` 决定，所以这只会影响「新 trigger 该进哪个目录」的推断，不会让一个目录的 worker 完成事件跑到另一个目录。
+- **热切换不支持**：`perDirectoryRouter` 在进程启动时读取一次，运行中改配置不生效；升级插件也必须重启网关。
+- **状态摘要只列活跃分区**：`status.partitions` 省略既没有 Router、也没有 pending、也没有 worker 的空分区（例如刚 hydrate 的默认分区）；少于两个活跃分区时整个 `partitions` 字段都不出现，因此单分区输出与阶段 2b 逐字节一致。
+- **聚合视图的旧字段仍是旧语义**：不传 `directory` 时 `router` 是默认分区（否则第一个有 Router 的分区）的 id、`pending` 是所有分区之和、`workers` 是全部 worker；需要单目录精确视图时必须传 `directory`。
 
 ### 终止会话 abort_session
 
@@ -308,11 +373,11 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 
 TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.superagent"`）与 `src/tools.ts` 的工具目录（`/tools` 直接渲染它，不发 RPC）。服务端注册的就是同一个 `Definition` 对象（`server.ts` 的 `ServerDefinition = Definition`），所以方法、入参/出参和声明错误两边不会漂移。TUI 实际调用六个方法：
 
-- `router({}) -> { sessionID }`：创建或返回 Router 会话。
-- `status({}) -> { version?, router?, pending, workers }`：`version` 是当前网关加载的插件版本（启动日志里也有），演示命令用它等待 `T-1` 的 Worker 就绪。Router 尚未创建时返回 `{ version, pending, workers }`，省略 `router` 键（显式 `undefined` 会导致输出校验失败）。
+- `router({ directory? }) -> { sessionID }`：创建或返回 Router 会话。带 `directory` 时打开/复用该目录分区的 Router（`perDirectoryRouter` 打开时创建在该目录）；关闭开关时仍落到唯一的默认 Router。
+- `status({ directory? }) -> { version?, router?, pending, workers, partitions?, dirKey?, directory? }`：`version` 是当前网关加载的插件版本（启动日志里也有），演示命令用它等待 `T-1` 的 Worker 就绪。Router 尚未创建时返回 `{ version, pending, workers }`，省略 `router` 键（显式 `undefined` 会导致输出校验失败）。不传 `directory` 是聚合视图；`perDirectoryRouter` 打开且存在两个以上活跃分区时额外返回 `partitions`（每区的 `dirKey`/`directory`/`router`/`pending`/`workers`/`running`，空分区省略），只有一个分区时不出现该字段（与阶段 2b 逐字节一致）；传了 `directory` 只返回该分区并回显 `dirKey`/`directory`，不返回 `partitions`。
 - `trigger({ source, threadID, author?, text, title?, createdAt?, id? }) -> { route, sessionID? }`：注入一条事件，`route` 为 `router` / `worker` / `dropped`。
 - `abort({ sessionID?, reason?, all?, stale? }) -> { text }`：终止/清理 Worker，被拒绝时抛 `abort.rejected`（带可读 message）。TUI 的 `/abort`（或命令面板「Superagent abort worker」）会列出 Worker 供选择，首项是「清理全部已结束 worker」。
-- `tickets({ threadID?, status?, limit? }) -> { text }`：渲染工单列表（按状态分组，窄终端友好），对应侧栏面板与 `/tickets` 的列表页。内存页不足时回源 KV 补齐，被裁剪的老单不会显示成缺失。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成「不过滤的完整列表」；服务端另有 `tickets.invalid_status` 作为第二道防线。
+- `tickets({ threadID?, status?, limit?, directory? }) -> { text }`：渲染工单列表（按状态分组，窄终端友好），对应侧栏面板与 `/tickets` 的列表页。传 `directory` 只列该目录分区（TUI 会传当前会话目录）；不传仍是进程级列表。内存页不足时回源 KV 补齐，被裁剪的老单不会显示成缺失。`status` 是闭合枚举，传非法值（如 `DONE`、拼写错误）会直接被协议校验拒绝，不会退化成「不过滤的完整列表」；服务端另有 `tickets.invalid_status` 作为第二道防线。
 - `ticket({ ticketID }) -> { text }`：渲染单张工单详情，对应 `/ticket <id>`；内存未命中时从 KV 读一次再渲染，确实不存在才回 `没有找到工单 <id>`。
 
 契约里还声明了 `dispatch` 与 `stop`：两者只给 Router 的工具使用，**RPC 调用一律 fail-closed**。RPC 传输层不提供调用方 session（`RpcCallContext` 只有 `error`），入参里的 `caller`/`routerID` 可伪造（router id 在 `status` 里公开），因此 `dispatch` 固定返回 `dispatch.rejected`、`stop` 固定返回 `stop.rejected`，既不会建 Worker 也不会中断 Worker。这两个错误与其他方法一样声明在共享 `Definition` 里，server 与 TUI 读同一份定义；真正的 Router 通过工具干活，工具的 `context.sessionID` 由宿主提供，是唯一被信任的身份来源。
@@ -328,6 +393,8 @@ TUI 侧只依赖 `src/protocol.ts` 导出的 `Definition`（`id: "opencode.super
 | `watchdogIntervalMs` | `60000` | Watchdog 检查间隔（毫秒），非正数回退默认。 |
 | `stallTimeoutMs` | `1800000` | Worker 停滞判定阈值（毫秒，默认 30 分钟），非正数回退默认。 |
 | `pendingTTLMs` | `86400000`（24 小时） | 未投递 trigger 的崩溃重放上限：`hydratePending` 只回放 `arrivedAt` 在 TTL 内的条目，更旧的从 KV 删除并在日志/`status` 记 `pendingDropped`。非数值或非正数回退默认。 |
+| `perDirectoryRouter` | `false` | 「一目录一实例」开关（阶段 2b：一目录一 Router + 工单/trigger 历史/thread 亲和按目录分区）。`false`＝单实例行为：全进程共用一份 Router / 队列 / thread 亲和 / 工单 / trigger 历史，KV key 保持 `router`、`worker:`、`thread:`、`trigger:`、`ticket…` 原样，升级不丢状态。`true`＝按目录分区：每个目录独立 Router 会话（创建在该目录）、独立未投递队列与锁、独立 thread 亲和、独立 trigger 历史与工单；非默认分区的 KV 加 `dir:<dirKey>:` 前缀（默认分区仍是旧 key，升级时旧工单按 `ticket.directory` 一次性幂等迁入各自分区并保留旧 key 供回滚）。同一 threadID 在两个目录下各归各的亲和表，互不串台。Worker 记录仍是进程级（记录里带 `directory`，事件据此归位）。只有严格 `true` 才打开（字符串 `"true"`、`1` 一律按关闭处理）。 |
+| `maxWorkersPerDirectory` | `0`（不限制） | 单目录同时存活的 worker 上限（`running`/`idle` 计数，`>0` 的整数才生效）。超限时 `dispatch` 返回 `Tool.Error`，占位与工单 claim 在同一同步段完成，不会并发超卖。开关关闭时计算的是「默认分区」即全进程。 |
 
 另外两项属于 OpenCode 自身配置，不是插件选项：
 
@@ -377,6 +444,7 @@ npm pack --dry-run     # 预览 tarball（prepack/prepare 会各跑一次 build�
 ## 已知限制与路线图
 
 - **反向派活与接管**：Worker 不能创建子任务，Router 也不能在多轮后重新接管 thread。
+- **一目录一实例（perDirectoryRouter，阶段 2b/3）**：`perDirectoryRouter: true` 时 Router 会话、未投递队列、flush/router 锁、thread 亲和、trigger 历史与工单都按目录分区；worker 终态、watchdog 告警与 `sleep` 唤醒只回到它所属目录的 Router，`dispatch`、工单读写、`status`、`tickets`、`thread_detail` 与状态注入也都只作用于调用方目录，跨目录的操作会被明确拒绝。RPC 的 `status` / `tickets` / `router` 接受可选 `directory`，TUI 自动带上当前会话目录；侧栏在存在多个分区时显示分区摘要，单分区时保持原样。同一个 threadID 在两个目录下各有各的亲和表与 trigger 历史。仍是进程级的部分：worker 记录（记录里带 `directory`，事件据此归位）与 `dirs.ts` 的 thread→目录提示表（全局提示，同一 threadID 复用时保留最后写入者）。升级兼容：旧 `ticket:<id>` 记录在启动时按 `ticket.directory` 迁入各自分区，**旧 key 保留**——回滚到旧版本时仍读得到自己的数据（旧版本看不到迁移后新写入的状态，迁移那一刻的快照是回滚后的可见内容）。开关热切换和升级都必须重启网关。详见[单网关多目录（perDirectoryRouter）](#单网关多目录perdirectoryrouter)。
 - **真实信道**：把 TUI 演示事件换成 IM、GitHub issue/comment、Webhook 等来源，并补上签名与去重。
 - **隐藏 Worker**：让 Worker 会话不出现在普通会话列表，只通过 Router 暴露进度（当前只做 title 前缀，未做过滤/分组）。
 - **持久化与并发**：事件去重、断线重放、跨进程 thread 租约，以及多 TUI 实例的一致性。
