@@ -179,11 +179,17 @@ describe("dispatch effort maps to the worker model variant", () => {
   test("a failing model catalog degrades to the inherited level instead of blocking", async () => {
     const ctx = effortContext({ model: routerModel, variants: "throws" })
     const created = await succeed(createTicket(ctx, base))
-    await succeed(runDispatch(ctx, { task: "写发布说明", ticketID: created.ticket.id, effort: "max" }, ROUTER))
+    const result = await succeed(
+      runDispatch(ctx, { task: "写发布说明", ticketID: created.ticket.id, effort: "max" }, ROUTER),
+    )
     expect(ctx.creates[0]?.model).toEqual(routerModel)
     const dispatch = getTicket(created.ticket.id)?.history.find((entry) => entry.kind === "dispatch")
     // The history never claims an effort that was not applied.
     expect(dispatch?.note).toContain("effort=max (unverified: inherited)")
+    // The Router reads the tool result, not the ticket history: a silent degrade
+    // here is exactly how a "effort=high" dispatch ends up unverified.
+    expect(result.content).toContain("WARNING: effort max was NOT applied")
+    expect(result.content).toContain("unverified: inherited")
   })
 
   test("a host without ctx.model degrades the same way", async () => {
@@ -214,10 +220,23 @@ describe("dispatch effort maps to the worker model variant", () => {
   test("effort without any resolvable model degrades to no explicit model", async () => {
     const ctx = effortContext({ model: undefined, defaultModel: undefined })
     const created = await succeed(createTicket(ctx, base))
-    await succeed(runDispatch(ctx, { task: "写发布说明", ticketID: created.ticket.id, effort: "low" }, ROUTER))
+    const result = await succeed(
+      runDispatch(ctx, { task: "写发布说明", ticketID: created.ticket.id, effort: "low" }, ROUTER),
+    )
     expect(ctx.creates[0]?.model).toBeUndefined()
     const dispatch = getTicket(created.ticket.id)?.history.find((entry) => entry.kind === "dispatch")
     expect(dispatch?.note).toContain("effort=low (unresolved: inherited)")
+    expect(result.content).toContain("WARNING: effort low was NOT applied")
+  })
+
+  test("an applied effort adds no warning to the tool result", async () => {
+    const ctx = effortContext({ model: routerModel })
+    const created = await succeed(createTicket(ctx, base))
+    const result = await succeed(
+      runDispatch(ctx, { task: "写发布说明", ticketID: created.ticket.id, effort: "high" }, ROUTER),
+    )
+    expect(result.content).not.toContain("WARNING")
+    expect(result.content).toContain(`Ticket ${created.ticket.id} is now in_progress.`)
   })
 
   test("effort cannot be combined with an explicit agent override", async () => {

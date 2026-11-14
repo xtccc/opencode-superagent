@@ -630,9 +630,16 @@ const completeDispatch = Effect.fn("superagent.dispatchClaimed")(function* (
     })
   }
   const where = targetDirectory === undefined ? "gateway default directory" : targetDirectory
+  // A degraded resolution must reach the Router, not just the ticket history: the
+  // dispatch still succeeds, so without this line the model would report the
+  // requested effort as applied while the worker actually inherited the Router's.
+  const degraded =
+    resolved.note !== undefined && /\((?:unverified|unresolved)/.test(resolved.note)
+      ? ` WARNING: effort ${input.effort} was NOT applied (${resolved.note}); the worker inherits the router's current level. Do not report this dispatch as effort=${input.effort}.`
+      : ""
   return {
     output: { sessionID: created.id },
-    content: `Worker ${created.id} started in ${where} in the background and will report back. Do not poll; wait for its report. Ticket ${ticket.id} is now in_progress.`,
+    content: `Worker ${created.id} started in ${where} in the background and will report back. Do not poll; wait for its report. Ticket ${ticket.id} is now in_progress.${degraded}`,
   }
 })
 

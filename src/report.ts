@@ -92,28 +92,70 @@ export function reportNotice(record: ReportRecord): string {
 }
 
 /**
+ * A compaction window can nest its replacement inside another compaction, so the
+ * native scan is bounded instead of trusting an arbitrary depth.
+ */
+const NATIVE_COMPACTION_DEPTH = 4
+
+/**
+ * One message's text parts, for both shapes this snapshot mixes: session
+ * messages tag the author in `type`, native (`native.messages`) windows use
+ * `role`. Non-assistant messages never contribute.
+ */
+function assistantText(message: unknown): string | undefined {
+  if (!isRecord(message)) return undefined
+  if (message["type"] !== "assistant" && message["role"] !== "assistant") return undefined
+  if (!Array.isArray(message["content"])) return undefined
+  const text = message["content"]
+    .flatMap((part) => {
+      if (!isRecord(part)) return []
+      return part["type"] === "text" && typeof part["text"] === "string" ? [part["text"] as string] : []
+    })
+    .join("\n")
+    .trim()
+  return text === "" ? undefined : text
+}
+
+/** The messages a live-compact replacement put in place of the window it shortened. */
+function compactedMessages(message: Record<string, unknown>): ReadonlyArray<unknown> | undefined {
+  if (message["type"] !== "compaction") return undefined
+  const native = message["native"]
+  if (!isRecord(native) || !Array.isArray(native["messages"])) return undefined
+  return native["messages"] as ReadonlyArray<unknown>
+}
+
+function newestAssistantText(messages: ReadonlyArray<unknown>, depth: number): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    const text = assistantText(message)
+    if (text !== undefined) return text
+    // A compaction replaces the whole window in `session.context()` with one card,
+    // so a finished answer can disappear from the top-level list entirely. The
+    // messages it stands in for are still there in `native.messages` — scanning
+    // them is the difference between a real report and "finished with no report".
+    if (depth >= NATIVE_COMPACTION_DEPTH || !isRecord(message)) continue
+    const inner = compactedMessages(message)
+    if (inner === undefined) continue
+    const nested = newestAssistantText(inner, depth + 1)
+    if (nested !== undefined) return nested
+  }
+  return undefined
+}
+
+/**
  * Last non-empty assistant text in a session-context snapshot. Shared by the
  * live watcher and startup hydration so a crash-recovered worker gets the
  * same report extraction as one that ended while the plugin was running.
+ *
+ * The snapshot is taken *after* the worker ended, which is exactly when a
+ * live-compact replacement may have collapsed the finished window into a single
+ * compaction card: the answer then only exists inside that card's `native.messages`.
+ * Without the fallback, every worker that ends inside a compacted span reports
+ * nothing even though it produced a full answer (an empty `lastReport` while the
+ * session is `done`).
  */
 export function lastAssistantText(messages: ReadonlyArray<unknown>): string | undefined {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]
-    if (typeof message !== "object" || message === null) continue
-    const typed = message as { type?: unknown; content?: unknown }
-    if (typed.type !== "assistant") continue
-    if (!Array.isArray(typed.content)) continue
-    const text = typed.content
-      .flatMap((part) => {
-        if (typeof part !== "object" || part === null) return []
-        const candidate = part as { type?: unknown; text?: unknown }
-        return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : []
-      })
-      .join("\n")
-      .trim()
-    if (text !== "") return text
-  }
-  return undefined
+  return newestAssistantText(messages, 0)
 }
 
 /** Page through a stored report; the caller validates offset against `stored`. */

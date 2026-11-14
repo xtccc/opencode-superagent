@@ -7,6 +7,7 @@ import {
   decodeReport,
   encodeReport,
   hydrateReports,
+  lastAssistantText,
   loadReport,
   REPORT_SUMMARY_LIMIT,
   REPORT_TEXT_LIMIT,
@@ -136,6 +137,70 @@ describe("report capture", () => {
     expect(decodeReport(undefined)).toBeUndefined()
     expect(decodeReport({ sessionID: "ses_a" } as unknown as Schema.Json)).toBeUndefined()
     expect(decodeReport({ sessionID: "ses_a", text: 1 } as unknown as Schema.Json)).toBeUndefined()
+  })
+})
+
+// ── extraction ────────────────────────────────────────────────────────────────
+
+/**
+ * `session.context()` is read *after* the worker ended, which is exactly when a
+ * live-compact replacement has already collapsed the finished window into one
+ * compaction card. Two real workers ended that way and stored no report at all
+ * while their session was `done`, so the extraction must read through the card.
+ */
+describe("lastAssistantText", () => {
+  const assistant = (text: string) => ({ type: "assistant", content: [{ type: "text", text }] })
+  const nativeAssistant = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] })
+
+  test("reads the newest text, skipping reasoning-only and tool messages", () => {
+    const messages = [
+      assistant("早先的结论"),
+      { type: "assistant", content: [{ type: "reasoning", text: "思考" }] },
+      { type: "tool", content: [] },
+      assistant("最终报告"),
+      { type: "idle", content: [] },
+    ]
+    expect(lastAssistantText(messages)).toBe("最终报告")
+  })
+
+  test("has nothing to report when no message carries text", () => {
+    expect(lastAssistantText([])).toBeUndefined()
+    expect(lastAssistantText([{ type: "assistant", content: [{ type: "reasoning", text: "x" }] }])).toBeUndefined()
+  })
+
+  test("falls back to the window a live-compact replacement stands in for", () => {
+    // Verbatim shape observed on a finished worker: the context is one card plus
+    // idle, and the answer survives only in `native.messages` (role-shaped).
+    const messages = [
+      {
+        type: "compaction",
+        id: "msg_card",
+        status: "completed",
+        reason: "manual",
+        summary: "Live Compact shortened a completed span.",
+        native: {
+          messages: [
+            { role: "user", content: [{ type: "text", text: "工单 tk_x" }] },
+            { role: "tool", content: [{ type: "text", text: "tool output" }] },
+            nativeAssistant("文档已写入 /tmp/opencode/one-instance-per-dir-eval.md"),
+          ],
+        },
+      },
+      { type: "idle", content: [] },
+    ]
+    expect(lastAssistantText(messages)).toBe("文档已写入 /tmp/opencode/one-instance-per-dir-eval.md")
+  })
+
+  test("a later replacement carries newer text than earlier messages, and nesting stays bounded", () => {
+    // The card stands in for everything up to its own position, so its window is
+    // newer than messages listed before it.
+    const card = { type: "compaction", native: { messages: [nativeAssistant("压缩后的新答案")] } }
+    expect(lastAssistantText([assistant("早先的答案"), card])).toBe("压缩后的新答案")
+
+    // A malformed or self-referential card must not recurse forever.
+    const cycle: Record<string, unknown> = { type: "compaction" }
+    cycle["native"] = { messages: [cycle] }
+    expect(lastAssistantText([cycle])).toBeUndefined()
   })
 })
 
