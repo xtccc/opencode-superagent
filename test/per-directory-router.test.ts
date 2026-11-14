@@ -31,6 +31,7 @@ import {
   totalPending,
   type WorkerRecord,
 } from "../src/state.js"
+import { resetSuperseded } from "../src/superseded.js"
 import { createTicket, resetTickets } from "../src/ticket.js"
 import { pluginVersion } from "../src/version.js"
 import { handleEnded, resetPartitionWarnings } from "../src/watcher.js"
@@ -205,6 +206,9 @@ beforeEach(() => {
   resetPartitions()
   resetPartitionWarnings()
   resetWatchdogAlerts()
+  // `superseded` is a process-wide registry: a marker left by an earlier test
+  // file would add a status line here and break the byte-for-byte assertions.
+  resetSuperseded()
   threadDirs.clear()
   aliasDirs.clear()
   aliasConflicts.clear()

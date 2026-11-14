@@ -16,6 +16,7 @@ import {
   store,
   threadKey,
 } from "../src/state.js"
+import { resetSuperseded } from "../src/superseded.js"
 import {
   closeTicket,
   createTicket,
@@ -147,6 +148,9 @@ beforeEach(() => {
   resetTickets()
   resetPartitions()
   resetPartitionWarnings()
+  // `superseded` is a process-wide registry: a marker left by an earlier test
+  // file would add a status line here and break the byte-for-byte assertions.
+  resetSuperseded()
   threadDirs.clear()
   aliasDirs.clear()
   aliasConflicts.clear()

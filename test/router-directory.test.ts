@@ -167,6 +167,9 @@ beforeEach(() => {
 afterEach(() => {
   resetSettings()
   resetPartitions()
+  // The registry is process-wide; leaving a marker here would leak a status
+  // line into the next test file.
+  resetSuperseded()
 })
 
 // ── 1. settings / validation ─────────────────────────────────────────────────
