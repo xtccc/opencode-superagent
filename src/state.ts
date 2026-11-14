@@ -19,6 +19,11 @@ import { partitioningEnabled, routerDirectorySetting } from "./settings.js"
 import { sharedSingleton } from "./shared.js"
 import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
+import {
+  hydrateSuperseded,
+  persistSuperseded,
+  supersededNotice,
+} from "./superseded.js"
 import { WORKER_STATES, workers, type WorkerRecord, type WorkerState } from "./worker-state.js"
 
 export type { WorkerRecord, WorkerState } from "./worker-state.js"
@@ -921,6 +926,9 @@ export const HYDRATE_CONCURRENCY = 8
  */
 export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Context) {
   persistHost.current = ctx
+  // Superseded markers first: the claim path below reads them to decide
+  // whether an old router pointer may be adopted again.
+  yield* hydrateSuperseded(ctx)
   const sessions = ctx.session
   const storage = ctx.storage
   // 旧 KV 只有一套扁平 key：读回的 Router / thread 亲和一律归入默认目录。
@@ -953,15 +961,32 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
           .get(dirScopedKey(ROUTER_KEY, pinnedKey))
           .pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (typeof scoped === "string" && scoped !== info.id) {
-          // A per-directory Router already owns this partition: keep it and
-          // drop the stale legacy pointer, so the same session can never be
-          // served by two partitions.
-          yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
-          yield* Effect.logInfo("superagent legacy router superseded by routerDirectory partition", {
-            legacy: info.id,
-            kept: scoped,
+          // A per-directory Router already owns this partition: it stays the
+          // owner. The legacy pointer is **kept** (not deleted) and the old
+          // session is marked `superseded`, so:
+          // - rolling back to the previous plugin version still finds a valid
+          //   `router` pointer (lossless rollback);
+          // - the old session can tell the user it lost the Router role
+          //   instead of failing every router-only tool silently.
+          // The legacy session is deliberately **not** registered as the
+          // default partition's Router: it belongs to the partition that
+          // replaced it, and one session must never serve two partitions.
+          const fresh = yield* persistSuperseded(ctx, {
+            sessionID: info.id,
+            supersededBy: scoped,
             dirKey: pinnedKey,
           })
+          if (fresh) {
+            yield* Effect.logWarning(
+              "superagent legacy router superseded: that session is no longer the Router",
+              {
+                legacy: info.id,
+                kept: scoped,
+                dirKey: pinnedKey,
+                notice: supersededNotice(info.id) ?? "",
+              },
+            )
+          }
         } else {
           dirState(store, pinnedKey, pinnedDir)
           rememberRouter(pinnedKey, info.id)

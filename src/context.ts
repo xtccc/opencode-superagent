@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import { directorySummary } from "./dirs.js"
 import { ROUTER_PROMPT } from "./prompts.js"
 import { registerRecall } from "./recall.js"
+import { supersededNotice } from "./superseded.js"
 import { dirKeyForWorker, dirState, effectiveDirKey, isRouterSession, store, type WorkerRecord } from "./state.js"
 import { activeTicketSummary, ticketStats } from "./ticket.js"
 import { displayWidth, ROUTER_TOOLS } from "./tools.js"
@@ -130,7 +131,16 @@ export const registerContext = Effect.fn("superagent.registerContext")(function*
   yield* ctx.session.hook("context", (event) =>
     Effect.sync(() => {
       const router = isRouterSession(event.sessionID)
-      if (!router && !store.workers.has(event.sessionID)) return
+      const worker = store.workers.has(event.sessionID)
+      // A session that *was* the Router and lost the role to another one is
+      // told so explicitly: otherwise it keeps seeing the router-only tools in
+      // its catalog and only learns from their error messages.
+      const superseded = supersededNotice(event.sessionID)
+      if (superseded !== undefined) {
+        event.system.push({ type: "text", text: superseded })
+        return
+      }
+      if (!router && !worker) return
       filterSessionTools(event.sessionID, event.tools)
       if (!router) return
       event.system.push({ type: "text", text: ROUTER_PROMPT })

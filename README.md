@@ -301,10 +301,10 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 - **目录解析**：有显式 `directory` 用显式值；否则按 thread 绑定、已知别名解析；都解析不出时落到 Router 自己的目录（默认分区的 Router 没有目录，就沿用宿主默认）。解析结果只决定 worker 跑在哪里，不影响归属。
 - **固定目录（`routerDirectory`）**：给网关的 Router 一个固定工作目录，解决「开关打开前创建的 Router 没有 `location.directory`、落在 `default` 分区，用户在任意目录的 `/tickets` 都看不到它的工单」。配置后：
   - Router 的分区恒为 `dirKeyOf(routerDirectory)`，会话创建时带 `location: { directory: routerDirectory }`；
-  - 旧 `router` 键指向的无目录 Router 在重启 hydrate 时被**认领**到该分区（写 `dir:<dirKey>:router`、删掉旧 `router` 指针，保证同一个会话不会被两个分区同时服务）；若该分区已有自己的 Router，则保留后者、丢弃旧指针；
+  - 旧 `router` 键指向的无目录 Router 在重启 hydrate 时被**认领**到该分区（写 `dir:<dirKey>:router`、删掉旧 `router` 指针，保证同一个会话不会被两个分区同时服务）；若该分区已有自己的 Router，则**保留后者、保留旧指针**（不删），并把旧会话标记为 `superseded`（见下），旧会话因此能明确告诉用户「我不再是 Router，已被 <某会话> 取代」而不是静默失败；
   - 旧 `ticket:<id>` 记录（没有 `dirKey` 字段）的归属改写为该分区，并写回**同一个旧键**（key 名不变，便于回滚），重复 hydrate 幂等；
   - 权限隔离不变：工单仍由「创建它的 Router」拥有，`directory` 只是工作目录；
-  - **TUI 可见性**：`/tickets` 与 `ticket` 选择器都用当前会话目录解析分区，所以只要 TUI 会话开在 `routerDirectory` 里，它看到的 `dirKey` 与 Router 的分区一致，工单自然出现；`/tickets` 只看当前目录，侧栏与 `/alltickets` 是跨分区的聚合视图。只配置 `routerDirectory` 而不打开 `perDirectoryRouter` 也有效：进程只有一个分区，但它是该固定目录的分区。非法配置（相对路径 / 不存在 / 不是目录）被忽略并回退 `default`，启动日志只告警一次，配置变更需重启网关。
+  - **TUI 可见性**：`/tickets` 与 `ticket` 选择器都用当前会话目录解析分区，所以只要 TUI 会话开在 `routerDirectory` 里，它看到的 `dirKey` 与 Router 的分区一致，工单自然出现；`/tickets` 只看当前目录，侧栏与 `/alltickets` 是跨分区的聚合视图。只配置 `routerDirectory` 而不打开 `perDirectoryRouter` 也有效：进程只有一个分区，但它是该固定目录的分区。非法配置（相对路径 / 不存在 / 不是目录 / 空值 / 非字符串）被忽略并回退 `default`，启动日志只告警一次，且告警会写明**具体原因**并给出可操作建议（例如目录不存在时提示 `mkdir -p "<path>"`）；配置变更需重启网关。
 
 #### KV 键布局对照
 
@@ -319,6 +319,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 | 工单 | `ticket:<id>` | `dir:<dirKey>:ticket:<id>` |
 | 工单索引 | `ticketidx:*` | `dir:<dirKey>:ticketidx:*` |
 | worker 记录 | `worker:<sessionID>` | 不变（进程级；记录里带 `ownerDirKey`＝归属分区、`directory`＝工作目录） |
+| 被取代的 Router 标记 | `superseded:router:<sessionID>` | 不变（全局事实：会话 id 全局唯一，不进分区命名空间） |
 | thread→目录提示 | `dir:thread:<threadID>` | 不变（全局提示表，见「已知限制」） |
 | 别名 | `dir:alias:<小写别名>` | 不变（全局提示表） |
 
@@ -328,7 +329,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 
 - **归属规则**：旧的 `ticket:` / `thread:` / `trigger:` / `pending:` / `router` 键**一律归入默认分区**，不按 `ticket.directory` 打散。旧记录没有归属字段，它们当初只可能在默认分区；按目录打散会让开关打开后老 Router 一张自己的历史工单都看不见（真机上是 `closed=19` → `closed=0`）。
 - **旧工单**：`hydrateTickets` 先扫旧的 `ticket:<id>`（归默认分区），再扫 `dir:<dirKey>:ticket:<id>`（保持原分区）。旧记录**不写任何分区副本**，**旧 key 保留**，因此重复 hydrate 的键集合与结果完全相同（`dirtyTicketIDs()` 为空）。**例外**：配置了 `routerDirectory` 时，没有 `dirKey` 的旧记录归 Router 的固定分区，并把 `dirKey` 写回同一个旧 key（key 名不变）；已带 `dirKey` 的记录不再改写，所以重复 hydrate 仍然幂等。
-- **旧 Router**：`router` 键读回默认分区；配置了 `routerDirectory` 时，这个无目录的旧 Router 会被认领到固定分区（`dir:<dirKey>:router`，删除旧 `router` 指针）。回滚到未配置时旧版本只看到一个已不存在的 `router` 键，会重新创建一个 Router，历史会话本身不受影响。
+- **旧 Router**：`router` 键读回默认分区；配置了 `routerDirectory` 时，这个无目录的旧 Router 会被认领到固定分区（`dir:<dirKey>:router`，删除旧 `router` 指针）。回滚到未配置时旧版本只看到一个已不存在的 `router` 键，会重新创建一个 Router，历史会话本身不受影响。**例外**：该分区**已经**有自己的 Router 时，旧指针**保留**（回滚无损）并写入 `superseded:router:<sessionID>` 标记，旧会话因此得到明确提示而不是静默失败。
 - **旧版本留下的副本**：如果同一 id 同时存在于旧 key 和 `dir:<k>:` 下（旧版本按目录迁移的产物），归属回到默认分区，内容取 `updatedAt` 更新的那份，所以迁移后继续更新的状态不会被旧副本回滚。
 - **旧 Router / thread / trigger / pending**：默认分区的旧 key 原样读回默认分区；非默认分区的数据本来就在 `dir:<dirKey>:` 下，启动时按命名空间回放到各自分区。
 - **不需要手工迁移**：开关关闭时连扫描都走旧路径；打开时默认分区仍是旧 key，只有非默认分区使用新前缀。
@@ -347,6 +348,7 @@ context.ui.slot({ append: "sidebar.content", render: () => <SidebarTickets conte
 - **热切换不支持**：`perDirectoryRouter` 在进程启动时读取一次，运行中改配置不生效；升级插件也必须重启网关。
 - **`routerDirectory` 也是启动时读一次**：改目录、删目录或修正非法路径都需要重启网关；路径在启动时必须存在且是绝对路径，否则配置被忽略（只告警一次）。
 - **被认领的旧 Router 保留原会话**：认领只改变归属分区与持久化指针，不会把已有会话的 `location.directory` 改到新目录（宿主不支持改会话位置）；新创建的 Router 才会真正 `location: { directory: routerDirectory }`。它的分区目录以配置为准，工具 cwd 仍是旧会话创建时的目录，必要时可让用户手工开新会话或删除旧 Router 让它重建。
+- **被取代的 Router 不再是 Router，但会明确说明**：认领时若目标分区已有 Router，旧指针**保留**在 `router` 键（回滚无损），旧会话被写入 `superseded:router:<sessionID>` 标记。此后旧会话的 router-only 工具报错会点名取代者（「本会话已不再是 Router，已被 `<会话>` 取代」），`status` 也会列出被取代的会话，启动时有一条 WARN 日志说明。标记在取代者会话被删除后自动失效，旧指针会被重新认领。
 - **状态摘要只列活跃分区**：`status.partitions` 省略既没有 Router、也没有 pending、也没有 worker 的空分区（例如刚 hydrate 的默认分区）；少于两个活跃分区时整个 `partitions` 字段都不出现，因此单分区输出与阶段 2b 逐字节一致。
 - **聚合视图的旧字段仍是旧语义**：不传 `directory` 时 `router` 是默认分区（否则第一个有 Router 的分区）的 id、`pending` 是所有分区之和、`workers` 是全部 worker；需要单目录精确视图时必须传 `directory`。
 

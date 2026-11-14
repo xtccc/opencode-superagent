@@ -10,6 +10,7 @@ import { DISPATCH_EFFORTS, type DispatchEffort } from "./effort.js"
 import { requireRouter } from "./guard.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
 import { partitioningEnabled, maxWorkersPerDirectorySetting, parseWorkerLimit } from "./settings.js"
+import { supersededSessions } from "./superseded.js"
 import {
   detachWorkerThreads,
   dirKeyForRouter,
@@ -246,6 +247,16 @@ export function statusText(options: StatusOptions = {}): string {
     lines.push(`directories: ${store.dirs.size} partition(s) active=${store.dirKey}${detail}`)
   }
   if (activeTickets !== "") lines.push(`active tickets: ${activeTickets}`)
+  // A Router that was replaced by another session: the old session's
+  // router-only tools keep failing, and the operator must see **who** took
+  // over. Only shown when it actually happened, so the common case stays
+  // byte-identical.
+  const replaced = supersededSessions()
+  for (const info of replaced) {
+    lines.push(
+      `superseded router session ${info.sessionID} (replaced by ${info.supersededBy}, partition ${info.dirKey})`,
+    )
+  }
   // Only shown when startup actually dropped something: a replayed trigger that
   // outlived its TTL is invisible otherwise, and the Router would wonder why the
   // thread it remembers never got an answer.

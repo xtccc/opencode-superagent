@@ -10,6 +10,11 @@ import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
 import { partitioningEnabled } from "./settings.js"
 import {
+  removeSuperseded,
+  supersededInfo,
+  supersededNotice,
+} from "./superseded.js"
+import {
   ROUTER_KEY,
   dirKeyFor,
   dirKeyForRouter,
@@ -332,10 +337,37 @@ const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(functi
   if (typeof stored === "string") {
     const info = yield* sessions.get({ sessionID: toSessionID(stored) }).pipe(Effect.option)
     if (Option.isSome(info)) {
-      rememberRouter(dirKey, info.value.id)
-      return info.value.id
+      const marker = supersededInfo(info.value.id)
+      if (marker === undefined) {
+        rememberRouter(dirKey, info.value.id)
+        return info.value.id
+      }
+      // The pointer's session lost the Router role to another one. It is not
+      // adopted again as long as its successor is still alive: two sessions
+      // must never serve one partition. When the successor is gone the marker
+      // is stale, so the pointer is reclaimed and the session becomes Router
+      // again. The KV entry itself is never deleted here (rollback stays
+      // lossless).
+      const successor = yield* sessions.get({ sessionID: toSessionID(marker.supersededBy) }).pipe(Effect.option)
+      if (Option.isSome(successor)) {
+        yield* Effect.logWarning("superagent skipping a superseded router pointer", {
+          sessionID: info.value.id,
+          dirKey,
+          supersededBy: marker.supersededBy,
+          notice: supersededNotice(info.value.id) ?? "",
+        })
+      } else {
+        yield* removeSuperseded(ctx, info.value.id)
+        rememberRouter(dirKey, info.value.id)
+        yield* Effect.logInfo("superagent reclaimed a router pointer whose successor is gone", {
+          sessionID: info.value.id,
+          dirKey,
+        })
+        return info.value.id
+      }
+    } else {
+      yield* storage.remove(routerKey).pipe(Effect.catch(() => Effect.void))
     }
-    yield* storage.remove(routerKey).pipe(Effect.catch(() => Effect.void))
   }
   const agents = ctx.agent
   const routerAgent = yield* agents.get({ agentID: Agent.ID.make(ROUTER_AGENT) }).pipe(

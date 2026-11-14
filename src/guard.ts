@@ -1,6 +1,7 @@
 import { Tool } from "@opencode/schema/tool"
 import { Effect } from "effect"
 import { DEFAULT_DIR_KEY } from "./dirs.js"
+import { supersededNotice } from "./superseded.js"
 import { dirKeyForRouter, isRouterSession } from "./state.js"
 
 /**
@@ -21,9 +22,20 @@ import { dirKeyForRouter, isRouterSession } from "./state.js"
  * pre-flag Router whose partition is `default`, out of every directory at all).
  * Directory arguments are now validated as working directories only, by the
  * tool that uses them (`directoryError`).
+ *
+ * **Never fail silently**: a session that *was* the Router and lost the role
+ * to another one (the "superseded" case) gets an explicit, readable message
+ * naming its successor instead of the generic "only available to the router
+ * session", which told the user nothing.
  */
 export const requireRouter = Effect.fn("superagent.requireRouter")(function* (caller: string, tool: string) {
   if (!isRouterSession(caller)) {
+    const notice = supersededNotice(caller)
+    if (notice !== undefined) {
+      return yield* new Tool.Error({
+        message: `${tool} is not available: ${notice}`,
+      })
+    }
     return yield* new Tool.Error({ message: `${tool} is only available to the router session` })
   }
   return dirKeyForRouter(caller) ?? DEFAULT_DIR_KEY

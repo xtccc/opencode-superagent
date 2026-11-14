@@ -7,6 +7,28 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ### Fixed
 
+- **Claiming a partition no longer silently takes the Router away.** When a
+  `routerDirectory` partition already had its own Router, the startup claim
+  **deleted** the legacy `router` KV pointer. The old session stopped being any
+  partition's Router, and every router-only tool (`ticket_list`, `dispatch`,
+  `sleep`, `status`, …) answered with a bare
+  `only available to the router session` — the user had no idea why. Now:
+  - the legacy pointer is **kept** (rolling back to the previous plugin version
+    still finds a valid `router` pointer, so the rollback stays lossless) and
+    the old session is marked `superseded` in a separate KV key
+    (`superseded:router:<sessionID>`, global: a session id is globally unique,
+    so the marker never enters the `dir:<dirKey>:` namespace);
+  - the marked session says so in plain words: its router-only tool errors
+    name the successor (`本会话已不再是 Router，已被 <会话> 取代`), the context
+    hook injects the same notice into its system block, `status` lists the
+    replaced session, and startup logs one readable WARN line per session;
+  - `ensureRouter` never adopts a superseded pointer while its successor is
+    alive (one session must not serve two partitions), and reclaims it once the
+    successor is gone, so a deleted Router cannot strand a partition.
+  - The default partition's KV key names are byte-identical (`router`,
+    `superseded:router:<id>`); non-default partitions keep the `dir:<k>:`
+    prefix.
+
 - **Partition ownership follows the calling Router, not the working directory
   (`perDirectoryRouter`).** The previous stage-2b rule derived a ticket's (and a
   worker's) partition from `directory`, which conflated "where the work runs"

@@ -12,6 +12,7 @@ import { hydrateReports } from "./src/report.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
 import { hydrateSessionMeta } from "./src/session-meta.js"
 import { applySettings, perDirectoryRouterEnabled, takeRouterDirectoryWarning } from "./src/settings.js"
+import { supersededNotice, takeUnreportedSuperseded } from "./src/superseded.js"
 import { registerSleep } from "./src/sleep.js"
 import { statusSnapshot } from "./src/status.js"
 import { dirStateForDirectory, hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
@@ -137,7 +138,25 @@ export default Plugin.define({
     // Tickets first: hydrating workers reconciles finished `running` records
     // and closes their tickets, so the ticket store must already be loaded.
     yield* hydrateTickets(ctx)
+    // `hydrate` loads the superseded markers first (the claim path below reads
+    // them), then claims/records the Router.
     yield* hydrate(ctx)
+    // A Router that lost the role to another session is a **user-visible**
+    // fact: the old session's router-only tools keep failing, and the user
+    // must learn which session took over. One line per superseded session,
+    // once per process (the marker table is shared, so the host's per-location
+    // plugin instances do not repeat it).
+    for (const info of takeUnreportedSuperseded()) {
+      yield* Effect.logWarning(
+        `superagent router session ${info.sessionID} was superseded by ${info.supersededBy} (partition ${info.dirKey}); it is no longer the Router and its router-only tools are disabled`,
+        {
+          sessionID: info.sessionID,
+          supersededBy: info.supersededBy,
+          dirKey: info.dirKey,
+          notice: supersededNotice(info.sessionID) ?? "",
+        },
+      )
+    }
     // Before any session work: the Router and Worker sessions resolve their agent by id.
     yield* registerAgents(ctx)
     yield* hydratePending(ctx)

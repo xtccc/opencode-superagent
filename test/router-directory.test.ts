@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Exit, type Schema } from "effect"
@@ -16,11 +16,18 @@ import { ensureRouter } from "../src/router.js"
 import {
   applySettings,
   partitioningEnabled,
+  parseRouterDirectory,
   perDirectoryRouterEnabled,
   resetSettings,
   routerDirectorySetting,
   takeRouterDirectoryWarning,
 } from "../src/settings.js"
+import {
+  resetSuperseded,
+  supersededInfo,
+  supersededKey,
+  supersededNotice,
+} from "../src/superseded.js"
 import {
   ROUTER_KEY,
   dirKeyForRouter,
@@ -153,6 +160,7 @@ beforeEach(() => {
   resetSettings()
   resetTickets()
   resetPartitions()
+  resetSuperseded()
   store.workers.clear()
 })
 
@@ -201,6 +209,73 @@ describe("routerDirectory setting", () => {
     resetSettings()
     expect(partitioningEnabled()).toBe(false)
     expect(dirKeyFor(dir)).toBe(DEFAULT_DIR_KEY)
+  })
+})
+
+// ── 1b. the warning explains the reason and how to fix it ────────────────────
+
+describe("routerDirectory warning text", () => {
+  test("a missing directory is reported with a mkdir -p suggestion", () => {
+    const missing = join(tempDir(), "not-created")
+    applySettings({ routerDirectory: missing })
+    const warning = takeRouterDirectoryWarning()
+    expect(warning).toBeDefined()
+    expect(warning).toContain("does not exist")
+    expect(warning).toContain(`mkdir -p "${missing}"`)
+    expect(warning).toContain("keeping the default partition")
+  })
+
+  test("a relative path is reported as relative with an absolute-path hint", () => {
+    applySettings({ routerDirectory: "relative/path" })
+    const warning = takeRouterDirectoryWarning()
+    expect(warning).toContain("absolute")
+    expect(warning).toContain("keeping the default partition")
+  })
+
+  test("an existing file is reported as not a directory", () => {
+    const file = join(tempDir(), "a-file")
+    writeFileSync(file, "x")
+    applySettings({ routerDirectory: file })
+    const warning = takeRouterDirectoryWarning()
+    expect(warning).toContain("not a directory")
+    expect(warning).toContain("keeping the default partition")
+  })
+
+  test("an empty value is reported as empty", () => {
+    applySettings({ routerDirectory: "   " })
+    const warning = takeRouterDirectoryWarning()
+    expect(warning).toContain("empty")
+    expect(warning).toContain("keeping the default partition")
+  })
+
+  test("a non-string value is reported as not a string", () => {
+    applySettings({ routerDirectory: 42 })
+    const warning = takeRouterDirectoryWarning()
+    expect(warning).toContain("string")
+    expect(warning).toContain("keeping the default partition")
+  })
+
+  test("the warning is emitted once per distinct bad value", () => {
+    applySettings({ routerDirectory: "relative/path" })
+    expect(takeRouterDirectoryWarning()).toBeDefined()
+    expect(takeRouterDirectoryWarning()).toBeUndefined()
+    applySettings({ routerDirectory: "relative/path" })
+    expect(takeRouterDirectoryWarning()).toBeUndefined()
+    applySettings({ routerDirectory: "other/relative" })
+    expect(takeRouterDirectoryWarning()).toBeDefined()
+  })
+
+  test("parseRouterDirectory reports the failure reason", () => {
+    expect(parseRouterDirectory(undefined).reason).toBeUndefined()
+    expect(parseRouterDirectory(undefined).invalid).toBe(false)
+    expect(parseRouterDirectory("relative").reason).toBe("not-absolute")
+    expect(parseRouterDirectory("").reason).toBe("empty")
+    expect(parseRouterDirectory(7).reason).toBe("not-a-string")
+    expect(parseRouterDirectory(join(tempDir(), "nope")).reason).toBe("missing")
+    const file = join(tempDir(), "file")
+    writeFileSync(file, "x")
+    expect(parseRouterDirectory(file).reason).toBe("not-a-directory")
+    expect(parseRouterDirectory(tempDir()).reason).toBeUndefined()
   })
 })
 
@@ -465,6 +540,19 @@ describe("legacy state is adopted by routerDirectory", () => {
     await succeed(hydrate(h.ctx))
     expect(routerIDForDir(key)).toBe("ses_new")
     expect(dirKeyForRouter("ses_old")).toBeUndefined()
-    expect(h.data.get(ROUTER_KEY)).toBeUndefined()
+    // The legacy pointer is **kept** (not deleted): rolling back to the
+    // previous plugin version still finds a valid `router` pointer.
+    expect(h.data.get(ROUTER_KEY)).toBe("ses_old")
+    expect(h.data.get(dirScopedKey(ROUTER_KEY, key))).toBe("ses_new")
+    // ...and the old session is marked superseded instead of failing silently.
+    expect(supersededInfo("ses_old")).toMatchObject({
+      sessionID: "ses_old",
+      supersededBy: "ses_new",
+      dirKey: key,
+    })
+    expect(h.data.get(supersededKey("ses_old"))).toBeDefined()
+    // The old session says so in plain words instead of a generic refusal.
+    expect(supersededNotice("ses_old")).toContain("ses_new")
+    expect(supersededNotice("ses_old")).toContain("不再是 Router")
   })
 })
