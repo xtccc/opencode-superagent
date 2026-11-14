@@ -5,7 +5,17 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
-Nothing yet — see `0.5.0` below.
+Nothing yet — see `0.5.1` below.
+
+## 0.5.1 — 2026-11-14
+
+### Changed
+
+- **`sleep` ceiling raised from 60s to 3600s (one hour).** The default (30s) and
+  the lower bound (1) are unchanged. `seconds` is still validated as an integer
+  in `1..3600`; the tool description, tool spec, Router prompt and README now say
+  `1..3600`. Only the Router-side tool definition changed, so no Worker behaviour
+  is affected. A gateway restart is needed to pick this up (no hot reload).
 
 ## 0.5.0 — 2026-11-11
 
