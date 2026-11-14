@@ -16,8 +16,8 @@ const ROUTER = "ses_router"
 const WORKER = "ses_worker"
 
 /**
- * Virtual clock: every poll advances the clock instead of waiting, so a 60s
- * sleep finishes in microseconds and the interval sequence is observable.
+ * Virtual clock: every poll advances the clock instead of waiting, so a long
+ * sleep (even 3600s) finishes in microseconds and the interval sequence is observable.
  */
 function virtualClock() {
   let current = 0
@@ -76,21 +76,22 @@ describe("sleep tool validation", () => {
     expect(polls).toHaveLength(180)
   })
 
-  test("the 1 and 60 boundaries are accepted", async () => {
+  test("the 1 and 3600 boundaries are accepted", async () => {
     const { deps, polls } = virtualClock()
     expect((await succeed(runSleep({ seconds: 1 }, ROUTER, deps))).content).toBe("slept 1s")
-    // 60 is the new hard ceiling; 600 is no longer reachable.
-    expect((await succeed(runSleep({ seconds: 60 }, ROUTER, deps))).content).toBe("slept 60s")
-    expect(SLEEP_MAX_SECONDS).toBe(60)
-    expect(polls).toHaveLength(4 + 240)
+    // 3600 (one hour) is the hard ceiling.
+    expect((await succeed(runSleep({ seconds: 3600 }, ROUTER, deps))).content).toBe("slept 3600s")
+    expect(SLEEP_MAX_SECONDS).toBe(3600)
+    // 1s and 3600s at 250ms per poll, four polls per second.
+    expect(polls).toHaveLength(4 + 14400)
   })
 
-  test("zero, negative, above 60 and non-numbers are rejected", async () => {
+  test("zero, negative, above 3600 and non-numbers are rejected", async () => {
     const { deps, polls } = virtualClock()
-    const outOfRange = [0, -1, 61, 600, Number.NaN, Number.POSITIVE_INFINITY]
+    const outOfRange = [0, -1, 3601, 6000, Number.NaN, Number.POSITIVE_INFINITY]
     for (const seconds of outOfRange) {
       const message = await failure(runSleep({ seconds } as never, ROUTER, deps))
-      expect(message).toContain("between 1 and 60")
+      expect(message).toContain("between 1 and 3600")
     }
     const notNumber = await failure(runSleep({ seconds: "abc" } as never, ROUTER, deps))
     expect(notNumber).toContain("must be a number")

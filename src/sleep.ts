@@ -23,7 +23,8 @@ import { isWorkerTerminal } from "./worker-state.js"
 
 export const SLEEP_DEFAULT_SECONDS = 30
 export const SLEEP_MIN_SECONDS = 1
-export const SLEEP_MAX_SECONDS = 60
+/** Ceiling is one hour: long Goal-mode waits without busy polling. */
+export const SLEEP_MAX_SECONDS = 3600
 /** State-check interval during a sleep; small enough to feel immediate, large enough not to spin. */
 export const SLEEP_POLL_MS = 250
 

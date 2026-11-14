@@ -115,9 +115,9 @@ beforeEach(() => {
 })
 
 describe("invalid and interrupted calls leave no residue", () => {
-  test("a rejected sleep(120) does not poll and the next sleep still wakes", async () => {
+  test("a rejected sleep(4000) does not poll and the next sleep still wakes", async () => {
     const rejected = virtualClock()
-    expect(await failure(runSleep({ seconds: 120 }, ROUTER, rejected.deps))).toContain("between 1 and 60")
+    expect(await failure(runSleep({ seconds: 4000 }, ROUTER, rejected.deps))).toContain("between 1 and 3600")
     // Validation returns before the baseline snapshot and before any timer:
     // there is no waiter or poll loop to leak.
     expect(rejected.polls).toEqual([])
@@ -127,7 +127,7 @@ describe("invalid and interrupted calls leave no residue", () => {
     )
     const result = await succeed(runSleep({ seconds: 30 }, ROUTER, clock.deps))
 
-    expect(SLEEP_MAX_SECONDS).toBe(60)
+    expect(SLEEP_MAX_SECONDS).toBe(3600)
     expect(result.content).toBe("slept 1s of 30s (woken: worker completed)")
     expect(result.output).toMatchObject({ slept: 1, woken: "worker completed" })
   })

@@ -9,8 +9,8 @@ import type { WorkerState } from "../src/worker-state.js"
 
 /**
  * Interruptible sleep (plan A): the wait polls plugin memory every 250ms for
- * terminal workers / queued triggers. All tests use a virtual clock so a 60s
- * wait completes instantly and the poll cadence is observable; nothing here
+ * terminal workers / queued triggers. All tests use a virtual clock so even a
+ * 3600s wait completes instantly and the poll cadence is observable; nothing here
  * depends on wall-clock delays.
  */
 
@@ -239,13 +239,13 @@ describe("normal and bounded waits", () => {
     expect(clock.polls).toHaveLength(120)
   })
 
-  test("the ceiling is 60 seconds: 60 passes, 0/61/1.5 are rejected", async () => {
-    expect(SLEEP_MAX_SECONDS).toBe(60)
+  test("the ceiling is 3600 seconds: 3600 passes, 0/3601/1.5 are rejected", async () => {
+    expect(SLEEP_MAX_SECONDS).toBe(3600)
     const clock = virtualClock()
-    expect((await succeed(runSleep({ seconds: 60 }, ROUTER, clock.deps))).content).toBe("slept 60s")
+    expect((await succeed(runSleep({ seconds: 3600 }, ROUTER, clock.deps))).content).toBe("slept 3600s")
 
-    expect(await failure(runSleep({ seconds: 0 }, ROUTER, clock.deps))).toContain("between 1 and 60")
-    expect(await failure(runSleep({ seconds: 61 }, ROUTER, clock.deps))).toContain("between 1 and 60")
+    expect(await failure(runSleep({ seconds: 0 }, ROUTER, clock.deps))).toContain("between 1 and 3600")
+    expect(await failure(runSleep({ seconds: 3601 }, ROUTER, clock.deps))).toContain("between 1 and 3600")
     expect(await failure(runSleep({ seconds: 1.5 }, ROUTER, clock.deps))).toContain("must be an integer")
   })
 
