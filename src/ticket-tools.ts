@@ -1,12 +1,17 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, Schema } from "effect"
+import { directoryOfDirKey } from "./dirs.js"
 import { requireRouter } from "./guard.js"
+import { store } from "./state.js"
+import { renderAggregatedTickets } from "./ticket-aggregate.js"
 import {
   closeTicket,
   createTicket,
   currentTrigger,
   getTicket,
+  LIST_DEFAULT,
   listTicketRecords,
+  listTicketRecordsByPartition,
   listTickets,
   loadTicket,
   renderTicketDetail,
@@ -220,6 +225,64 @@ export const renderTicketsTextDeep = (
     },
     dirKey,
   ).pipe(Effect.map(renderTicketList))
+
+/**
+ * The directory a partition belongs to.
+ *
+ * `store.dirs` is authoritative (the partition records its own directory when
+ * it is created), `directoryOfDirKey` is the fallback for a partition that was
+ * only ever seen through its key (a ticket's owner). The default partition has
+ * no directory of its own, so it stays `undefined` and is rendered as `-`.
+ */
+function partitionDirectory(dirKey: string): string | undefined {
+  return store.dirs.get(dirKey)?.directory ?? directoryOfDirKey(dirKey)
+}
+
+/**
+ * The aggregate view (`/alltickets`): **every** partition's tickets, grouped by
+ * directory.
+ *
+ * The group bodies are the very same `renderTicketList` output as the
+ * single-partition view, so `/tickets` and `/alltickets` differ only in the
+ * group headers and the total count. With a single partition the output is
+ * byte-identical to the single-partition view — the aggregate view must not
+ * add noise to a gateway that only ever has one directory.
+ */
+export const renderAllTicketsTextDeep = (
+  ctx: Plugin.Context,
+  input: TicketListInput = {},
+) =>
+  listTicketRecordsByPartition(
+    ctx,
+    {
+      ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.since === undefined ? {} : { since: input.since }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    },
+    input.limit ?? LIST_DEFAULT,
+  ).pipe(
+    Effect.map((groups) => {
+      const rendered = renderAggregatedTickets(
+        [...groups.entries()].map(([dirKey, tickets]) => {
+          const directory = partitionDirectory(dirKey)
+          // A group that reached the fetch limit may hold more tickets than it
+          // shows; its count is then printed as a lower bound (`20+ 条`).
+          const truncated = tickets.length >= (input.limit ?? LIST_DEFAULT)
+          return {
+            dirKey,
+            ...(directory === undefined ? {} : { directory }),
+            count: tickets.length,
+            truncated,
+            body: renderTicketList(tickets),
+          }
+        }),
+      )
+      // No ticket anywhere: the single-partition empty text, so both views say
+      // the same thing when there is nothing to show.
+      return rendered === "" ? renderTicketList([]) : rendered
+    }),
+  )
 
 export const renderTicketTextDeep = (ctx: Plugin.Context, ticketID: string) =>
   loadTicket(ctx, ticketID).pipe(

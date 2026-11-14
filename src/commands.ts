@@ -4,12 +4,14 @@
  *
  * `tui.tsx` maps each `run` key to the handler of the same name; the table
  * itself carries only ids, titles and slash names. Exactly one command owns a
- * slash name: `/tickets` is the two-level browser, `/ticket` opens a single
- * ticket, and there is no plain-text ticket list command.
+ * slash name: `/tickets` is the two-level browser of the session's own
+ * directory, `/alltickets` is the aggregate browser over every partition,
+ * `/ticket` opens a single ticket, and there is no plain-text ticket list
+ * command.
  */
 
 /** Handler key: `tui.tsx` binds each one to a function in this file's sibling module. */
-export type CommandRun = "open" | "browse" | "abort" | "tools" | "detail"
+export type CommandRun = "open" | "browse" | "browseAll" | "abort" | "tools" | "detail"
 
 /** One command, minus the handler the renderer adds. */
 export interface CommandSpec {
@@ -43,6 +45,15 @@ export const COMMANDS: ReadonlyArray<CommandSpec> = [
     palette: true,
     slash: { name: "tickets" },
     run: "browse",
+  },
+  {
+    id: "superagent.alltickets",
+    title: "Superagent all tickets",
+    description:
+      "跨所有分区聚合浏览工单（按目录分组）：共 N 条、K 个目录，⏎ 看详情、/ 搜索、q 退出。只看当前目录用 /tickets",
+    palette: true,
+    slash: { name: "alltickets" },
+    run: "browseAll",
   },
   {
     id: "superagent.abort",

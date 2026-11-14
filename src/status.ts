@@ -1,5 +1,5 @@
 import { canonicalDirectory, dirKeyFor, directoryOfDirKey } from "./dirs.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled } from "./settings.js"
 import { dirKeyForWorker, routerPartitions, store, totalPending } from "./state.js"
 import { pluginVersion } from "./version.js"
 import type { WorkerRecord, WorkerState } from "./worker-state.js"
@@ -114,7 +114,7 @@ export function statusSnapshot(input: { readonly directory?: string } = {}): Sta
   // (else the first partition that has one), the sum over every queue and the
   // full worker list.
   const router = store.routerID ?? routerPartitions()[0]?.routerID
-  const partitions = perDirectoryRouterEnabled() ? partitionViews(allWorkers) : []
+  const partitions = partitioningEnabled() ? partitionViews(allWorkers) : []
   return {
     version,
     ...(router === undefined ? {} : { router }),

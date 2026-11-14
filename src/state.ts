@@ -8,12 +8,15 @@ import {
   effectiveDirKey,
   rememberDirDirectory,
   resetDirDirectories,
+  routerDirKeySetting,
+  routerDirectoryForPartition,
   workerHomeDirectory,
   workerOwnerDirKey,
 } from "./dirs.js"
 import { buildReport, lastAssistantText, reportSummary, saveReport } from "./report.js"
 import { dirScopedKey, scanDirScoped, scanEntries } from "./scope.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled, routerDirectorySetting } from "./settings.js"
+import { sharedSingleton } from "./shared.js"
 import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
 import { WORKER_STATES, workers, type WorkerRecord, type WorkerState } from "./worker-state.js"
@@ -74,8 +77,12 @@ export interface DirectTriggerInput {
 
 const ROUTES: ReadonlyArray<TriggerRoute> = ["router", "worker"]
 
-/** Host context for fire-and-forget KV writes from synchronous interception points. Set during hydrate. */
-let persistHost: Plugin.Context | undefined
+/**
+ * Host context for fire-and-forget KV writes from synchronous interception
+ * points. Set during hydrate; shared so an instance that has not hydrated yet
+ * (or whose hydrate ran first) still persists through the process-wide host.
+ */
+const persistHost = sharedSingleton("state.persist-host", () => ({ current: undefined as Plugin.Context | undefined }))
 
 export function triggerIdFor(input: TriggerInput): string {
   return input.id ?? `${input.source}:${input.threadID}:${input.createdAt ?? Date.now()}`
@@ -90,7 +97,7 @@ function normalizeTrigger(input: TriggerInput): TriggerInput {
 }
 
 function schedulePersist(record: TriggerRecord, dirKey: string): void {
-  const host = persistHost
+  const host = persistHost.current
   if (host === undefined) return
   const snapshot: TriggerRecord = { ...record }
   const scope = effectiveDirKey(dirKey)
@@ -299,14 +306,20 @@ export function createDirState(dirKey: string = DEFAULT_DIR_KEY, directory?: str
  */
 export function dirState(target: Store, key?: string, directory?: string): DirState {
   const dirKey = key ?? target.dirKey ?? DEFAULT_DIR_KEY
+  // The partition's own directory is fixed when it is the `routerDirectory`
+  // partition: a caller passing a work directory must not rename it (status,
+  // Router creation and `workerHomeDirectory` all read this field).
+  const pinned = routerDirectoryForPartition(dirKey)
+  const home = pinned ?? directory
   const existing = target.dirs.get(dirKey)
   if (existing !== undefined) {
-    if (directory !== undefined && existing.directory === undefined) existing.directory = directory
+    if (pinned !== undefined) existing.directory = pinned
+    else if (directory !== undefined && existing.directory === undefined) existing.directory = directory
     return existing
   }
-  const created = createDirState(dirKey, directory)
+  const created = createDirState(dirKey, home)
   target.dirs.set(dirKey, created)
-  if (directory !== undefined) rememberDirDirectory(dirKey, directory)
+  if (home !== undefined) rememberDirDirectory(dirKey, home)
   return created
 }
 
@@ -404,12 +417,12 @@ export function dirKeyForRouter(sessionID: string | undefined): string | undefin
 export function isRouterSession(sessionID: string | undefined): boolean {
   const dirKey = dirKeyForRouter(sessionID)
   if (dirKey === undefined) return false
-  return perDirectoryRouterEnabled() || dirKey === DEFAULT_DIR_KEY
+  return partitioningEnabled() || dirKey === DEFAULT_DIR_KEY
 }
 
 /** 所有分区的未投递 trigger 总数（`status`/RPC 用；开关关闭时等于旧行为）。 */
 export function totalPending(): number {
-  if (!perDirectoryRouterEnabled()) return store.pending.length
+  if (!partitioningEnabled()) return store.pending.length
   let total = 0
   for (const dir of store.dirs.values()) total += dir.pending.length
   return total
@@ -907,13 +920,18 @@ export const HYDRATE_CONCURRENCY = 8
  * had when the loop was serial.
  */
 export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Context) {
-  persistHost = ctx
+  persistHost.current = ctx
   const sessions = ctx.session
   const storage = ctx.storage
   // 旧 KV 只有一套扁平 key：读回的 Router / thread 亲和一律归入默认目录。
   // 分区读写（`dir:<dirKey>:`）留给阶段 2，因此这里永远显式指向默认分区，
   // 而不是依赖 `store.dirKey`——升级时不会把状态写进一个空分区。
   const defaultDir = dirState(store, DEFAULT_DIR_KEY)
+  // `routerDirectory`：网关的 Router 固定在这个目录的分区里。旧版（开关打开前）
+  // 创建的 Router 没有 `location.directory`，重启后按这个配置「认领」过去，而不是
+  // 留在 `default` 分区（那样用户在任何目录的 `/tickets` 都看不到它的工单）。
+  const pinnedDir = routerDirectorySetting()
+  const pinnedKey = routerDirKeySetting()
   const storedRouter = yield* storage.get(ROUTER_KEY).pipe(Effect.catch(() => Effect.succeed(undefined)))
   if (typeof storedRouter === "string") {
     const info = yield* sessions.get({ sessionID: toSessionID(storedRouter) }).pipe(
@@ -923,9 +941,46 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
     if (info === undefined) {
       yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
     } else {
-      rememberRouter(DEFAULT_DIR_KEY, info.id)
-      const directory = sessionDirectory(info)
-      if (directory !== undefined) defaultDir.directory = directory
+      const home = sessionDirectory(info)
+      // The legacy `router` pointer is by definition the default partition's
+      // Router — created before the flag/feature, so it has no partition of its
+      // own. With a fixed directory configured it belongs to that partition;
+      // its session location (when the host reports the gateway's own default)
+      // is not an ownership statement.
+      const claimable = pinnedKey !== undefined && pinnedKey !== DEFAULT_DIR_KEY
+      if (claimable) {
+        const scoped = yield* storage
+          .get(dirScopedKey(ROUTER_KEY, pinnedKey))
+          .pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (typeof scoped === "string" && scoped !== info.id) {
+          // A per-directory Router already owns this partition: keep it and
+          // drop the stale legacy pointer, so the same session can never be
+          // served by two partitions.
+          yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
+          yield* Effect.logInfo("superagent legacy router superseded by routerDirectory partition", {
+            legacy: info.id,
+            kept: scoped,
+            dirKey: pinnedKey,
+          })
+        } else {
+          dirState(store, pinnedKey, pinnedDir)
+          rememberRouter(pinnedKey, info.id)
+          yield* storage
+            .set(dirScopedKey(ROUTER_KEY, pinnedKey), info.id)
+            .pipe(Effect.catch((cause) => Effect.logWarning("superagent failed to persist claimed router", { cause })))
+          // Move the pointer: keeping both keys would let the default
+          // partition adopt the same session again on the next ensureRouter.
+          yield* storage.remove(ROUTER_KEY).pipe(Effect.catch(() => Effect.void))
+          yield* Effect.logInfo("superagent legacy router claimed by routerDirectory", {
+            router: info.id,
+            dirKey: pinnedKey,
+            directory: pinnedDir,
+          })
+        }
+      } else {
+        rememberRouter(DEFAULT_DIR_KEY, info.id)
+        if (home !== undefined) defaultDir.directory = home
+      }
     }
   }
   // 非默认分区的 Router 存在 `dir:<dirKey>:router`。开关关闭时 scanDirScoped
@@ -1020,7 +1075,7 @@ export const hydrate = Effect.fn("superagent.hydrate")(function* (ctx: Plugin.Co
   // 新记录只在 `dirKeyOf(directory) === dirKey` 时命中）：`directory` 是工作目录，
   // 把一个跨目录派发的 worker 的目录登记给派发方分区，会让 A 分区的 Router 被
   // 创建在 B 的工作目录里。
-  if (perDirectoryRouterEnabled()) {
+  if (partitioningEnabled()) {
     for (const worker of store.workers.values()) {
       const dirKey = dirKeyForWorker(worker)
       const home = workerHomeDirectory(worker, dirKey)

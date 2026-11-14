@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { DateTime, Effect, Option, Stream } from "effect"
 import { workerHomeDirectory } from "./dirs.js"
 import { ensureRouter } from "./router.js"
+import { sharedSingleton } from "./shared.js"
 import { dirKeyForWorker, store, toSessionID } from "./state.js"
 
 /** Default interval between stall checks. Overridable with the `watchdogIntervalMs` plugin option. */
@@ -21,7 +22,7 @@ export const STALLED_PREFIX = "watchdog: stalled"
  * never mutates the worker record, so dedupe lives in memory. Keying by
  * `time.busy` lets a resumed worker alert once more if it stalls again.
  */
-const alerted = new Map<string, number>()
+const alerted = sharedSingleton("watchdog.alerted", () => new Map<string, number>())
 
 /** Test/hydrate hook: forget every in-memory stall alert. */
 export function resetWatchdogAlerts(): void {

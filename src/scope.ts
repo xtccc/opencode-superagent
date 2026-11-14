@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect, type Schema } from "effect"
 import { DEFAULT_DIR_KEY } from "./dirs.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled } from "./settings.js"
 
 /**
  * KV key 的分区命名空间：`dir:<dirKey>:<原来的 key>`。
@@ -18,7 +18,7 @@ export const DIR_SCOPE_PREFIX = "dir:"
 
 /** 把 KV key 映射到目录分区。默认分区或开关关闭时原样返回入参。 */
 export function dirScopedKey(key: string, dirKey: string = DEFAULT_DIR_KEY): string {
-  if (dirKey === DEFAULT_DIR_KEY || !perDirectoryRouterEnabled()) return key
+  if (dirKey === DEFAULT_DIR_KEY || !partitioningEnabled()) return key
   return `${DIR_SCOPE_PREFIX}${dirKey}:${key}`
 }
 
@@ -83,7 +83,7 @@ export const scanDirScoped: (
   suffixPrefix: string,
 ) {
   const out: Array<ScopedEntry> = []
-  if (!perDirectoryRouterEnabled()) return out
+  if (!partitioningEnabled()) return out
   for (const entry of yield* scanEntries(ctx, DIR_SCOPE_PREFIX)) {
     const parsed = parseScopedKey(entry.key)
     if (parsed === undefined) continue

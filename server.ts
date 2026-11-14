@@ -11,12 +11,17 @@ import { Definition } from "./src/protocol.js"
 import { hydrateReports } from "./src/report.js"
 import { ensureRouter, enqueuePending, flushPending, hydratePending, registerRouterIdle } from "./src/router.js"
 import { hydrateSessionMeta } from "./src/session-meta.js"
-import { applySettings, perDirectoryRouterEnabled } from "./src/settings.js"
+import { applySettings, perDirectoryRouterEnabled, takeRouterDirectoryWarning } from "./src/settings.js"
 import { registerSleep } from "./src/sleep.js"
 import { statusSnapshot } from "./src/status.js"
 import { dirStateForDirectory, hydrate, store, toSessionID, type TriggerInput } from "./src/state.js"
 import { hydrateTickets, TICKET_STATES, type TicketState } from "./src/ticket.js"
-import { registerTicketTools, renderTicketTextDeep, renderTicketsTextDeep } from "./src/ticket-tools.js"
+import {
+  registerTicketTools,
+  renderAllTicketsTextDeep,
+  renderTicketTextDeep,
+  renderTicketsTextDeep,
+} from "./src/ticket-tools.js"
 import { registerWatcher } from "./src/watcher.js"
 import { registerWatchdog } from "./src/watchdog.js"
 import { versionNotice } from "./src/version.js"
@@ -125,6 +130,10 @@ export default Plugin.define({
     // switch decides where state is read and written, so it must not be read
     // lazily per call after some state has already been routed.
     applySettings(ctx.options)
+    // A configured-but-unusable `routerDirectory` is ignored (never fatal) and
+    // reported once per process, not once per loaded location.
+    const routerDirectoryWarning = takeRouterDirectoryWarning()
+    if (routerDirectoryWarning !== undefined) yield* Effect.logWarning(routerDirectoryWarning)
     // Tickets first: hydrating workers reconciles finished `running` records
     // and closes their tickets, so the ticket store must already be loaded.
     yield* hydrateTickets(ctx)
@@ -173,6 +182,17 @@ export default Plugin.define({
                 status: String(input.status),
               }),
             )
+          }
+          // The aggregate view (`all: true`): every partition, grouped by
+          // directory. It ignores `directory` — "all" and "one directory" are
+          // different questions, and asking for both is not an error, just the
+          // aggregate answer.
+          if (input.all === true) {
+            return renderAllTicketsTextDeep(ctx, {
+              ...(input.threadID === undefined ? {} : { threadID: input.threadID }),
+              ...(input.status === undefined ? {} : { status: input.status }),
+              ...(input.limit === undefined ? {} : { limit: input.limit }),
+            }).pipe(Effect.map((text) => ({ text })))
           }
           // Stage 3: a directory argument scopes the read to that partition;
           // omitting it keeps the process-wide list (the pre-3 behaviour).

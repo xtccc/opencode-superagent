@@ -457,6 +457,11 @@ describe("composition root: RPC surface", () => {
     const tickets = (await succeed(handler("tickets")({}, context))) as { text: string }
     expect(tickets.text.length).toBeGreaterThan(0)
 
+    // The aggregate view answers the same question for every partition; with
+    // nothing stored it says exactly what the default view says.
+    const aggregate = (await succeed(handler("tickets")({ all: true }, context))) as { text: string }
+    expect(aggregate.text).toBe(tickets.text)
+
     const invalid = (await failWith(handler("tickets")({ status: "nope" }, context))) as { type: string }
     expect(invalid.type).toBe("tickets.invalid_status")
 

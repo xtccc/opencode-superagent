@@ -2,7 +2,8 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
 import { createHash } from "node:crypto"
 import { realpathSync } from "node:fs"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled, perDirectoryRouterEnabled, routerDirectorySetting } from "./settings.js"
+import { sharedSingleton } from "./shared.js"
 
 /**
  * Router 自管目录记忆：单网关进程服务多目录，Router 从自然语言推断
@@ -24,18 +25,27 @@ export const DIR_ALIAS_PREFIX = "dir:alias:"
 export const threadDirKey = (threadID: string): string => `${DIR_THREAD_PREFIX}${threadID}`
 export const aliasDirKey = (alias: string): string => `${DIR_ALIAS_PREFIX}${alias.toLowerCase()}`
 
-/** threadID -> 绝对路径（内存镜像，hydrate 时从 KV 读回）。 */
-export const threadDirs = new Map<string, string>()
+/**
+ * Directory memory is process state, not per-module state: the host may load
+ * one plugin instance per location, and a Router in instance A must resolve the
+ * same thread/alias bindings as the dispatcher in instance B.
+ *
+ * threadID -> 绝对路径（内存镜像，hydrate 时从 KV 读回）。
+ */
+export const threadDirs: Map<string, string> = sharedSingleton("dirs.threads", () => new Map<string, string>())
 /**
  * 小写别名 -> 路径（内存镜像，hydrate 时从 KV 读回）。
  * 迭代顺序即“最近登记”顺序（最旧在前），状态行据此只显示最近几条。
  */
-export const aliasDirs = new Map<string, string>()
+export const aliasDirs: Map<string, string> = sharedSingleton("dirs.aliases", () => new Map<string, string>())
 /**
  * 别名冲突：同名 basename 落在了别的目录。先登记的目录保留映射（稳定），
  * 后到的目录只记在这里，且该别名不再参与自动匹配（避免派发到错误目录）。
  */
-export const aliasConflicts = new Map<string, Array<string>>()
+export const aliasConflicts: Map<string, Array<string>> = sharedSingleton(
+  "dirs.alias-conflicts",
+  () => new Map<string, Array<string>>(),
+)
 
 /** 目录字符串长度上限， pathologic input 的护栏。 */
 const MAX_DIRECTORY_LENGTH = 500
@@ -142,7 +152,10 @@ export function dirKeyOf(directory: string | undefined): string {
  * `dirKeyOf` 的再次命中、hydrate 到的 Router 会话 `location.directory` 或该分区
  * worker 的 `directory` 重新填充。首次写入优先，避免符号链接与其目标互相覆盖。
  */
-const dirKeyDirectories = new Map<string, string>()
+const dirKeyDirectories: Map<string, string> = sharedSingleton(
+  "dirs.dir-key-directories",
+  () => new Map<string, string>(),
+)
 
 /** 登记（首次优先）某个分区的目录。 */
 export function rememberDirDirectory(dirKey: string, directory: string): void {
@@ -164,25 +177,72 @@ export function resetDirDirectories(): void {
 }
 
 /**
- * 目录 → 分区 key，受 `perDirectoryRouter` 开关控制：关闭时一切归入默认分区，
- * 所以阶段 1 的单实例行为不会因为某个调用点忘了判断开关而被绕开。
+ * Router 的固定分区（`routerDirectory` 配置后），未配置时为 `undefined`。
+ *
+ * 结果缓存到配置的目录字符串上：`dirKeyOf` 会做 realpath + sha1，而分区规则
+ * 在每次工单/worker/dispatch 判定时都会被读到。配置是进程启动时读一次的，
+ * 所以只要目录不变就不需要重算（`resetSettings` 会让目录变回 `undefined`）。
+ */
+let pinnedRouter: { readonly directory: string; readonly dirKey: string } | undefined
+
+/** `routerDirectory` 对应的分区 key；未配置（或配置被忽略）返回 `undefined`。 */
+export function routerDirKeySetting(): string | undefined {
+  const directory = routerDirectorySetting()
+  if (directory === undefined) {
+    pinnedRouter = undefined
+    return undefined
+  }
+  if (pinnedRouter?.directory === directory) return pinnedRouter.dirKey
+  const dirKey = dirKeyOf(directory)
+  pinnedRouter = { directory, dirKey }
+  return dirKey
+}
+
+/**
+ * 某个分区是不是 Router 的固定分区；是则返回它的目录，否则 `undefined`。
+ * 创建/认领 Router 会话时用它补上 `location.directory`。
+ */
+export function routerDirectoryForPartition(dirKey: string | undefined): string | undefined {
+  const directory = routerDirectorySetting()
+  if (directory === undefined) return undefined
+  return routerDirKeySetting() === (dirKey ?? DEFAULT_DIR_KEY) ? directory : undefined
+}
+
+/**
+ * 目录 → 分区 key。
+ *
+ * - 未启用分区（`perDirectoryRouter` 关闭且没有 `routerDirectory`）：一切归默认
+ *   分区，阶段 1 的单实例行为不会因为某个调用点忘了判断开关而被绕开。
+ * - 只配置了 `routerDirectory`（开关关闭）：整个进程仍然只有一个分区，但它就是
+ *   那个固定目录的分区 —— 固定目录若没有落点，`/tickets` 依旧看不到 Router 的工单。
+ * - 分区启用后：缺省目录（`undefined`）归 Router 的固定分区（没有固定目录时归
+ *   `default`），显式目录按 `dirKeyOf` 各自成区。
  *
  * 定义放在 `dirs.ts`（而不是 `state.ts`）是为了让**不能** import `state.ts` 的模块
  * （工单层 `ticket.ts`，它与 `state.ts` 互相引用）用同一份实现，而不是各自复制
  * 一份"开关关闭就落到默认分区"的判断。
  */
 export function dirKeyFor(directory: string | undefined): string {
-  if (!perDirectoryRouterEnabled()) return DEFAULT_DIR_KEY
+  if (!partitioningEnabled()) return DEFAULT_DIR_KEY
+  const pinned = routerDirKeySetting()
+  if (!perDirectoryRouterEnabled()) return pinned ?? DEFAULT_DIR_KEY
+  if (directory === undefined) return pinned ?? DEFAULT_DIR_KEY
   return dirKeyOf(directory)
 }
 
 /**
- * 把「调用方给的分区」收敛成生效分区：开关关闭时一切归默认分区。
- * 关闭意味着单实例，接受第二个 key 只会把状态写进一个没人读的命名空间。
+ * 把「调用方给的分区」收敛成生效分区。
+ *
+ * 关闭分区时一切归默认分区（单实例，接受第二个 key 只会把状态写进一个没人读的
+ * 命名空间）。只配置了 `routerDirectory` 时唯一的分区就是那个固定目录；分区
+ * 打开后只有**缺省**分区被替换成固定分区，显式分区（含 `default`）保持原样——
+ * 那样历史 `default` 工单才有明确的"不在这里"语义。
  */
 export function effectiveDirKey(dirKey: string | undefined): string {
-  if (!perDirectoryRouterEnabled()) return DEFAULT_DIR_KEY
-  return dirKey ?? DEFAULT_DIR_KEY
+  if (!partitioningEnabled()) return DEFAULT_DIR_KEY
+  const pinned = routerDirKeySetting()
+  if (!perDirectoryRouterEnabled()) return pinned ?? DEFAULT_DIR_KEY
+  return dirKey ?? pinned ?? DEFAULT_DIR_KEY
 }
 
 /**
@@ -211,10 +271,10 @@ export interface WorkerOwnerRef {
  * - neither present → the default partition (the caller warns once).
  */
 export function workerOwnerDirKey(record: WorkerOwnerRef | undefined): string {
-  if (!perDirectoryRouterEnabled()) return DEFAULT_DIR_KEY
+  if (!partitioningEnabled()) return DEFAULT_DIR_KEY
   const owner = record?.ownerDirKey
   if (owner !== undefined && owner !== "") return owner
-  return dirKeyOf(record?.directory)
+  return dirKeyFor(record?.directory)
 }
 
 /** Whether a worker record states its own partition (either field), for the one-shot degradation warning. */

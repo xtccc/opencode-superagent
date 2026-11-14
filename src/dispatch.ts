@@ -9,7 +9,7 @@ import { DEFAULT_DIR_KEY, directoryError, normalizeDirectory, rememberDirectory,
 import { DISPATCH_EFFORTS, type DispatchEffort } from "./effort.js"
 import { requireRouter } from "./guard.js"
 import { superagentMetadata, workerTitle } from "./session-meta.js"
-import { perDirectoryRouterEnabled, maxWorkersPerDirectorySetting, parseWorkerLimit } from "./settings.js"
+import { partitioningEnabled, maxWorkersPerDirectorySetting, parseWorkerLimit } from "./settings.js"
 import {
   detachWorkerThreads,
   dirKeyForRouter,
@@ -237,7 +237,7 @@ export function statusText(options: StatusOptions = {}): string {
   ]
   // Only when directory partitioning is switched on: with the default `false`
   // this reply stays byte-identical to the pre-partition format.
-  if (perDirectoryRouterEnabled()) {
+  if (partitioningEnabled()) {
     const partitions = routerPartitions()
     const detail =
       partitions.length > 0 && store.dirs.size > 1
@@ -275,7 +275,7 @@ export function statusText(options: StatusOptions = {}): string {
 
 /** Router column of the status line: one id with the switch off, per-partition ids with it on. */
 function routerSummary(): string {
-  if (!perDirectoryRouterEnabled()) return store.routerID ?? "none"
+  if (!partitioningEnabled()) return store.routerID ?? "none"
   const entries = routerPartitions().map((entry) => `${entry.dirKey}=${entry.routerID}`)
   return entries.length === 0 ? "none" : entries.join(",")
 }

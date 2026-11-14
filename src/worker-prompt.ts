@@ -3,7 +3,7 @@ import { Tool } from "@opencode/schema/tool"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import { Effect, Schema } from "effect"
 import { requireRouter } from "./guard.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled } from "./settings.js"
 import { dirKeyForWorker, isRouterSession, store, toSessionID } from "./state.js"
 import { isTerminalState } from "./ticket-state.js"
 import { ticketForWorker } from "./ticket.js"
@@ -102,7 +102,7 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
   }
   // A router only drives the workers it dispatched: a worker running in this
   // directory but owned by another partition belongs to that Router.
-  if (perDirectoryRouterEnabled() && dirKeyForWorker(worker) !== callerDirKey) {
+  if (partitioningEnabled() && dirKeyForWorker(worker) !== callerDirKey) {
     return yield* new Tool.Error({
       message: `worker ${sessionID} belongs to another router's partition (${dirKeyForWorker(worker)}); prompt it from that router`,
     })

@@ -5,10 +5,10 @@ import { Effect, Option, Semaphore, type Schema } from "effect"
 import { createHash } from "node:crypto"
 import { ROUTER_AGENT } from "./agents.js"
 import { buildStatusInjection } from "./context.js"
-import { DEFAULT_DIR_KEY, threadDirHint } from "./dirs.js"
+import { DEFAULT_DIR_KEY, routerDirectoryForPartition, threadDirHint } from "./dirs.js"
 import { formatTrigger } from "./format.js"
 import { ROUTER_TITLE, superagentMetadata } from "./session-meta.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled } from "./settings.js"
 import {
   ROUTER_KEY,
   dirKeyFor,
@@ -295,7 +295,13 @@ export const ensureRouter = Effect.fn("superagent.ensureRouter")(function* (
   target: RouterTarget = {},
 ) {
   const dirKey = effectiveDirKey(target.dirKey ?? dirKeyFor(target.directory))
-  const directory = target.directory ?? dirState(store, dirKey).directory
+  // A pinned partition always lives in its configured directory, even when the
+  // caller passes another one (the flag-off TUI sends its session directory):
+  // "fixed directory" must win, otherwise the Router's session and its
+  // partition would disagree. The fixed directory is also the fallback for a
+  // caller that only names the partition (`router` RPC, idle flush).
+  const pinnedDirectory = routerDirectoryForPartition(dirKey)
+  const directory = pinnedDirectory ?? target.directory ?? dirState(store, dirKey).directory
   return yield* lockFor("router", dirKey).withPermit(ensureRouterUnlocked(ctx, dirKey, directory))
 })
 
@@ -344,9 +350,10 @@ const ensureRouterUnlocked = Effect.fn("superagent.ensureRouterUnlocked")(functi
   // resolution, tool cwd and injected directory context then match the workers
   // it dispatches (`dispatch` creates workers the same way). The default
   // partition keeps the host default (`location` omitted), which is what the
-  // pre-partition code always did.
-  const where = perDirectoryRouterEnabled() && dirKey !== DEFAULT_DIR_KEY ? dir.directory : undefined
-  if (perDirectoryRouterEnabled() && dirKey !== DEFAULT_DIR_KEY && where === undefined) {
+  // pre-partition code always did; a `routerDirectory` partition always gets
+  // its configured directory, even when the per-directory switch is off.
+  const where = dirKey !== DEFAULT_DIR_KEY ? dir.directory : undefined
+  if (partitioningEnabled() && dirKey !== DEFAULT_DIR_KEY && where === undefined) {
     yield* Effect.logWarning("superagent router created without a directory: partition has no known path", {
       dirKey,
     })

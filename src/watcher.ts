@@ -5,7 +5,8 @@ import { createHash } from "node:crypto"
 import { buildReport, lastAssistantText, reportNotice, reportSummary, saveReport } from "./report.js"
 import { ensureRouter } from "./router.js"
 import { clipCodePoints } from "./format.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled } from "./settings.js"
+import { sharedSingleton } from "./shared.js"
 import { workerHomeDirectory, workerOwnerKnown } from "./dirs.js"
 import {
   dirKeyForRouter,
@@ -25,7 +26,7 @@ import { closeOutcomeForWorkerState } from "./ticket-state.js"
  * completion is retried on every duplicate delivery, and a warning per attempt
  * would bury the one line the operator needs. Keyed by warning topic.
  */
-const warnedOnce = new Set<string>()
+const warnedOnce = sharedSingleton("watcher.warned-once", () => new Set<string>())
 
 function warnOnce(key: string, message: string, fields: Record<string, unknown>): Effect.Effect<void> {
   if (warnedOnce.has(key)) return Effect.void
@@ -312,7 +313,7 @@ const ensureRouterForWorker = Effect.fn("superagent.ensureRouterForWorker")(func
   worker: WorkerRecord,
 ) {
   const dirKey = dirKeyForWorker(worker)
-  if (perDirectoryRouterEnabled() && !workerOwnerKnown(worker)) {
+  if (partitioningEnabled() && !workerOwnerKnown(worker)) {
     yield* warnOnce("worker-without-directory", "superagent worker has no partition; reporting to the default router", {
       sessionID: worker.sessionID,
       dirKey,

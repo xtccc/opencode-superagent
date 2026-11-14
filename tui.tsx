@@ -15,6 +15,14 @@ import {
   type TicketPane,
 } from "./src/picker-nav"
 import { detailRows, parseTicketDetail, type TicketDetail } from "./src/ticket-detail"
+import { parseAggregateHeader, parseAggregatedTicketList } from "./src/ticket-aggregate"
+import {
+  sidebarAggregatePanel,
+  sidebarCollapsedGroups,
+  sidebarExpandedLabel,
+  sidebarGroupSummary,
+  type SidebarAggregatePanel,
+} from "./src/ticket-sidebar"
 import { resolveTicketQuery, searchPickerOptions } from "./src/ticket-search"
 import type { StatusPartitionView } from "./src/status"
 import {
@@ -34,7 +42,6 @@ import {
   TICKET_PANEL_LIMIT,
   TICKET_PANEL_REFRESH_MS,
   TICKET_STATE_SYMBOL,
-  ticketPanel,
   truncateCells,
   type TicketRow,
   type TicketState,
@@ -53,6 +60,7 @@ import {
 const RUNNERS: Record<CommandRun, (context: Plugin.Context, input?: string) => Promise<void> | void> = {
   open: (context) => open(context),
   browse: (context) => tickets(context),
+  browseAll: (context) => allTickets(context),
   abort: (context) => abort(context),
   tools: (context) => tools(context),
   detail: (context, input) => ticket(context, input),
@@ -101,10 +109,21 @@ function ticketStateColor(theme: Theme, state: TicketState) {
   }
 }
 
-/** Fixed 36-cell layout: the sidebar publishes no width, and 42 columns are fixed upstream. */
+/**
+ * The sidebar ticket panel.
+ *
+ * The panel shows the **aggregate** view: every partition's tickets, the
+ * session's own directory expanded and the other partitions as one-line
+ * summaries (`目录 · 计数`). 36 cells cannot show every partition's tickets in
+ * full, and the user's own directory is the one they are working on, so it
+ * wins the space.
+ *
+ * With a single partition the panel is byte-identical to the old one: no group
+ * header, no summary line, the same items in the same order.
+ */
 function SidebarTickets(props: { context: Plugin.Context }) {
   const theme = props.context.theme
-  const [rows, setRows] = createSignal<ReadonlyArray<TicketRow>>([])
+  const [panel, setPanel] = createSignal<SidebarAggregatePanel>(emptySidebarPanel())
   const [partitions, setPartitions] = createSignal<ReadonlyArray<StatusPartitionView>>([])
   const [currentDirKey, setCurrentDirKey] = createSignal<string | undefined>(undefined)
   const [failed, setFailed] = createSignal(false)
@@ -119,21 +138,21 @@ function SidebarTickets(props: { context: Plugin.Context }) {
       const call = options(props.context)
       const directory = directoryOf(props.context)
       // Aggregate status drives the partition list; the scoped call tells us
-      // which row is the session's own directory (so it can be highlighted).
-      // Scoping the ticket list keeps another directory's work orders out of
-      // this panel under `perDirectoryRouter`.
+      // which row is the session's own directory (so it can be highlighted and
+      // expanded in the ticket panel).
+      // The ticket list is the **aggregate** view: the sidebar shows every
+      // partition's work orders, not just this directory's.
       const [status, scoped, tickets] = await Promise.all([
         rpc.status({}, call),
         directory === undefined ? Promise.resolve(undefined) : rpc.status({ directory }, call).catch(() => undefined),
-        rpc.tickets(
-          { limit: TICKET_PANEL_LIMIT, ...(directory === undefined ? {} : { directory }) },
-          call,
-        ),
+        rpc.tickets({ limit: TICKET_PANEL_LIMIT, all: true }, call),
       ])
       if (disposed) return
       setPartitions(status.partitions ?? [])
       setCurrentDirKey(scoped?.dirKey)
-      setRows(parseTicketList(tickets.text))
+      // The same aggregate text `/alltickets` renders, parsed by the same
+      // shared model: the sidebar and the command cannot disagree.
+      setPanel(sidebarAggregatePanel(tickets.text, scoped?.dirKey))
       setFailed(false)
     } catch {
       if (!disposed) setFailed(true)
@@ -153,13 +172,15 @@ function SidebarTickets(props: { context: Plugin.Context }) {
     })
   })
 
-  const panel = createMemo(() => ticketPanel(rows()))
+  const expanded = createMemo(() => panel().expanded)
+  // The groups the panel does not expand: one summary line each.
+  const collapsed = createMemo(() => sidebarCollapsedGroups(panel()))
   // One partition = the pre-2b view; hide the summary entirely so the sidebar
   // looks exactly as it did before this stage.
   const showPartitions = createMemo(() => partitions().length > 1)
 
   return (
-    <Show when={panel().items.length > 0 || failed() || showPartitions()}>
+    <Show when={panel().total > 0 || failed() || showPartitions()}>
       <box>
         <Show when={showPartitions()}>
           <box>
@@ -194,7 +215,7 @@ function SidebarTickets(props: { context: Plugin.Context }) {
           </box>
         </Show>
         <Show
-          when={panel().items.length > 0}
+          when={panel().total > 0}
           fallback={
             <Show when={failed()}>
               <text fg={theme.text.feedback.warning.base}>工单 读取失败</text>
@@ -206,11 +227,30 @@ function SidebarTickets(props: { context: Plugin.Context }) {
             <Show when={panel().active > 0}>
               <span style={{ fg: theme.text.muted }}> · {panel().active} 未结</span>
             </Show>
+            <Show when={panel().grouped}>
+              <span style={{ fg: theme.text.muted }}> · {panel().groups.length} 个目录</span>
+            </Show>
             <Show when={failed()}>
               <span style={{ fg: theme.text.feedback.warning.base }}> · 读取失败</span>
             </Show>
           </text>
-          <For each={panel().items}>
+          <Show when={panel().grouped}>
+            {/* The other partitions: one line each, so the panel still says
+                "there is work waiting elsewhere, and here is how much". */}
+            <For each={collapsed()}>
+              {(group) => (
+                <text fg={theme.text.muted} wrapMode="none" truncate>
+                  {sidebarGroupSummary(group)}
+                </text>
+              )}
+            </For>
+          </Show>
+          <Show when={panel().grouped && expanded() !== undefined}>
+            <text fg={theme.text.base} wrapMode="none" truncate>
+              {sidebarExpandedLabel(expanded()!)}
+            </text>
+          </Show>
+          <For each={expanded()?.items ?? []}>
             {(item) => (
               <box flexDirection="row" minWidth={0} onMouseUp={() => void ticket(props.context, item.id)}>
                 <text wrapMode="none" truncate>
@@ -221,13 +261,18 @@ function SidebarTickets(props: { context: Plugin.Context }) {
               </box>
             )}
           </For>
-          <Show when={panel().hidden > 0}>
-            <text fg={theme.text.muted}>… 另有 {panel().hidden} 条已结</text>
+          <Show when={(expanded()?.hidden ?? 0) > 0}>
+            <text fg={theme.text.muted}>… 另有 {expanded()!.hidden} 条已结</text>
           </Show>
         </Show>
       </box>
     </Show>
   )
+}
+
+/** The panel before the first refresh: empty, so nothing is drawn. */
+function emptySidebarPanel(): SidebarAggregatePanel {
+  return { total: 0, active: 0, grouped: false, groups: [] }
 }
 
 /** Show the directory's basename; fall back to the partition key when unknown. */
@@ -1006,6 +1051,107 @@ async function tickets(context: Plugin.Context) {
     gotoSession(context, result.sessionID)
   } catch (error) {
     context.ui.toast.show({ title: "Superagent tickets", message: message(error), variant: "error" })
+  }
+}
+
+/**
+ * `/alltickets`: the aggregate view.
+ *
+ * Unlike `/tickets` (which lists the session's own directory and its workers),
+ * this lists **every** partition and groups the tickets by directory. The
+ * worker list stays out of it: workers belong to a partition, and the aggregate
+ * view is about the work orders.
+ *
+ * The rows are the same ticket rows as `/tickets` (so `⏎` opens the same
+ * detail and `⏎` in the detail enters the same worker session), with the
+ * directory of each group shown as a header row above the group.
+ */
+async function allTickets(context: Plugin.Context) {
+  try {
+    const rpc = context.client.rpc(Definition)
+    const call = options(context)
+    const { text } = await rpc.tickets({ limit: TICKET_PICKER_LIMIT, all: true }, call)
+    const groups = parseAggregatedTicketList(text)
+    const header = parseAggregateHeader(text)
+    const rows = groups.flatMap((group) => group.rows)
+    if (rows.length === 0) {
+      context.ui.toast.show({ title: "Superagent all tickets", message: "暂无工单", variant: "info" })
+      return
+    }
+    const ticketByID = new Map(rows.map((row) => [row.id, row]))
+    // Group headers are rows too, so the list reads as one scrollable list.
+    const listRows: Array<PickerRow> = []
+    const searchable: Array<TicketRow> = []
+    groups.forEach((group, index) => {
+      // Every group gets a header row, except the degenerate single-partition
+      // view (no directory known) — that one must look exactly like `/tickets`.
+      if (group.directory !== undefined) {
+        listRows.push({
+          title: `目录 ${group.directory}`,
+          description: group.dirKey === undefined ? "" : group.dirKey,
+          value: `group:${index}`,
+          glyph: "▸",
+          code: "",
+        })
+      }
+      for (const row of group.rows) {
+        searchable.push(row)
+        listRows.push({
+          title: row.title === "" ? row.id : row.title,
+          description: `${TICKET_STATE_SYMBOL[row.state]} ${row.state} · ${row.priority} · ${row.id}`,
+          value: `${TICKET_CHOICE_PREFIX}${row.id}`,
+          glyph: TICKET_STATE_SYMBOL[row.state],
+          tone: row.state,
+          code: shortTicketID(row.id),
+          status: row.state,
+          trailing: row.workerSuffix === undefined ? row.priority : `${row.priority} w=${row.workerSuffix}`,
+          nav: { kind: "ticket" as const },
+        })
+      }
+    })
+    const result = await browseTickets(context, {
+      title:
+        header === undefined
+          ? `Superagent all tickets · 工单 ${rows.length}`
+          : `Superagent all tickets · 共 ${header.total} 条，${header.directories} 个目录`,
+      placeholder: TICKET_SEARCH_PLACEHOLDER,
+      rows: listRows,
+      // The counter is about tickets, not about the group header rows.
+      total: rows.length,
+      search: (query, visible) => searchPickerOptions(query, visible, searchable, TICKET_CHOICE_PREFIX),
+      loadDetail: async (row, width) => {
+        // A group header carries no ticket: say so instead of failing.
+        if (!row.value.startsWith(TICKET_CHOICE_PREFIX)) {
+          return { lines: [row.title, row.description ?? ""].filter((line) => line !== "") }
+        }
+        const ticketID = row.value.slice(TICKET_CHOICE_PREFIX.length)
+        const listRow = ticketByID.get(ticketID)
+        const detail = await loadTicketDetail(context, ticketID)
+        if (detail === undefined) {
+          return {
+            lines: [
+              `工单 ${ticketID}`,
+              "",
+              listRow === undefined ? "读取详情失败。" : `${listRow.state} · ${listRow.priority}`,
+              "（详情读取失败）",
+            ],
+          }
+        }
+        // The detail knows the ticket's last worker session, so `⏎` in the
+        // detail pane still enters the worker — exactly like `/tickets`.
+        const sessionID = detail.workerSessionID
+        return {
+          lines: detailRows(detail, width),
+          ...(sessionID === undefined ? {} : { sessionID }),
+        }
+      },
+    })
+    if (result === undefined) return
+    // The detail pane resolved the ticket's most recent worker session, so
+    // `⏎` there jumps to it — exactly like `/tickets`.
+    if (result.sessionID !== undefined) gotoSession(context, result.sessionID)
+  } catch (error) {
+    context.ui.toast.show({ title: "Superagent all tickets", message: message(error), variant: "error" })
   }
 }
 

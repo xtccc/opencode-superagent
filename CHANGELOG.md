@@ -55,6 +55,94 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ### Added
 
+- **`/alltickets`: one aggregate view over every partition.** `/tickets` lists
+  the session's own directory (and its workers); the new `/alltickets` lists
+  **every** partition's work orders and groups them by directory, so a gateway
+  serving several directories can be surveyed in one place.
+  - **RPC**: `tickets` gained an optional `all?: boolean`. Omitted, the
+    behaviour is exactly as before (the caller's partition, or the
+    process-wide list when no `directory` is given). With `all: true` the
+    response is the aggregate list; `all` wins over `directory` (asking for
+    "all" and "one directory" at once is not an error, the aggregate simply
+    answers).
+  - **Output**: the total comes first (`共 N 条，K 个目录`), then one block per
+    directory with its own header (`目录 <path> · <dirKey> · <n> 条`) and the
+    **same** body the single-partition view prints (`renderTicketList`), so the
+    two commands differ only in the headers. With a single partition the
+    aggregate output is byte-identical to the default output — the aggregate
+    view adds no noise to a gateway that only ever has one directory. The
+    `limit` applies to **each** group (the N newest tickets of every
+    directory), and the KV fallback fills the groups when memory was trimmed,
+    so a ticket that only lives in KV still shows up in its own directory's
+    block.
+  - **TUI**: `/alltickets` is registered next to `/tickets` (same palette
+    entry style, same two-pane browser, same keys: `⏎` detail, `/` search,
+    `q`/`esc` quit). Each group is introduced by a `目录 <path>` header row;
+    `⏎` in the detail still enters the ticket's most recent worker session.
+    The worker list stays out of the aggregate view: workers belong to a
+    partition, and the aggregate view is about the work orders.
+  - New suite `test/ticket-all.test.ts` (two partitions aggregate with group
+    headers and the total line; the default call still returns one partition;
+    a single partition degrades byte-for-byte to the default output; the empty
+    case agrees; the layout and the aggregate text parser), an updated
+    `test/commands.test.ts` (the command set now contains `alltickets`), and an
+    aggregate case in `e2e/per-directory.e2e.ts`. README's command table, RPC
+    section and "单网关多目录" section document the new command.
+- **The sidebar ticket panel is the aggregate view too.** The panel used to
+  list only the session's own directory's work orders; it now lists **every**
+  partition's, the same data `/alltickets` shows. 36 cells cannot hold every
+  partition's tickets, so the panel expands the session's own directory and
+  gives every other partition **one summary line** (`目录 <basename> · <N> 条`)
+  — the user still sees that work is waiting elsewhere and how much of it
+  there is, without the panel outgrowing the terminal. A count that may be a
+  lower bound is printed as `N+ 条` (the partition hit the 20-per-partition
+  fetch limit), so the number is never a wrong claim. With a single partition
+  the panel is structurally identical to the old one: same rows, same order,
+  same counts, no group label and no summary line.
+  - Both surfaces read the **same** aggregate text and share one model:
+    `src/ticket-aggregate.ts` renders the groups on the server and parses them
+    on the TUI side, and `src/ticket-sidebar.ts` turns the parsed groups into
+    the panel's layout. The group count the panel prints is the count the
+    **server** wrote into the group header, so the sidebar and the command can
+    never disagree.
+  - New suite `test/ticket-sidebar.test.ts` (the panel holds every partition's
+    tickets; the session's own directory is expanded and comes first; the
+    other partitions are collapsed into one summary line with their count; the
+    single-partition panel equals the old one row for row; the aggregate fetch
+    of one partition is byte-identical to the old directory-scoped fetch).
+    README's "侧栏工单面板" section documents the new layout.
+
+- **Fixed Router working directory (`routerDirectory` option).** The gateway
+  Router can now be pinned to one directory so its work orders land in that
+  directory's partition and show up in the `/tickets` panel / sidebar of a TUI
+  session opened there. The option must be an existing absolute path; a
+  relative, missing or non-directory value is ignored with a single startup
+  warning and the old `default` behaviour is kept. When set:
+  - the Router's partition is `dirKeyOf(routerDirectory)` and a newly created
+    Router session carries `location: { directory: routerDirectory }`;
+    `ensureRouter` uses the fixed directory even when a caller names the
+    partition without a directory (and, with `perDirectoryRouter` off, pins the
+    single Router there — configuring the option is enough to enable the
+    partition machinery with exactly one partition);
+  - a legacy Router stored under `router` (created before the flag, no
+    `location.directory`, parked in `default`) is claimed into that partition on
+    hydrate: `dir:<dirKey>:router` is written, the legacy `router` pointer is
+    removed, and an already-scoped Router wins over the stale pointer, so one
+    session is never served by two partitions;
+  - legacy `ticket:<id>` records without a `dirKey` are re-owned by the fixed
+    partition and written back to the **same** legacy key (key name kept for
+    rollback); records that already name an owner are untouched, so repeated
+    hydration is idempotent. Without the option nothing changes (`default`
+    partition, no `dir:` keys, byte-identical snapshots).
+  - TUI visibility needs no new aggregate view: `/tickets`, the sidebar and the
+    ticket picker already resolve the session directory to a partition, which
+    equals the Router's partition when the session runs in `routerDirectory`.
+  New suite `test/router-directory.test.ts` covers creation pinning, ticket
+  visibility from that directory vs `default`, legacy ticket re-owning
+  (idempotent, old key kept), legacy Router claiming (no-location, matching,
+  superseded and foreign-location shapes), flag-off standalone pinning and
+  invalid-value warnings. README's "单网关多目录" section and the options table
+  document the option; the config change needs a gateway restart.
 - **Groundwork for one-instance-per-directory (stage 1, no behaviour change).**
   `dirKeyOf()` turns a directory into a KV-safe partition key (`<slug>-<sha1[0:8]>`,
   canonicalized, symlink-resolved), `DEFAULT_DIR_KEY` names the no-directory

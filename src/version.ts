@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import path from "node:path"
+import { sharedSingleton } from "./shared.js"
 
 /**
  * Plugin version, read from the package's own `package.json`.
@@ -63,12 +64,12 @@ export function loadVersion(read: ReadFile = readRelative): string {
   return UNKNOWN_VERSION
 }
 
-let cached: string | undefined
+const cached = sharedSingleton("version.cached", () => ({ value: undefined as string | undefined }))
 
 /** Cached plugin version; the process never changes version at runtime. */
 export function pluginVersion(): string {
-  cached ??= loadVersion()
-  return cached
+  cached.value ??= loadVersion()
+  return cached.value
 }
 
 /**

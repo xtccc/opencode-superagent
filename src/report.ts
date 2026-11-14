@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import type { Schema } from "effect"
 import { Effect } from "effect"
 import { clipUtf16 } from "./format.js"
+import { sharedSingleton } from "./shared.js"
 
 /**
  * Full worker reports ("spill") kept beside the compact `worker:<id>` record.
@@ -228,7 +229,11 @@ export const loadReport = Effect.fn("superagent.loadReport")(function* (ctx: Plu
   return decodeReport(value)
 })
 
-let stats: ReportStats = { entries: 0, chars: 0, truncated: 0 }
+/**
+ * Measured spill totals. Shared, so every plugin instance reports the same
+ * numbers instead of only the instance whose `hydrateReports` ran last.
+ */
+const stats = sharedSingleton("report.stats", () => ({ entries: 0, chars: 0, truncated: 0 }))
 
 export const reportStats = (): ReportStats => stats
 
@@ -262,7 +267,9 @@ export const hydrateReports = Effect.fn("superagent.hydrateReports")(function* (
     }
     after = page.next
   } while (after !== undefined)
-  stats = { entries, chars, truncated }
+  stats.entries = entries
+  stats.chars = chars
+  stats.truncated = truncated
   yield* Effect.logInfo("superagent report spill measured", stats)
   if (entries > REPORT_ENTRY_WARN || chars > REPORT_CHARS_WARN) {
     yield* Effect.logWarning(

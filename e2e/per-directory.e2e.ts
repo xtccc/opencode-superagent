@@ -415,6 +415,19 @@ async function main(): Promise<void> {
     assertEqual(scopedBefore.output?.partitions, undefined, "scoped status must not include the aggregate summary")
     console.log(`[e2e] status      aggregate partitions=${aggregateBefore.output?.partitions?.length ?? 0} scoped=${scopedBefore.output?.dirKey}`)
 
+    // 4b. The ticket list: the aggregate view (`all: true`) and the
+    //     directory-scoped one. Both are still empty here, but the aggregate
+    //     must not print a total line for an empty process, and the scoped
+    //     call must not answer with the aggregate header.
+    const emptyAggregate = await rpc<{ output?: { text?: string } }>("tickets", { all: true })
+    const emptyScoped = await rpc<{ output?: { text?: string } }>("tickets", { directory: dirA })
+    assertEqual(emptyAggregate.output?.text, emptyScoped.output?.text, "empty aggregate and scoped text agree")
+    assert(
+      !(emptyAggregate.output?.text ?? "").startsWith("共 "),
+      "an empty process must not print an aggregate total line",
+    )
+    console.log(`[e2e] tickets     empty aggregate=${JSON.stringify(emptyAggregate.output?.text)}`)
+
     // 5. Two Routers, each created in its own directory through the public RPC.
     const routerA = await rpc<{ output?: { sessionID?: string } }>("router", { directory: dirA })
     const routerB = await rpc<{ output?: { sessionID?: string } }>("router", { directory: dirB })
@@ -592,6 +605,14 @@ interface HarnessResult {
     readonly routerB: string
     readonly created: number
   }
+  /** `routerDirectory`: the gateway Router is pinned to directory A. */
+  readonly pinned: {
+    readonly router: string
+    readonly directory: string | undefined
+    readonly dirKey: string
+    readonly visible: number
+    readonly visibleInDefault: number
+  }
 }
 
 async function runHarness(dirA: string, dirB: string, root: string): Promise<HarnessResult> {
@@ -607,6 +628,7 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
   const watcherModule = (await import(join(REPO_ROOT, "dist/src/watcher.js"))) as typeof import("../src/watcher.js")
   const settingsModule = (await import(join(REPO_ROOT, "dist/src/settings.js"))) as typeof import("../src/settings.js")
   const statusModule = (await import(join(REPO_ROOT, "dist/src/status.js"))) as typeof import("../src/status.js")
+  const dirsModule = (await import(join(REPO_ROOT, "dist/src/dirs.js"))) as typeof import("../src/dirs.js")
 
   interface Created {
     readonly id: string
@@ -762,6 +784,24 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
   assertEqual(statusOn.partitions?.length, 2, "flag-on aggregate partitions")
   assertEqual(statusModule.statusSnapshot({ directory: dirA }).workers?.length, 1, "flag-on scoped alpha workers")
 
+  // ── the aggregate ticket view (`/alltickets`) ──
+  // Two partitions, one ticket each: the aggregate lists both, grouped by
+  // directory, while the directory-scoped list keeps only its own.
+  const ticketToolsModule = (await import(join(REPO_ROOT, "dist/src/ticket-tools.js"))) as typeof import("../src/ticket-tools.js")
+  const aggregateText = await succeed(ticketToolsModule.renderAllTicketsTextDeep(on.ctx, {}))
+  assert(aggregateText.startsWith("共 2 条，2 个目录"), `aggregate header missing: ${aggregateText}`)
+  assert(aggregateText.includes(ticketA.ticket.id), "aggregate lists alpha's ticket")
+  assert(aggregateText.includes(ticketB.ticket.id), "aggregate lists beta's ticket")
+  assert(aggregateText.includes(dirA), "aggregate names alpha's directory")
+  assert(aggregateText.includes(dirB), "aggregate names beta's directory")
+  const scopedText = await succeed(ticketToolsModule.renderTicketsTextDeep(on.ctx, {}, keyA))
+  assert(scopedText.includes(ticketA.ticket.id), "scoped list lists alpha's ticket")
+  assert(!scopedText.includes(ticketB.ticket.id), "scoped list must not list beta's ticket")
+  assert(!scopedText.startsWith("共 "), "the scoped list must not carry an aggregate header")
+  console.log(
+    `[e2e] alltickets  aggregate=${JSON.stringify(aggregateText.split("\n")[0])} scoped=${JSON.stringify(scopedText.split("\n")[0])}`,
+  )
+
   // ── ownership: a worker dispatched into the OTHER directory stays owned by A ──
   // Router A creates a ticket whose working directory is beta and dispatches a
   // worker there. The ticket and the completion notice must stay with A: the
@@ -821,6 +861,43 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
   assertEqual(off.created[0]?.directory, undefined, "flag off Router keeps the host default location")
   assertEqual(statusModule.statusSnapshot().partitions, undefined, "flag off has no partition summary")
 
+  // ── routerDirectory: the gateway Router is pinned to dirA ──
+  // A TUI session opened in dirA resolves its directory to dirA's partition, so
+  // the Router's tickets must be listed there and not in the default partition.
+  settingsModule.applySettings({ perDirectoryRouter: true, routerDirectory: dirA })
+  ticketModule.resetTickets()
+  stateModule.resetPartitions()
+  stateModule.store.workers.clear()
+  const pinned = memoryContext()
+  const pinnedDirKey = stateModule.dirKeyFor(dirA)
+  assertEqual(pinnedDirKey, keyA, "routerDirectory partition key")
+  const pinnedRouter = await succeed(routerModule.ensureRouter(pinned.ctx, {}))
+  assertEqual(pinned.created.length, 1, "routerDirectory creates one Router")
+  assertEqual(pinned.created[0]?.directory, dirA, "routerDirectory Router location.directory")
+  assertEqual(stateModule.dirKeyForRouter(pinnedRouter), keyA, "routerDirectory Router partition")
+  assertEqual(stateModule.store.dirs.get(keyA)?.routerID, pinnedRouter, "routerDirectory partition owns the Router")
+  const pinnedTicket = await succeed(
+    ticketModule.createTicket(pinned.ctx, {
+      threadID: "e2e:pinned",
+      title: "pinned task",
+      objective: "work from the fixed directory",
+      acceptance: ["done"],
+      directory: dirB,
+      dirKey: keyA,
+      source: "e2e",
+    }),
+  )
+  const pinnedVisible = ticketModule.listTickets({}, keyA).filter((ticket) => ticket.id === pinnedTicket.ticket.id).length
+  const pinnedInDefault = ticketModule
+    .listTickets({}, dirsModule.DEFAULT_DIR_KEY)
+    .filter((ticket) => ticket.id === pinnedTicket.ticket.id).length
+  assertEqual(pinnedVisible, 1, "routerDirectory ticket visible in its partition")
+  assertEqual(pinnedInDefault, 0, "routerDirectory ticket invisible in the default partition")
+
+  console.log(
+    `[e2e] pinned      router=${pinnedRouter}@${dirA} dirKey=${keyA} ticket=${pinnedTicket.ticket.id} ` +
+      `visible=${pinnedVisible} inDefault=${pinnedInDefault}`,
+  )
   console.log(
     `[e2e] harness     flag-on routers=${routerA},${routerB} workers=${workerA}@${dirA},${workerB}@${dirB} ` +
       `deliveries=${toA.length}/${toB.length} cross=${crossWorker}@${dirB} owner=${crossRecord.ownerDirKey} ` +
@@ -853,6 +930,13 @@ async function runHarness(dirA: string, dirB: string, root: string): Promise<Har
       routerA: offRouterA,
       routerB: offRouterB,
       created: off.created.length,
+    },
+    pinned: {
+      router: pinnedRouter,
+      directory: pinned.created[0]?.directory,
+      dirKey: pinnedDirKey,
+      visible: pinnedVisible,
+      visibleInDefault: pinnedInDefault,
     },
   }
 }

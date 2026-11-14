@@ -1,9 +1,10 @@
 /**
  * `src/commands.ts` pins the registered slash names. `/tickets` is the
- * two-level browser (list → detail → session), `/ticket <id>` opens one ticket,
- * and the deleted plain-text `/tickets` list must not come back
- * under any name. `tui.tsx` only maps each `run` key to its handler, so these
- * assertions cover what the prompt actually offers.
+ * two-level browser (list → detail → session) scoped to the session's own
+ * directory, `/alltickets` is the aggregate view over every partition,
+ * `/ticket <id>` opens one ticket, and the deleted plain-text `/tickets` list
+ * must not come back under any name. `tui.tsx` only maps each `run` key to its
+ * handler, so these assertions cover what the prompt actually offers.
  */
 
 import { describe, expect, test } from "bun:test"
@@ -13,8 +14,8 @@ const names = COMMANDS.map((command) => command.slash.name)
 
 describe("registered slash commands", () => {
   test("the command set has no `/task` and no second ticket list", () => {
-    // open, tickets, abort, tools, ticket
-    expect(names).toEqual(["superagent", "tickets", "abort", "tools", "ticket"])
+    // open, tickets, alltickets, abort, tools, ticket
+    expect(names).toEqual(["superagent", "tickets", "alltickets", "abort", "tools", "ticket"])
     expect(names).not.toContain("task")
   })
 
@@ -29,13 +30,33 @@ describe("registered slash commands", () => {
     expect(tickets[0]!.title).toBe("Superagent tickets")
   })
 
+  test("`/alltickets` is the aggregate browser over every partition", () => {
+    const all = COMMANDS.filter((command) => command.slash.name === "alltickets")
+    expect(all).toHaveLength(1)
+    // A separate run key: the aggregate view is not the directory-scoped one.
+    expect(all[0]!.run).toBe("browseAll")
+    expect(all[0]!.slash.arguments).toBeUndefined()
+    expect(all[0]!.id).toBe("superagent.alltickets")
+    expect(all[0]!.title).toBe("Superagent all tickets")
+    // The help text points at the directory-scoped command.
+    expect(all[0]!.description).toContain("/tickets")
+    // The two browser commands are distinct, not a rename of one another.
+    expect(all[0]!.run).not.toBe(
+      COMMANDS.find((command) => command.slash.name === "tickets")!.run,
+    )
+  })
+
   test("`/ticket` keeps opening a single ticket and does not collide with `/tickets`", () => {
     const ticket = COMMANDS.find((command) => command.slash.name === "ticket")
     expect(ticket?.run).toBe("detail")
     expect(ticket?.slash.arguments).toBe(true)
     expect(ticket?.description).toContain("/tickets")
-    // Exactly two ticket commands: the browser and the single-ticket opener.
-    expect(names.filter((name) => name.startsWith("ticket"))).toEqual(["tickets", "ticket"])
+    // Exactly three ticket commands: the two browsers and the single-ticket opener.
+    expect(names.filter((name) => name.includes("ticket"))).toEqual([
+      "tickets",
+      "alltickets",
+      "ticket",
+    ])
   })
 
   test("no slash name or alias is registered twice", () => {

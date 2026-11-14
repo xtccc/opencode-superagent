@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin/effect"
 import { Tool } from "@opencode/schema/tool"
 import { Effect, Option, Schema } from "effect"
 import { requireRouter } from "./guard.js"
-import { perDirectoryRouterEnabled } from "./settings.js"
+import { partitioningEnabled } from "./settings.js"
 import {
   detachWorkerThreads,
   dirKeyForWorker,
@@ -185,7 +185,7 @@ export const runAbort = Effect.fn("superagent.abort")(function* (
         message: `${input.sessionID} is not tracked by the superagent router; refusing to abort a session the plugin does not own`,
       })
     }
-    if (perDirectoryRouterEnabled() && !inCallerPartition(input.sessionID)) {
+    if (partitioningEnabled() && !inCallerPartition(input.sessionID)) {
       return yield* new Tool.Error({
         message: `${input.sessionID} belongs to another router's partition (${dirKeyForWorker(store.workers.get(input.sessionID))}); abort it from that router (or from the TUI)`,
       })

@@ -82,6 +82,10 @@ export const Definition = Rpc.define({
           // Stage 3: scope the list to one directory's partition. Omitted =
           // process-wide list, exactly the pre-3 behaviour.
           directory: Schema.optionalKey(Schema.String),
+          // Aggregate view: list **every** partition, grouped by directory.
+          // Omitted = the current behaviour (the caller's partition only, or
+          // the process-wide list when no directory is given).
+          all: Schema.optionalKey(Schema.Boolean),
         }),
       ),
       output: Schema.toStandardSchemaV1(Schema.Struct({ text: Schema.String })),
