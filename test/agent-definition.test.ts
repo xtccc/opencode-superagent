@@ -257,6 +257,23 @@ describe("superagent agent markdown templates", () => {
     expect(ROUTER_PROMPT).toContain("unverified: inherited")
   })
 
+  test("ROUTER_PROMPT requires a self-contained task briefing", () => {
+    // The worker never sees the router's conversation: the dispatch task must
+    // carry every known fact up front so it starts work instead of re-investigating.
+    expect(ROUTER_PROMPT).toContain("任务投喂")
+    for (const term of [
+      "没有长度上限",
+      "已知结论",
+      "确切路径",
+      "关键地址/帧号",
+      "已证伪的方向",
+      "避坑点",
+      "从零重新调查",
+    ]) {
+      expect(ROUTER_PROMPT).toContain(term)
+    }
+  })
+
   test("the worker prompt does not restate the effort policy", () => {
     // Keeping the rulebook out of the worker keeps its context small; the only
     // effort-related line there is the "you cannot change it" constraint.
