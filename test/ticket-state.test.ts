@@ -83,9 +83,9 @@ describe("worker-state: terminal worker states", () => {
 // ── closed-outcome helpers ────────────────────────────────────────────────────
 
 describe("ticket-state: worker close helpers", () => {
-  test("only done/failed ends close a ticket", () => {
+  test("only a successful worker end closes a ticket; failure parks it for re-dispatch", () => {
     expect(closeOutcomeForWorkerState("done")).toBe("done")
-    expect(closeOutcomeForWorkerState("failed")).toBe("failed")
+    expect(closeOutcomeForWorkerState("failed")).toBeUndefined()
     expect(closeOutcomeForWorkerState("idle")).toBeUndefined()
     expect(closeOutcomeForWorkerState("aborted")).toBeUndefined()
     expect(closeOutcomeForWorkerState("running")).toBeUndefined()

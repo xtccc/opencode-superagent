@@ -843,14 +843,14 @@ const removeWorker = Effect.fn("superagent.removeWorker")(function* (ctx: Plugin
  * that is still executing keeps `running`; one that finished while the plugin
  * was down is backfilled the same way the watcher would have handled it:
  * capture the last assistant report, persist the terminal/interrupted state,
- * close its ticket for `done`/`failed`, and park it as `blocked` for an
- * interruption.
+ * close its ticket for `done`, and park it as `blocked` for an interruption or
+ * a reported failure.
  *
- * The interruption branch is the restart counterpart of the watcher's: the
- * worker becomes `idle`, which the dispatch gate treats as a live session, so a
- * ticket left `in_progress` would be gated forever and the Router could never
- * re-dispatch it. `blocked` records that the attempt was interrupted and makes
- * the ticket dispatchable again.
+ * The parking branch is the restart counterpart of the watcher's: a ticket left
+ * `in_progress` would either be gated forever (an `idle` worker is still live)
+ * or look closed to the Router (a failed worker's ticket used to close as
+ * `failed`). `blocked` records why the attempt stopped and keeps the work order
+ * re-dispatchable with a corrected angle.
  */
 const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(function* (
   ctx: Plugin.Context,
@@ -889,14 +889,22 @@ const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(fu
         }),
       ),
     )
-  } else if (state === "idle") {
+  } else if (state === "idle" || state === "failed") {
+    // A failed attempt is parked too: closing it would leave the Router with a
+    // closed work order and no reason to try another angle after a restart.
     yield* blockTicketsForWorker(ctx, {
       sessionID: record.sessionID,
-      ...(info.outcome === undefined ? {} : { reason: `interrupted while the plugin was down (${info.outcome})` }),
+      ...(state === "failed" ? { kind: "failed" as const } : {}),
+      ...(state === "failed"
+        ? { reason: "worker failed while the plugin was down; router should re-dispatch" }
+        : info.outcome === undefined
+          ? {}
+          : { reason: `interrupted while the plugin was down (${info.outcome})` }),
     }).pipe(
       Effect.catch((cause) =>
-        Effect.logWarning("superagent failed to block ticket for rehydrated interrupted worker", {
+        Effect.logWarning("superagent failed to park ticket for rehydrated worker", {
           sessionID: record.sessionID,
+          state,
           cause,
         }),
       ),

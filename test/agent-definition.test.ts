@@ -274,6 +274,30 @@ describe("superagent agent markdown templates", () => {
     }
   })
 
+  test("ROUTER_PROMPT makes failure handling a manager decision", () => {
+    expect(ROUTER_PROMPT).toContain("失败处置")
+    for (const term of [
+      "不是任务不可行的定论",
+      "禁止原样转述给用户后就结束回合",
+      "report_read",
+      "thread_detail",
+      "默认动作是重派",
+      "ticket_update",
+      "已证伪方向",
+      "最多重派 2~3 次",
+      "第一次失败就交回用户是失职",
+    ]) {
+      expect(ROUTER_PROMPT).toContain(term)
+    }
+  })
+
+  test("the worker prompt reports blockers and falsified directions instead of declaring defeat", () => {
+    const { system } = AGENT_DEFINITIONS.find((definition) => definition.id === WORKER_AGENT)!
+    for (const term of ["阻塞原因", "已经试过且证伪的方向", "替代路径", "不要自行断言"]) {
+      expect(system).toContain(term)
+    }
+  })
+
   test("the worker prompt does not restate the effort policy", () => {
     // Keeping the rulebook out of the worker keeps its context small; the only
     // effort-related line there is the "you cannot change it" constraint.

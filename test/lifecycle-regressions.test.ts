@@ -206,7 +206,7 @@ describe("abort clears queued prompts", () => {
 // ── hydrate: reconcile records that were `running` across a restart ─────────
 
 describe("hydrate reconciles running records", () => {
-  test("keeps live workers, backfills ended reports and closes their tickets", async () => {
+  test("keeps live workers, backfills ended reports, closes done tickets and parks failed ones", async () => {
     const h = memoryContext()
     store.routerID = "ses_router"
     h.infos.set("ses_router", {})
@@ -256,10 +256,13 @@ describe("hydrate reconciles running records", () => {
     expect(decodeReport(h.data.get(reportKey("ses_done")))?.text).toBe("迁移完成：报告正文")
     expect(getTicket(doneTicket.ticket.id)?.state).toBe("done")
 
-    // Failed: failed + ticket close, no report invented.
+    // Failed: failed + no report invented, but the ticket is parked as blocked
+    // so the Router can re-dispatch with a corrected angle instead of giving up.
     expect(store.workers.get("ses_failed")?.state).toBe("failed")
     expect(h.data.has(reportKey("ses_failed"))).toBe(false)
-    expect(getTicket(failedTicket.ticket.id)?.state).toBe("failed")
+    const failedParked = getTicket(failedTicket.ticket.id)
+    expect(failedParked?.state).toBe("blocked")
+    expect(failedParked?.history.at(-1)?.note).toContain("failed")
 
     // Interrupted: idle + ticket parked as `blocked` so a restart does not
     // leave it `in_progress` behind the idle dispatch gate.

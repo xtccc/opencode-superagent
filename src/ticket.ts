@@ -1391,23 +1391,27 @@ export const closeTicketsForWorker = Effect.fn("superagent.closeTicketsForWorker
 
 /** Why a ticket was parked: the worker was interrupted, not finished. */
 export const INTERRUPTED_REASON = "interrupted"
+/** Why a ticket was parked: the worker reported failure; the Router decides next. */
+export const FAILED_REASON = "failed"
 
 export interface BlockForWorkerInput {
   readonly sessionID: string
-  /** Raw interruption detail (the host's `reason`), when there is one. */
+  /** How the attempt stopped: an interruption or a reported failure. */
+  readonly kind?: "interrupted" | "failed"
+  /** Raw detail from the host (or the failure summary), when there is one. */
   readonly reason?: string
   readonly now?: number
 }
 
 /**
- * Park the in-progress ticket of a worker that was interrupted.
+ * Park the in-progress ticket of a worker that was interrupted or failed.
  *
- * An interruption finishes neither the work nor the attempt: closing the
- * ticket as `failed` would lie and leaving it `in_progress` would keep it out
- * of every later dispatch (the interrupted worker stays `idle`, which the
- * dispatch gate treats as live). `blocked` is the honest state — the ticket
- * says why it stopped, and the Router can re-open and re-dispatch it. The
- * history entry is also what tells the gate that worker released the ticket.
+ * Neither case finished the work: closing a failed attempt's ticket as `failed`
+ * would hand the Router a closed work order and invite it to report defeat to
+ * the user, while leaving it `in_progress` would gate re-dispatch. `blocked` is
+ * the honest state for both — the ticket says why it stopped, and the Router
+ * can re-open and re-dispatch it with a corrected angle. The history entry is
+ * also what tells the gate that the worker released the ticket.
  */
 export const blockTicketsForWorker = Effect.fn("superagent.blockTicketsForWorker")(function* (
   ctx: Plugin.Context,
@@ -1417,7 +1421,8 @@ export const blockTicketsForWorker = Effect.fn("superagent.blockTicketsForWorker
   if (ticket === undefined) return undefined
   const now = input.now ?? Date.now()
   const reason = input.reason === undefined || input.reason.trim() === "" ? undefined : input.reason.trim()
-  const note = compact(reason === undefined ? INTERRUPTED_REASON : `${INTERRUPTED_REASON}: ${reason}`, SUMMARY_MAX)
+  const prefix = input.kind === "failed" ? FAILED_REASON : INTERRUPTED_REASON
+  const note = compact(reason === undefined ? prefix : `${prefix}: ${reason}`, SUMMARY_MAX)
   ticket.history.push({ at: now, kind: "state", from: ticket.state, to: "blocked", note })
   ticket.state = "blocked"
   ticket.updatedAt = now

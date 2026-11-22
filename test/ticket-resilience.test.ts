@@ -10,6 +10,7 @@ import {
   decodeTicket,
   dirtyTicketIDs,
   dirtyTicketIndexKeys,
+  FAILED_REASON,
   flushTicketWrites,
   getTicket,
   hydrateTickets,
@@ -204,6 +205,53 @@ describe("an interrupted worker parks its ticket", () => {
     })
     await succeed(handleEnded(h.ctx, WORKER, "done"))
     expect(getTicket(created.ticket.id)?.state).toBe("done")
+  })
+})
+
+// ── 1b. a failed worker parks its ticket instead of closing it ───────────────
+
+describe("a failed worker parks its ticket for re-dispatch", () => {
+  async function failed() {
+    const h = memoryContext()
+    store.routerID = ROUTER
+    h.infos.set(ROUTER, {})
+    const created = await succeed(createTicket(h.ctx, base))
+    const ticketID = created.ticket.id
+    await succeed(linkTicketToWorker(h.ctx, { ticketID, sessionID: WORKER }))
+    store.workers.set(WORKER, {
+      sessionID: WORKER,
+      threadID: THREAD,
+      threads: [THREAD],
+      state: "running",
+      createdAt: 1,
+    })
+    await succeed(handleEnded(h.ctx, WORKER, "failed", "boom"))
+    return { ...h, ticketID }
+  }
+
+  test("the ticket is blocked with the failure recorded, not closed", async () => {
+    const h = await failed()
+    const ticket = getTicket(h.ticketID)
+    expect(ticket?.state).toBe("blocked")
+    expect(ticket?.closedAt).toBeUndefined()
+    expect(ticket?.history.at(-1)).toMatchObject({ kind: "state", from: "in_progress", to: "blocked" })
+    expect(ticket?.history.at(-1)?.note).toBe(`${FAILED_REASON}: boom`)
+    expect(store.workers.get(WORKER)?.state).toBe("failed")
+    expect(ticket?.workerSessionID).toBe(WORKER)
+  })
+
+  test("reopening the parked ticket lets the Router re-dispatch a new worker", async () => {
+    const h = await failed()
+    // Blocked is not dispatchable until the Router re-opens it.
+    const blocked = await failure(requireDispatchTicket(h.ticketID, THREAD))
+    expect(blocked).toContain("is blocked")
+    expect(blocked).toContain("ticket_update")
+
+    await succeed(updateTicket(h.ctx, { ticketID: h.ticketID, state: "in_progress" }))
+    const ready = await succeed(requireDispatchTicket(h.ticketID, THREAD))
+    expect(ready.id).toBe(h.ticketID)
+    expect(ready.state).toBe("in_progress")
+    // The failed worker is terminal, so it no longer gates the ticket.
   })
 })
 

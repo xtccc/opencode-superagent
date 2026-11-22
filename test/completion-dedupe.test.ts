@@ -88,6 +88,23 @@ beforeEach(() => {
 // ── dedupe ───────────────────────────────────────────────────────────────────
 
 describe("worker completion dedupe", () => {
+  test("a failed worker's router event demands recovery, not defeat", async () => {
+    const h = memoryContext()
+    store.routerID = "ses_router"
+    h.infos.set("ses_router", {})
+    h.infos.set("ses_worker", {})
+    store.workers.set("ses_worker", worker("ses_worker", "running", { execution: 3 }))
+
+    await succeed(handleEnded(h.ctx, "ses_worker", "failed", "boom", 3))
+
+    expect(h.calls.synthetic).toHaveLength(1)
+    expect(h.calls.synthetic[0]).toContain("finished (failed)")
+    expect(h.calls.synthetic[0]).toContain("不是任务不可行的定论")
+    expect(h.calls.synthetic[0]).toContain("report_read")
+    expect(h.calls.synthetic[0]).toContain("thread_detail")
+    expect(h.calls.synthetic[0]).toContain("重派")
+  })
+
   test("three consecutive `done` events inject one router notification", async () => {
     const h = memoryContext()
     store.routerID = "ses_router"

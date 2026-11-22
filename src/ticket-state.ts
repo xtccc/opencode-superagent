@@ -144,11 +144,13 @@ export function findActiveTicketForWorker<T extends WorkerBoundTicket>(
 
 /**
  * Ticket outcome for a worker that just ended, or `undefined` when the worker
- * end closes nothing. `idle`/`aborted`/`running` leave the ticket for the abort
- * path or a deliberate re-dispatch.
+ * end does not close the ticket. Only a successful worker closes its ticket:
+ * a failure is parked as `blocked` so the Router can re-dispatch with a
+ * corrected angle instead of silently turning one failed attempt into a
+ * closed work order. `idle`/`aborted`/`running` stay open for the abort path.
  */
-export function closeOutcomeForWorkerState(state: WorkerState): "done" | "failed" | undefined {
-  return state === "done" || state === "failed" ? state : undefined
+export function closeOutcomeForWorkerState(state: WorkerState): "done" | undefined {
+  return state === "done" ? "done" : undefined
 }
 
 /**

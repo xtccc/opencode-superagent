@@ -28,6 +28,16 @@ import { closeOutcomeForWorkerState } from "./ticket-state.js"
  */
 const warnedOnce = sharedSingleton("watcher.warned-once", () => new Set<string>())
 
+/**
+ * A failed worker's report is evidence for the Router's next decision, not a
+ * verdict to forward. Appended to the completion event so the live trigger
+ * steers toward recovery even when the system prompt is far back in context.
+ */
+export const FAILURE_ACTION_NOTICE =
+  "\n这是 Worker 一次尝试的结论，不是任务不可行的定论。请先 report_read 读全文、thread_detail 回看用户原始目标，" +
+  "判断是角度错还是障碍问题；默认重开工单并换角度/换方案重派（见 ROUTER_PROMPT「失败处置」），" +
+  "只有穷尽尝试或必须用户拍板时才回复用户。"
+
 function warnOnce(key: string, message: string, fields: Record<string, unknown>): Effect.Effect<void> {
   if (warnedOnce.has(key)) return Effect.void
   warnedOnce.add(key)
@@ -210,10 +220,10 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   // record only keeps a summary, which is what list/status lines show.
   const captured = report === undefined ? undefined : yield* captureReport(ctx, worker, report)
   yield* saveWorker(ctx, worker)
-  // A worker that reached a terminal state closes its in-progress ticket.
-  // An interruption (`idle`) parks it instead: the work did not finish and the
-  // attempt did not fail, but leaving it `in_progress` would keep it out of
-  // every later dispatch. `blocked` records the reason and stays re-dispatchable.
+  // Only a successful worker closes its in-progress ticket. An interruption
+  // (`idle`) or a failed attempt parks it instead: closing a failed attempt
+  // would hand the Router a closed work order and invite it to report defeat
+  // to the user. `blocked` records the reason and stays re-dispatchable.
   const closeOutcome = closeOutcomeForWorkerState(state)
   if (closeOutcome !== undefined) {
     yield* closeTicketsForWorker(ctx, {
@@ -225,13 +235,18 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
         Effect.logWarning("superagent failed to close ticket for ended worker", { sessionID, cause }),
       ),
     )
-  } else if (state === "idle") {
+  } else if (state === "idle" || state === "failed") {
     yield* blockTicketsForWorker(ctx, {
       sessionID,
-      ...(detail === undefined ? {} : { reason: detail }),
+      ...(state === "failed" ? { kind: "failed" as const } : {}),
+      ...(detail === undefined
+        ? state === "failed"
+          ? { reason: "worker reported failure; router should re-dispatch" }
+          : {}
+        : { reason: detail }),
     }).pipe(
       Effect.catch((cause) =>
-        Effect.logWarning("superagent failed to block ticket for interrupted worker", { sessionID, cause }),
+        Effect.logWarning("superagent failed to park ticket for worker", { sessionID, state, cause }),
       ),
     )
   }
@@ -253,10 +268,11 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
           ? "failed"
           : "interrupted"
   const label = worker.title === undefined ? `Worker ${sessionID}` : `Worker ${sessionID} (${worker.title})`
-  const text =
+  const baseText =
     report !== undefined && captured !== undefined
       ? [`${label} finished (${state}):`, reportSummary(captured), "---", reportNotice(captured)].join("\n")
       : `${label} finished (${state}) with no report (outcome: ${outcome}).${detail === undefined ? "" : ` Cause: ${detail}.`} Suggest: 可换模型重派.`
+  const text = state === "failed" ? `${baseText}${FAILURE_ACTION_NOTICE}` : baseText
   const routerID = yield* ensureRouterForWorker(ctx, worker).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("superagent cannot report without a router", { cause }).pipe(Effect.as(undefined)),
