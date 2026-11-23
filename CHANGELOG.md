@@ -5,6 +5,13 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
+Nothing yet — see 0.7.0 below.
+
+## 0.7.0 — 2026-11-23
+
+Additive release. No public surface was removed or renamed; all new tools and
+behaviour are additions to the Router's capabilities.
+
 ### Added
 
 - **Machine-read context usage for workers.** Router can now see a worker's
@@ -32,6 +39,31 @@ version is independent of the main OpenCode line (see README, "发布与构建")
   context instead of starting a cold worker. A closed ticket no longer blocks
   the prompt: the reply reminds the Router to reopen it first. `failed`/`aborted`
   workers and workers with no ticket are still refused.
+- **Restricted `file_read` tool for the Router.** The Router can page through
+  text files inside the workspace and known directories (thread-bound dirs,
+  directory aliases, Router partition dirs), by absolute path or relative to
+  the gateway cwd — 8,000 chars/page by default, 20,000 max — and gets back the
+  character range plus a next offset, like `report_read`. Only the Router can
+  call it; the host's general `read` is not opened up to the Router (which would
+  bypass the sensitive-file boundary and strip Workers of file access). Secret
+  names/prefixes and private-key/certificate extensions (`.env*`,
+  `credentials*`, `id_*`, …), sensitive directories (`.ssh`, `.aws`, `.git`,
+  `.gnupg`, …), escaping symlinks and files over 2 MB are rejected. Read-only:
+  writes still go through a Worker.
+- **Known-facts briefing in dispatch tasks.** `ROUTER_PROMPT` now asks the
+  Router to recall prior context before dispatch and put known conclusions,
+  exact paths, addresses/frame numbers, disproven directions and pitfalls into
+  the Worker's `task`, so Workers start directly instead of re-investigating.
+
+### Fixed
+
+- **Worker failure is a decision, not a defeat.** Failed completion events now
+  carry a recovery directive and the Router prompt has an explicit failure
+  policy: read the full report and the user's original goal, classify
+  angle/obstacle/unclear, re-dispatch by default with a capped retry count.
+  Failed attempts park the ticket as `blocked` (watcher + hydrate) instead of
+  closing it, so the Router can reopen and re-dispatch with a corrected angle;
+  Workers report blockers, falsified directions and alternatives as material.
 
 ## 0.6.0 — 2026-11-14
 
