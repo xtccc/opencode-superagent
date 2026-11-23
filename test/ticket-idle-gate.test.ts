@@ -111,4 +111,19 @@ describe("a terminal worker allows re-dispatch on the same ticket", () => {
     // The gate only checks: the ticket still points at the previous worker.
     expect(getTicket(ticketID)?.workerSessionID).toBe(WORKER)
   })
+
+  test("any live worker in the session list blocks a re-dispatch", async () => {
+    const { ctx, ticketID } = await ticketWithWorker("done")
+    const second = "ses_worker_2"
+    await succeed(linkTicketToWorker(ctx, { ticketID, sessionID: second }))
+    store.workers.set(second, {
+      sessionID: second,
+      threadID: THREAD,
+      threads: [THREAD],
+      state: "idle",
+      createdAt: 2,
+    })
+    const message = await failure(requireDispatchTicket(ticketID, THREAD))
+    expect(message).toContain(`already has an idle worker ${second}`)
+  })
 })

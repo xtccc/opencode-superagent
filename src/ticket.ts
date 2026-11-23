@@ -19,6 +19,7 @@ import {
   isTerminalState,
   PRIORITIES,
   TICKET_STATES,
+  ticketWorkerIDs,
   transitionError,
   workerCloseSummary,
   type Ticket,
@@ -48,8 +49,10 @@ export {
   ACTIVE_STATES,
   allowedTransitions,
   canTransition,
+  CLOSED_STATES,
   isTerminalState,
   TICKET_STATES,
+  ticketWorkerIDs,
   transitionError,
 } from "./ticket-state.js"
 export { isWorkerTerminal, TERMINAL_WORKER_STATES } from "./worker-state.js"
@@ -81,14 +84,17 @@ export interface TicketTriggerNoteInput {
  *
  * State machine:
  *
- *   open ─┬─▶ in_progress ─┬─▶ done
- *         │                ├─▶ failed
+ *   open ─┬─▶ in_progress ─┬─▶ done ───────┐
+ *         │                ├─▶ failed ────┤
  *         │                ├─▶ blocked ──▶ in_progress
- *         ├─▶ blocked      └─▶ cancelled
- *         ├─▶ cancelled
- *         └─▶ superseded
+ *         ├─▶ blocked      └─▶ cancelled ─┤
+ *         ├─▶ cancelled                   │
+ *         └─▶ superseded ─────────────────┘
  *
- * `done`, `failed`, `cancelled` and `superseded` are terminal.
+ * `done`, `failed`, `cancelled` and `superseded` are closed states, but not
+ * dead ends: each can be reopened to `in_progress` with `ticket_update`. A
+ * ticket keeps the list of every worker session bound to it, so continuing
+ * work can reuse an existing worker's context instead of starting cold.
  */
 
 export const TICKET_PREFIX = "ticket:"
@@ -527,20 +533,30 @@ export function activeTicketForWorker(sessionID: string): Ticket | undefined {
 }
 
 /**
- * The ticket bound to a worker session, including a closed one. Used by
- * `worker_prompt` to refuse waking a worker whose work order already ended.
- * The ticket store is the only worker → ticket mapping; a reused worker
- * session keeps the newest write (a closed ticket is never reopened).
+ * The ticket bound to a worker session, closed or not. A worker may be bound
+ * to several tickets over its lifetime (reopen + re-dispatch, or follow-ups);
+ * prefer the one that is still workable, then the most recently updated one.
+ * `worker_prompt` uses this to decide which work order a follow-up belongs to.
  */
 export function ticketForWorker(sessionID: string): Ticket | undefined {
   const dirKey = workerScope(sessionID)
   const pool = dirKey === undefined ? [...tickets.values()] : inScope(dirKey)
-  let latest: Ticket | undefined
+  let best: Ticket | undefined
   for (const ticket of pool) {
-    if (ticket.workerSessionID !== sessionID) continue
-    if (latest === undefined || ticket.updatedAt > latest.updatedAt) latest = ticket
+    if (!ticketWorkerIDs(ticket).includes(sessionID)) continue
+    if (best === undefined) {
+      best = ticket
+      continue
+    }
+    const bestClosed = isTerminalState(best.state)
+    const closed = isTerminalState(ticket.state)
+    if (bestClosed && !closed) {
+      best = ticket
+    } else if (bestClosed === closed && ticket.updatedAt > best.updatedAt) {
+      best = ticket
+    }
   }
-  return latest
+  return best
 }
 
 // ── validation ────────────────────────────────────────────────────────────────
@@ -668,6 +684,10 @@ export function decodeTicket(value: Schema.Json | undefined): Ticket | undefined
       })
     : []
   const workerSessionID = optionalString(value, "workerSessionID")
+  const workerSessionIDs = stringArray(value["workerSessionIDs"])
+  // A legacy record has only the single field; upgrade it in memory so every
+  // later write persists the list as well.
+  const workerIDs = ticketWorkerIDs({ workerSessionID, workerSessionIDs })
   const dirKey = optionalString(value, "dirKey")
   const directory = optionalString(value, "directory")
   const parentTicketID = optionalString(value, "parentTicketID")
@@ -690,7 +710,8 @@ export function decodeTicket(value: Schema.Json | undefined): Ticket | undefined
       at: optionalNumber(authorization, "at") ?? createdAt,
     },
     threadID,
-    ...(workerSessionID === undefined ? {} : { workerSessionID }),
+    ...(workerIDs.length === 0 ? {} : { workerSessionID: workerIDs[workerIDs.length - 1] }),
+    workerSessionIDs: [...workerIDs],
     attempts,
     priority: PRIORITIES.includes(priority as TicketPriority) ? (priority as TicketPriority) : "p1",
     ...(dirKey === undefined ? {} : { dirKey }),
@@ -707,6 +728,9 @@ export function decodeTicket(value: Schema.Json | undefined): Ticket | undefined
 }
 
 export function encodeTicket(ticket: Ticket): Schema.Json {
+  // Persist both views: the list is the source of truth, the single pointer
+  // keeps older readers (and the TUI detail pane) working on downgrade.
+  const workerIDs = ticketWorkerIDs(ticket)
   return {
     id: ticket.id,
     state: ticket.state,
@@ -724,7 +748,8 @@ export function encodeTicket(ticket: Ticket): Schema.Json {
       at: ticket.authorization.at,
     },
     threadID: ticket.threadID,
-    ...(ticket.workerSessionID === undefined ? {} : { workerSessionID: ticket.workerSessionID }),
+    workerSessionIDs: [...workerIDs],
+    ...(workerIDs.length === 0 ? {} : { workerSessionID: workerIDs[workerIDs.length - 1] }),
     attempts: ticket.attempts.map((attempt) => ({
       at: attempt.at,
       ...(attempt.sessionID === undefined ? {} : { sessionID: attempt.sessionID }),
@@ -963,6 +988,7 @@ export const createTicket = Effect.fn("superagent.createTicket")(function* (
     },
     authorization,
     threadID: input.threadID,
+    workerSessionIDs: [],
     attempts: [],
     priority: input.priority ?? "p1",
     dirKey,
@@ -1023,22 +1049,32 @@ export const updateTicket = Effect.fn("superagent.updateTicket")(function* (
   if (input.state !== undefined && input.state !== ticket.state) {
     const failure = transitionError(ticket.state, input.state)
     if (failure !== undefined) return yield* new Tool.Error({ message: failure })
+    const wasClosed = isTerminalState(ticket.state)
+    const reopened = wasClosed && !isTerminalState(input.state)
+    const note = reopened && input.note === undefined ? "reopened" : input.note
     ticket.history.push({
       at: now,
       kind: "state",
       from: ticket.state,
       to: input.state,
-      ...(input.note === undefined ? {} : { note: input.note }),
+      ...(note === undefined ? {} : { note: compact(note, SUMMARY_MAX) }),
     })
     ticket.state = input.state
     if (isTerminalState(input.state)) {
       ticket.closedAt = now
       ticket.closeReason = compact(input.note ?? input.state, SUMMARY_MAX)
+    } else if (reopened) {
+      // Reopening clears the previous close stamp: the work order is live again.
+      ticket.closedAt = undefined
+      ticket.closeReason = undefined
     }
   } else if (input.note !== undefined) {
     ticket.history.push({ at: now, kind: "note", note: compact(input.note, SUMMARY_MAX) })
   }
-  if (input.workerSessionID !== undefined) ticket.workerSessionID = input.workerSessionID
+  if (input.workerSessionID !== undefined) {
+    ticket.workerSessionID = input.workerSessionID
+    if (!ticket.workerSessionIDs.includes(input.workerSessionID)) ticket.workerSessionIDs.push(input.workerSessionID)
+  }
   ticket.updatedAt = now
   yield* persistTicket(ctx, ticket)
   yield* persistIndexes(ctx, ticket)
@@ -1274,7 +1310,7 @@ export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket
   if (foreign !== undefined) return yield* new Tool.Error({ message: foreign })
   if (!ACTIVE_STATES.includes(ticket.state)) {
     const hint =
-      ticket.state === "blocked"
+      ticket.state === "blocked" || isTerminalState(ticket.state)
         ? 'reopen it with ticket_update({ status: "in_progress" })'
         : "create a new ticket with ticket_create"
     return yield* new Tool.Error({
@@ -1286,22 +1322,19 @@ export const requireDispatchTicket = Effect.fn("superagent.requireDispatchTicket
       message: `ticket ${ticket.id} belongs to thread ${ticket.threadID}, not ${threadID}; dispatch with threadID=${ticket.threadID} or ticket_create a ticket for ${threadID}`,
     })
   }
-  // One ticket never runs two workers at once: the previous worker must be
-  // terminal (done, failed, aborted) before anything is dispatched again.
-  // `idle` is NOT terminal — the session may still be resumed — so it blocks
-  // a re-dispatch exactly like `running`, unless the ticket was parked after
-  // that worker went idle (an interruption released it). A worker record that
-  // is gone blocks nothing: there is no live worker left to wait for.
-  const workerID = ticket.workerSessionID
-  const worker = workerID === undefined ? undefined : workers.get(workerID)
-  if (workerID !== undefined && worker !== undefined && !isWorkerTerminal(worker.state)) {
-    const released = worker.state === "idle" && releasedSinceDispatch(ticket)
-    if (!released) {
-      const article = worker.state === "idle" ? "an" : "a"
-      return yield* new Tool.Error({
-        message: `ticket ${ticket.id} already has ${article} ${worker.state} worker ${workerID}; wait for it to finish, abort_session it, or ticket_create a new ticket for the re-dispatch`,
-      })
-    }
+  // One ticket never runs two workers at once. Check every session ever bound
+  // to it (reopen keeps the old ones in the list): a live `running`/`idle`
+  // worker gates a new dispatch. `idle` is NOT terminal — the session may still
+  // be resumed — unless the ticket was parked after it went idle (an
+  // interruption released it). A worker record that is gone blocks nothing.
+  for (const workerID of ticketWorkerIDs(ticket)) {
+    const worker = workers.get(workerID)
+    if (worker === undefined || isWorkerTerminal(worker.state)) continue
+    if (worker.state === "idle" && releasedSinceDispatch(ticket)) continue
+    const article = worker.state === "idle" ? "an" : "a"
+    return yield* new Tool.Error({
+      message: `ticket ${ticket.id} already has ${article} ${worker.state} worker ${workerID}; wait for it to finish, abort_session it, or resume it with worker_prompt`,
+    })
   }
   return ticket
 })
@@ -1341,6 +1374,7 @@ export const linkTicketToWorker = Effect.fn("superagent.linkTicketToWorker")(fun
   }
   const now = input.now ?? Date.now()
   ticket.workerSessionID = input.sessionID
+  if (!ticket.workerSessionIDs.includes(input.sessionID)) ticket.workerSessionIDs.push(input.sessionID)
   ticket.attempts.push({
     at: now,
     sessionID: input.sessionID,
@@ -1370,9 +1404,9 @@ export interface CloseForWorkerInput {
 }
 
 /**
- * Close the in-progress ticket attached to a worker that just ended. Tickets
- * in any other state are left alone: a closed ticket never reopens and an
- * aborted worker is handled by its own path.
+ * Close the in-progress ticket attached to a worker that just ended. This also
+ * covers a reopened ticket that a resumed worker just finished. Tickets in any
+ * other state are left alone; an aborted worker is handled by its own path.
  */
 export const closeTicketsForWorker = Effect.fn("superagent.closeTicketsForWorker")(function* (
   ctx: Plugin.Context,
@@ -1621,6 +1655,8 @@ export function renderTicketDetail(ticket: Ticket, width = DETAIL_WIDTH): string
   lines.push(...wrapLabel("thread：", ticket.threadID, width))
   lines.push(...wrapLabel("目录：", ticket.directory ?? "-", width))
   lines.push(...wrapLabel("worker：", ticket.workerSessionID ?? "-", width))
+  const workerIDs = ticketWorkerIDs(ticket)
+  if (workerIDs.length > 1) lines.push(...wrapLabel("workers：", workerIDs.join(", "), width))
   const effort = dispatchEffort(ticket)
   if (effort !== undefined) lines.push(...wrapLabel("档位：", effort, width))
   lines.push(...wrapLabel("尝试：", `${ticket.attempts.length}`, width))

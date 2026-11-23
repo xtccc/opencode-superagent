@@ -352,6 +352,7 @@ describe("legacy KV hydrates into the default partition", () => {
     requester: { source: "telegram", threadID: THREAD },
     authorization: { triggerID: "unknown", quote: "", at: 1_000 },
     threadID: THREAD,
+    workerSessionIDs: [],
     attempts: [],
     priority: "p1" as const,
     directory: DIR_B,

@@ -109,8 +109,8 @@ beforeEach(() => {
   store.pending.length = 0
 })
 
-describe("worker_prompt refuses closed work orders", () => {
-  test("done, failed and cancelled tickets are rejected without prompt or interrupt", async () => {
+describe("worker_prompt allows closed work orders with a reopen reminder", () => {
+  test("done, failed and cancelled tickets are promptable and remind to reopen", async () => {
     for (const outcome of ["done", "failed", "cancelled"] as const) {
       resetTickets()
       store.workers.clear()
@@ -119,24 +119,27 @@ describe("worker_prompt refuses closed work orders", () => {
       const ticket = await boundTicket(h.ctx, WORKER)
       await succeed(closeTicket(h.ctx, { ticketID: ticket.id, outcome, summary: "closed for test" }))
 
-      const message = await failure(
+      const result = await succeed(
         runWorkerPrompt(h.ctx, { sessionID: WORKER, text: "continue", interrupt: true }, ROUTER),
       )
-      expect(message).toContain(`worker ${WORKER} ticket ${ticket.id} is closed (${outcome})`)
-      expect(message).toContain("start a new worker instead")
-      // The closed-ticket rule wins even when interrupt was requested.
-      expect(h.calls).toEqual([])
+      expect(result.output.delivered).toBe(true)
+      expect(result.output.ticketState).toBe(outcome)
+      expect(result.output.text).toContain(`ticket ${ticket.id} is closed (${outcome})`)
+      expect(result.output.text).toContain('reopen it with ticket_update({ status: "in_progress" })')
+      // The prompt lands even with interrupt requested; the reminder is advisory.
+      expect(h.calls).toHaveLength(2)
     }
   })
 
-  test("a superseded ticket is closed too", async () => {
+  test("a superseded ticket is promptable too", async () => {
     store.workers.set(WORKER, worker(WORKER, "running"))
     const h = memoryContext()
     const ticket = await boundTicket(h.ctx, WORKER)
     await succeed(updateTicket(h.ctx, { ticketID: ticket.id, state: "superseded" }))
-    const message = await failure(runWorkerPrompt(h.ctx, { sessionID: WORKER, text: "continue" }, ROUTER))
-    expect(message).toContain("is closed (superseded)")
-    expect(h.calls).toEqual([])
+    const result = await succeed(runWorkerPrompt(h.ctx, { sessionID: WORKER, text: "continue" }, ROUTER))
+    expect(result.output.delivered).toBe(true)
+    expect(result.output.text).toContain("is closed (superseded)")
+    expect(h.calls).toHaveLength(1)
   })
 
   test("a tracked worker without a ticket is refused fail-closed", async () => {
@@ -175,8 +178,8 @@ describe("worker_prompt refuses untrusted targets", () => {
     expect(h.calls).toEqual([])
   })
 
-  test("done, aborted and unknown worker states are refused", async () => {
-    for (const state of ["done", "aborted", "mystery"] as Array<WorkerState>) {
+  test("aborted and unknown worker states are refused", async () => {
+    for (const state of ["aborted", "mystery"] as Array<WorkerState>) {
       resetTickets()
       store.workers.clear()
       store.workers.set(WORKER, worker(WORKER, state))
@@ -184,9 +187,24 @@ describe("worker_prompt refuses untrusted targets", () => {
       await boundTicket(h.ctx, WORKER)
       const message = await failure(runWorkerPrompt(h.ctx, { sessionID: WORKER, text: "hi" }, ROUTER))
       expect(message).toContain(`worker ${WORKER} is ${state}`)
-      expect(message).toContain("only running/idle workers")
+      expect(message).toContain("only running/idle/done workers")
       expect(h.calls).toEqual([])
     }
+  })
+
+  test("a done worker is resumed so its context can be reused", async () => {
+    store.workers.set(WORKER, worker(WORKER, "done"))
+    const h = memoryContext()
+    const ticket = await boundTicket(h.ctx, WORKER)
+    await succeed(closeTicket(h.ctx, { ticketID: ticket.id, outcome: "done", summary: "finished" }))
+
+    const result = await succeed(runWorkerPrompt(h.ctx, { sessionID: WORKER, text: "one more thing" }, ROUTER))
+    expect(result.output.delivered).toBe(true)
+    expect(result.output.state).toBe("done")
+    expect(result.output.text).toContain("reopen it with ticket_update")
+    expect(h.calls).toEqual([
+      { kind: "prompt", sessionID: WORKER, text: `${FOLLOW_UP_PREFIX} one more thing`, delivery: "queue" },
+    ])
   })
 
   test("empty text is refused", async () => {

@@ -39,6 +39,7 @@ import {
   type Ticket,
 } from "./ticket.js"
 import { specFor } from "./tools.js"
+import { compactUsage } from "./usage.js"
 import { pluginVersion } from "./version.js"
 import { isWorkerTerminal, type WorkerRecord } from "./worker-state.js"
 
@@ -297,7 +298,8 @@ function liveWorkerLine(worker: WorkerRecord): string {
   const title = worker.title ?? "-"
   const threads = worker.threads.length === 0 ? "-" : worker.threads.join(",")
   const dir = worker.directory ?? "-"
-  return clip(`- ${id} ${title} [${threads}] ${worker.state} dir=${dir}`, STATUS_LINE_LIMIT)
+  const usage = compactUsage(worker.lastUsage)
+  return clip(`- ${id} ${title} [${threads}] ${worker.state} dir=${dir}${usage === undefined ? "" : ` ${usage}`}`, STATUS_LINE_LIMIT)
 }
 
 /**
@@ -309,7 +311,8 @@ function finishedWorkerLine(worker: WorkerRecord, limit: number): string {
   const id = worker.sessionID
   const title = clip(worker.title ?? "-", STATUS_TITLE_LIMIT)
   const report = clip((worker.lastReport ?? "-").replace(/\s+/g, " "), STATUS_REPORT_LIMIT)
-  return clip(`- ${id} ${worker.state} ${title} report=${report}`, limit)
+  const usage = compactUsage(worker.lastUsage)
+  return clip(`- ${id} ${worker.state} ${title}${usage === undefined ? "" : ` ${usage}`} report=${report}`, limit)
 }
 
 /** Slice by code point, so a tightened budget never splits an emoji or surrogate pair. */

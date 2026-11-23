@@ -2,6 +2,7 @@ import { canonicalDirectory, dirKeyFor, directoryOfDirKey } from "./dirs.js"
 import { partitioningEnabled } from "./settings.js"
 import { dirKeyForWorker, routerPartitions, store, totalPending } from "./state.js"
 import { pluginVersion } from "./version.js"
+import { compactUsage } from "./usage.js"
 import type { WorkerRecord, WorkerState } from "./worker-state.js"
 
 /**
@@ -27,6 +28,8 @@ export interface StatusWorkerView {
   readonly title?: string
   readonly threads: ReadonlyArray<string>
   readonly state: WorkerState
+  /** Machine-read context usage of the session, when the host reported one. */
+  readonly usage?: string
 }
 
 /** One row of the aggregate partition summary (counts only, never worker ids). */
@@ -55,11 +58,13 @@ export interface StatusSnapshot {
 }
 
 function workerView(worker: WorkerRecord): StatusWorkerView {
+  const usage = compactUsage(worker.lastUsage)
   return {
     sessionID: worker.sessionID,
     ...(worker.title === undefined ? {} : { title: worker.title }),
     threads: [...worker.threads],
     state: worker.state,
+    ...(usage === undefined ? {} : { usage }),
   }
 }
 

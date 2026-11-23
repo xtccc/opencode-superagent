@@ -1,7 +1,10 @@
+import type { UsageSnapshot } from "./usage.js"
+
 /**
  * Worker records and the in-memory worker registry they live in.
  *
- * This module is intentionally dependency-free: `state.ts` owns KV persistence
+ * This module is intentionally runtime-dependency-free (the one import above is
+ * a type-only import): `state.ts` owns KV persistence
  * and the rest of the store, while the ticket layer only needs to look up a
  * worker's state when it gates a dispatch. Keeping the record type and the
  * registry map here lets `ticket.ts` avoid importing `state.ts`, which is what
@@ -31,6 +34,12 @@ export interface WorkerRecord {
   /** Last persisted write. Refreshed by `saveWorker`, so an aborted record keeps a traceable timestamp. */
   updatedAt?: number
   lastReport?: string
+  /**
+   * Machine-captured context/token usage of this session (never self-reported by
+   * the worker). Refreshed from `session.usage.updated` while running and from
+   * `session.get()` when the worker ends or is rehydrated.
+   */
+  lastUsage?: UsageSnapshot
   /**
    * Working directory this worker's session was created in. It is **not** the
    * partition: one Router may dispatch into any directory.

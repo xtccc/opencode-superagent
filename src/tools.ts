@@ -90,7 +90,8 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       "effort 影响 Worker 推理档位：只能取该模型 variants 里的档位，否则报错并列出可用档位；缺省继承 Router 当前档位，且不能与 agent 覆盖同用。",
       "每次派发都要带 directory（绝对路径）；Router 会复用 thread 绑定与目录别名。",
       "同一 thread 的后续消息直投该 Worker，不要重复 dispatch。",
-      "派发成功即绑定工单：workerSessionID 写入、attempts+1、state → in_progress；Worker 结束自动结单。",
+      "派发成功即绑定工单：更新 workerSessionID 并追加到 worker 列表。",
+      "同时 attempts+1、state → in_progress；Worker 结束自动结单。",
     ],
   },
   {
@@ -165,7 +166,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     name: "ticket_update",
     group: "control",
     description:
-      "Move a ticket along its state machine (open → in_progress → blocked/done/failed/cancelled/superseded) and optionally append a note. Illegal transitions are rejected. Only the router may call it.",
+      "Move a ticket along its state machine (open → in_progress → blocked/done/failed/cancelled/superseded, and any closed state → in_progress to reopen) and optionally append a note. Illegal transitions are rejected. Only the router may call it.",
     summary: "推进工单状态或追加备注，非法迁移直接报错。",
     params: [
       { name: "ticketID", required: true, type: "string", note: "工单 ID" },
@@ -180,8 +181,11 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     ],
     risk: "write",
     permission: "status",
-    confirmation: "自动执行：状态迁移按状态机校验。",
-    usage: ["结束任务优先用 ticket_close（带 outcome 与 summary），不要手动跳到 done。"],
+    confirmation: "自动执行：状态按状态机校验；closed → in_progress 即重开，清除原关闭时间与结论。",
+    usage: [
+      "结束任务优先用 ticket_close（带 outcome 与 summary），不要手动跳到 done。",
+      "要在同一张单上继续时，先用 status=in_progress 重开，再 worker_prompt 原 Worker 或重新 dispatch。",
+    ],
   },
   {
     name: "ticket_close",
@@ -196,7 +200,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     ],
     risk: "write",
     permission: "status",
-    confirmation: "自动执行：已结单的工单保持原状态，改结论需新建工单。",
+    confirmation: "自动执行：结单后可用 ticket_update 重开同一张单，不必新建。",
     usage: ["Worker 结束会自动结单；只有在 Router 主动放弃/改判时才手动调用。"],
   },
   {
@@ -215,6 +219,7 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
       "默认只列活跃（非终态）Worker 且不带 lastReport，输出不超过 2000 字符，避免撑爆 Router 历史。",
       "要回看已结束 Worker 才传 includeFinished=true：最多 20 条、报告截断到 120 字符。",
       "system 状态行只给计数，细节用 status / thread_detail。",
+      "worker 行可能带 ctx=<token 数>（机械读取的上下文占用）；要看完整分解用 worker_detail。",
     ],
   },
   {
@@ -247,7 +252,11 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     risk: "read",
     permission: "status",
     confirmation: "只读，自动执行（permission: status）。",
-    usage: ["用于验收 Worker 的中间结论，不必等它结束。", "单条消息默认截断 1500 字；要看完整报告用 report_read。"],
+    usage: [
+      "用于验收 Worker 的中间结论，不必等它结束。",
+      "context usage 一行是宿主的 token 计数（机械读取，不是 Worker 自报），运行中也能看到。",
+      "单条消息默认截断 1500 字；要看完整报告用 report_read。",
+    ],
   },
   {
     name: "report_read",
@@ -272,8 +281,8 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     name: "worker_prompt",
     group: "control",
     description:
-      "Append a follow-up prompt to an existing tracked worker session, delivered with queue (default) or steer; interrupt=true first steers the text and then interrupts the worker with resume. Refuses untracked sessions, the router itself, workers whose ticket is closed (done/failed/cancelled/superseded) or missing, and workers not in running/idle state. Only the router may call it.",
-    summary: "给已有 Worker 追加提示词（queue/steer），可先入队再中断并恢复；结单的 Worker 一律拒绝。",
+      "Append a follow-up prompt to an existing tracked worker session, delivered with queue (default) or steer; interrupt=true first steers the text and then interrupts the worker with resume. Resumes running/idle/done workers (a done session starts a new execution), so accumulated context is kept. A closed ticket is allowed but the reply reminds you to reopen it with ticket_update(status=in_progress); untracked sessions, the router itself, workers without a ticket, and failed/aborted workers are refused. Only the router may call it.",
+    summary: "给已有 Worker 追加提示词（queue/steer），可恢复 done 会话复用上下文；结单单允许但会提示先重开。",
     params: [
       { name: "sessionID", required: true, type: "string", note: "必须是已跟踪的 Worker" },
       { name: "text", required: true, type: "string", note: "追加的提示词，非空" },
@@ -282,11 +291,12 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     ],
     risk: "write",
     permission: "status",
-    confirmation: "仅投递提示词；结单或无工单直接拒绝，不唤醒。",
+    confirmation: "仅投递提示词；无工单或 failed/aborted 的 Worker 拒绝，done 会话会被恢复执行。",
     usage: [
-      "只对 store.workers 中 running/idle 的 Worker 生效；Router 自身、未知 session、failed/aborted/done 记录一律拒绝。",
-      "工单为 done/failed/cancelled（以及 superseded）时拒绝：worker <id> ticket <id> is closed (<state>); start a new worker instead。",
-      "没有关联工单同样拒绝（fail-closed），避免唤醒无工单的 Worker。",
+      "running/idle/done 的 Worker 可 prompt；Router 自身、未知 session、failed/aborted 拒绝。",
+      "工单已关闭时不再拒绝：照常投递，并在回复里提醒用 ticket_update(status=in_progress) 重开该单。",
+      "没有关联工单仍然拒绝（fail-closed），避免唤醒无工单的 Worker。",
+      "同一 Worker 可被多次 prompt，且一张工单会保留所有关联过的 Worker（workerSessionIDs 列表）。",
       "queue=排队到当前执行之后；steer=下一个 step 边界插入；interrupt=true 先以 steer 入队，再 interrupt({ resume: true })。",
       "文本自动加 [router:follow-up] 来源标记。",
     ],

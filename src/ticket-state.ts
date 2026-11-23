@@ -50,7 +50,18 @@ export interface Ticket {
   readonly requester: TicketRequester
   readonly authorization: TicketAuthorization
   readonly threadID: string
+  /**
+   * Most recently dispatched worker session. Kept as the single-field view for
+   * backward compatibility (older KV records, the TUI detail pane and the
+   * list trailer all use it); the full history lives in `workerSessionIDs`.
+   */
   workerSessionID?: string
+  /**
+   * Every worker session ever bound to this ticket, oldest first. A reopened
+   * ticket can be dispatched again (or resumed via `worker_prompt`), so the
+   * association is one-to-many rather than a single overwritten pointer.
+   */
+  readonly workerSessionIDs: Array<string>
   readonly attempts: Array<TicketAttempt>
   readonly priority: TicketPriority
   /**
@@ -89,20 +100,27 @@ export const TICKET_STATES: ReadonlyArray<TicketState> = [
 /** A ticket can be dispatched while it is one of these. */
 export const ACTIVE_STATES: ReadonlyArray<TicketState> = ["open", "in_progress"]
 
+/** Closed outcomes. Kept separate from the transition table so a closed ticket can be reopened. */
+export const CLOSED_STATES: ReadonlyArray<TicketState> = ["done", "failed", "cancelled", "superseded"]
+
 const TRANSITIONS: Record<TicketState, ReadonlyArray<TicketState>> = {
   // A ticket can close from any active state: `done`/`failed` also cover work
   // finished outside the worker (or a dispatch that never started).
   open: ["in_progress", "blocked", "done", "failed", "cancelled", "superseded"],
   in_progress: ["blocked", "done", "failed", "cancelled", "superseded"],
   blocked: ["in_progress", "done", "failed", "cancelled", "superseded"],
-  done: [],
-  failed: [],
-  cancelled: [],
-  superseded: [],
+  // Reopen: a closed work order can go back to in_progress (never straight to
+  // open/blocked). This lets the Router continue on the same ticket — and via
+  // `worker_prompt` on the same worker session — without losing accumulated
+  // context or creating a duplicate work order.
+  done: ["in_progress"],
+  failed: ["in_progress"],
+  cancelled: ["in_progress"],
+  superseded: ["in_progress"],
 }
 
 export function isTerminalState(state: TicketState): boolean {
-  return TRANSITIONS[state].length === 0
+  return CLOSED_STATES.includes(state)
 }
 
 export function allowedTransitions(state: TicketState): ReadonlyArray<TicketState> {
@@ -117,13 +135,35 @@ export function canTransition(from: TicketState, to: TicketState): boolean {
 /** Human-readable reason a move is illegal, or `undefined` when it is allowed. */
 export function transitionError(from: TicketState, to: TicketState): string | undefined {
   if (canTransition(from, to)) return undefined
-  if (isTerminalState(from)) return `ticket is already closed (${from}); cannot move to ${to}`
+  if (isTerminalState(from)) {
+    return `ticket is closed (${from}); cannot move to ${to} — reopen it with status=in_progress first`
+  }
   return `illegal transition ${from} -> ${to}; allowed: ${TRANSITIONS[from].join(", ")}`
+}
+
+/**
+ * All worker sessions bound to a ticket, oldest first.
+ *
+ * Reads the new list when present, then folds in the legacy single field so a
+ * record written before the list existed (or a `ticket_update({ workerSessionID })`)
+ * still resolves. Duplicates are removed without reordering.
+ */
+export function ticketWorkerIDs(ticket: {
+  readonly workerSessionID?: string
+  readonly workerSessionIDs?: ReadonlyArray<string>
+}): ReadonlyArray<string> {
+  const out: Array<string> = []
+  const candidates = [...(ticket.workerSessionIDs ?? []), ...(ticket.workerSessionID ? [ticket.workerSessionID] : [])]
+  for (const id of candidates) {
+    if (id !== "" && !out.includes(id)) out.push(id)
+  }
+  return out
 }
 
 /** Minimal shape a worker-bound ticket needs, so the selector stays pure and generic. */
 export interface WorkerBoundTicket {
   readonly workerSessionID?: string
+  readonly workerSessionIDs?: ReadonlyArray<string>
   readonly state: TicketState
 }
 
@@ -137,7 +177,7 @@ export function findActiveTicketForWorker<T extends WorkerBoundTicket>(
   sessionID: string,
 ): T | undefined {
   for (const ticket of candidates) {
-    if (ticket.workerSessionID === sessionID && ticket.state === "in_progress") return ticket
+    if (ticket.state === "in_progress" && ticketWorkerIDs(ticket).includes(sessionID)) return ticket
   }
   return undefined
 }

@@ -7,7 +7,9 @@ import {
   closeTicket,
   closeTicketsForWorker,
   createTicket,
+  decodeTicket,
   dedupeKeyFor,
+  encodeTicket,
   findDuplicate,
   getTicket,
   hydrateTickets,
@@ -17,6 +19,8 @@ import {
   renderTicketDetail,
   renderTicketList,
   resetTickets,
+  ticketForWorker,
+  ticketWorkerIDs,
   tickets,
   transitionError,
   updateTicket,
@@ -81,10 +85,10 @@ describe("ticket state machine", () => {
       open: ["in_progress", "blocked", "done", "failed", "cancelled", "superseded"],
       in_progress: ["blocked", "done", "failed", "cancelled", "superseded"],
       blocked: ["in_progress", "done", "failed", "cancelled", "superseded"],
-      done: [],
-      failed: [],
-      cancelled: [],
-      superseded: [],
+      done: ["in_progress"],
+      failed: ["in_progress"],
+      cancelled: ["in_progress"],
+      superseded: ["in_progress"],
     }
     const states = Object.keys(allowed) as Array<TicketState>
     for (const from of states) {
@@ -99,9 +103,10 @@ describe("ticket state machine", () => {
     expect(isTerminalState("blocked")).toBe(false)
   })
 
-  test("a terminal ticket names its own closure in the error", () => {
-    expect(transitionError("done", "in_progress")).toContain("already closed")
-    expect(transitionError("done", "in_progress")).toContain("already closed")
+  test("a closed ticket can be reopened but still names its closure for other moves", () => {
+    expect(transitionError("done", "in_progress")).toBeUndefined()
+    expect(transitionError("done", "open")).toContain("closed")
+    expect(transitionError("done", "open")).toContain("reopen")
   })
 })
 
@@ -175,7 +180,7 @@ describe("ticket creation", () => {
 // ── transitions through the store ────────────────────────────────────────────
 
 describe("ticket transitions", () => {
-  test("a closed ticket is terminal; close records the outcome", async () => {
+  test("closing records the outcome, and reopening clears the close stamp", async () => {
     const ctx = fresh()
     const created = await succeed(createTicket(ctx, base))
     const closed = await succeed(
@@ -186,16 +191,23 @@ describe("ticket transitions", () => {
     expect(typeof closed.closedAt).toBe("number")
     expect(closed.history.at(-1)?.kind).toBe("closed")
     expect(getTicket(created.ticket.id)?.state).toBe("done")
-    expect(await failure(updateTicket(ctx, { ticketID: created.ticket.id, state: "in_progress" }))).toContain(
-      "already closed",
-    )
+
+    const reopened = await succeed(updateTicket(ctx, { ticketID: created.ticket.id, state: "in_progress" }))
+    expect(reopened.state).toBe("in_progress")
+    expect(reopened.closedAt).toBeUndefined()
+    expect(reopened.closeReason).toBeUndefined()
+    expect(reopened.history.at(-1)?.to).toBe("in_progress")
+    expect(reopened.history.at(-1)?.note).toBe("reopened")
+    expect(getTicket(created.ticket.id)?.state).toBe("in_progress")
   })
 
   test("a terminal ticket rejects any further move", async () => {
     const ctx = fresh()
     const created = await succeed(createTicket(ctx, base))
     await succeed(updateTicket(ctx, { ticketID: created.ticket.id, state: "superseded", note: "改单了" }))
-    expect(await failure(updateTicket(ctx, { ticketID: created.ticket.id, state: "open" }))).toContain("already closed")
+    const message = await failure(updateTicket(ctx, { ticketID: created.ticket.id, state: "open" }))
+    expect(message).toContain("closed")
+    expect(message).toContain("reopen")
   })
 
   test("re-closing is idempotent for the same outcome and a conflict otherwise", async () => {
@@ -224,6 +236,33 @@ describe("ticket transitions", () => {
     expect(
       await failure(linkTicketToWorker(ctx, { ticketID: created.ticket.id, sessionID: "ses_worker_2" })),
     ).toContain("only open/in_progress")
+  })
+
+  test("a ticket accumulates every worker session and round-trips through KV", async () => {
+    const ctx = fresh()
+    const created = await succeed(createTicket(ctx, base))
+    await succeed(linkTicketToWorker(ctx, { ticketID: created.ticket.id, sessionID: "ses_a" }))
+    await succeed(closeTicket(ctx, { ticketID: created.ticket.id, outcome: "done", summary: "ok" }))
+    await succeed(updateTicket(ctx, { ticketID: created.ticket.id, state: "in_progress" }))
+    await succeed(linkTicketToWorker(ctx, { ticketID: created.ticket.id, sessionID: "ses_b" }))
+    // Re-linking the same session (e.g. a resumed worker) must not duplicate it.
+    await succeed(linkTicketToWorker(ctx, { ticketID: created.ticket.id, sessionID: "ses_b" }))
+
+    const ticket = getTicket(created.ticket.id)!
+    expect(ticket.workerSessionIDs).toEqual(["ses_a", "ses_b"])
+    expect(ticket.workerSessionID).toBe("ses_b")
+    expect(ticketWorkerIDs(ticket)).toEqual(["ses_a", "ses_b"])
+    expect(ticketForWorker("ses_a")?.id).toBe(ticket.id)
+    expect(ticketForWorker("ses_b")?.id).toBe(ticket.id)
+
+    const decoded = decodeTicket(encodeTicket(ticket))!
+    expect(decoded.workerSessionIDs).toEqual(["ses_a", "ses_b"])
+    expect(decoded.workerSessionID).toBe("ses_b")
+
+    // A record written before the list existed upgrades from the single field.
+    const legacy = { ...(encodeTicket(ticket) as Record<string, unknown>) }
+    delete legacy.workerSessionIDs
+    expect(decodeTicket(legacy as unknown as Schema.Json)?.workerSessionIDs).toEqual(["ses_b"])
   })
 
   test("a worker ending closes only its in-progress ticket", async () => {

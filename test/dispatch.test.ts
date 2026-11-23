@@ -4,7 +4,7 @@ import { Effect, Exit, type Schema } from "effect"
 import { DispatchInput, runDispatch } from "../src/dispatch.js"
 import { Definition } from "../src/protocol.js"
 import { store } from "../src/state.js"
-import { closeTicket, createTicket, getTicket, linkTicketToWorker, resetTickets } from "../src/ticket.js"
+import { closeTicket, createTicket, getTicket, linkTicketToWorker, resetTickets, updateTicket } from "../src/ticket.js"
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
 
@@ -104,7 +104,18 @@ describe("dispatch requires a work ticket", () => {
     await succeed(closeTicket(ctx, { ticketID: created.ticket.id, outcome: "done", summary: "merged" }))
     const message = await failure(runDispatch(ctx, { task: "修日志", ticketID: created.ticket.id }, ROUTER))
     expect(message).toContain("only open/in_progress")
-    expect(message).toContain("ticket_create")
+    expect(message).toContain("ticket_update")
+    expect(message).toContain("in_progress")
+  })
+
+  test("a reopened ticket accepts a new dispatch", async () => {
+    const ctx = dispatchContext()
+    const created = await succeed(createTicket(ctx, base))
+    await succeed(closeTicket(ctx, { ticketID: created.ticket.id, outcome: "done", summary: "merged" }))
+    const reopened = await succeed(updateTicket(ctx, { ticketID: created.ticket.id, state: "in_progress" }))
+    expect(reopened.state).toBe("in_progress")
+    expect(reopened.closedAt).toBeUndefined()
+    expect(reopened.closeReason).toBeUndefined()
   })
 
   test("a ticket from another thread is refused", async () => {

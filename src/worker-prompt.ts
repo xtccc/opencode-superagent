@@ -11,13 +11,14 @@ import { specFor, toolPermission } from "./tools.js"
 import type { WorkerState } from "./worker-state.js"
 
 /**
- * Router-only follow-up prompt for an already running/idle worker.
+ * Router-only follow-up prompt for an existing worker session.
  *
- * This is deliberately not `dispatch`: it never creates a session and never
- * resumes one whose work order is closed. A worker exists to finish one
- * ticket; once that ticket is done/failed/cancelled (or any other terminal
- * state) waking the session would produce work with no work order behind it.
- * The guard is fail-closed: a tracked worker with no ticket is refused too.
+ * This is deliberately not `dispatch`: it never creates a session. A `done`
+ * worker can be resumed just like `running`/`idle` (the same resume path the
+ * thread-affinity router uses), so its accumulated context is not thrown away
+ * when a follow-up arrives. A closed ticket is no longer a hard refusal — the
+ * reply carries a reminder to reopen it — but a worker with *no* ticket is
+ * still refused: every follow-up must have a work order behind it.
  */
 
 export const WorkerPromptInput = Schema.Struct({
@@ -45,8 +46,14 @@ interface WorkerPromptInput {
 
 export type WorkerPromptMode = "queue" | "steer" | "interrupt+steer"
 
-/** Worker states that may accept a follow-up; terminal records are history. */
-const PROMPTABLE_STATES: ReadonlyArray<WorkerState> = ["running", "idle"]
+/**
+ * Worker states that may accept a follow-up. `done` is promptable on purpose:
+ * prompting a finished session starts a new execution in it, which is exactly
+ * how the thread-affinity router reuses a completed worker's context.
+ * `failed`/`aborted` stay refused so a broken or user-cancelled session is not
+ * silently revived (use a fresh dispatch instead).
+ */
+const PROMPTABLE_STATES: ReadonlyArray<WorkerState> = ["running", "idle", "done"]
 
 /** Message source marker so the worker side (and recall) can tell router follow-ups apart. */
 export const FOLLOW_UP_PREFIX = "[router:follow-up]"
@@ -108,23 +115,22 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
     })
   }
 
-  // Closed tickets win over every other rule: the explicit requirement is that
-  // a worker whose work order ended is never woken, regardless of the record's
-  // own state or the requested delivery mode. No prompt and no interrupt run.
+  // A ticket is required (fail-closed), but a closed one no longer blocks the
+  // prompt: continuing an existing worker is precisely how we avoid losing its
+  // context. The reply reminds the Router to reopen the work order.
   const ticket = ticketForWorker(sessionID)
   if (ticket === undefined) {
     return yield* new Tool.Error({
       message: `worker ${sessionID} has no ticket; refusing to prompt a worker without a work order — start a new worker instead`,
     })
   }
-  if (isTerminalState(ticket.state)) {
-    return yield* new Tool.Error({
-      message: `worker ${sessionID} ticket ${ticket.id} is closed (${ticket.state}); start a new worker instead`,
-    })
-  }
+  const ticketClosed = isTerminalState(ticket.state)
+  const closedNote = ticketClosed
+    ? `; ticket ${ticket.id} is closed (${ticket.state}) — reopen it with ticket_update({ status: "in_progress" }) to keep a live work order`
+    : ""
   if (!PROMPTABLE_STATES.includes(worker.state)) {
     return yield* new Tool.Error({
-      message: `worker ${sessionID} is ${worker.state}; only running/idle workers can receive a follow-up prompt`,
+      message: `worker ${sessionID} is ${worker.state}; only running/idle/done workers can receive a follow-up prompt`,
     })
   }
 
@@ -148,7 +154,7 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
       state: worker.state,
       ticketState: ticket.state,
       mode,
-      text: `failed to deliver ${mode} prompt to worker ${sessionID}: ${promptFailure}`,
+      text: `failed to deliver ${mode} prompt to worker ${sessionID}: ${promptFailure}${closedNote}`,
     })
   }
 
@@ -159,7 +165,7 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
       state: worker.state,
       ticketState: ticket.state,
       mode,
-      text: `delivered ${mode} prompt to worker ${sessionID} (state=${worker.state}, ticket=${ticket.id} ${ticket.state})`,
+      text: `delivered ${mode} prompt to worker ${sessionID} (state=${worker.state}, ticket=${ticket.id} ${ticket.state})${closedNote}`,
     })
   }
 
@@ -174,7 +180,7 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
       state: worker.state,
       ticketState: ticket.state,
       mode,
-      text: `steer prompt delivered to worker ${sessionID} but interrupt failed: ${interruptFailure}`,
+      text: `steer prompt delivered to worker ${sessionID} but interrupt failed: ${interruptFailure}${closedNote}`,
     })
   }
   return ok({
@@ -183,7 +189,7 @@ export const runWorkerPrompt = Effect.fn("superagent.workerPrompt")(function* (
     state: worker.state,
     ticketState: ticket.state,
     mode,
-    text: `delivered steer prompt to worker ${sessionID} and interrupted it (state=${worker.state}, ticket=${ticket.id} ${ticket.state})`,
+    text: `delivered steer prompt to worker ${sessionID} and interrupted it (state=${worker.state}, ticket=${ticket.id} ${ticket.state})${closedNote}`,
   })
 })
 

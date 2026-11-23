@@ -19,6 +19,7 @@ import { partitioningEnabled, routerDirectorySetting } from "./settings.js"
 import { sharedSingleton } from "./shared.js"
 import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
+import { decodeUsage, encodeUsage, pickUsage } from "./usage.js"
 import {
   hydrateSuperseded,
   persistSuperseded,
@@ -719,6 +720,7 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
   const triggerID = optionalString(value, "triggerID")
   const execution = optionalNumber(value, "execution")
   const notified = stateArray(value["notified"])
+  const lastUsage = decodeUsage(value["lastUsage"])
   return {
     sessionID: value["sessionID"],
     title: optionalString(value, "title"),
@@ -731,6 +733,7 @@ export function decodeWorker(value: Schema.Json | undefined): WorkerRecord | und
     createdAt,
     updatedAt: optionalNumber(value, "updatedAt") ?? createdAt,
     lastReport: optionalString(value, "lastReport"),
+    ...(lastUsage === undefined ? {} : { lastUsage }),
     ...(optionalString(value, "directory") === undefined ? {} : { directory: optionalString(value, "directory") }),
     ...(optionalString(value, "ownerDirKey") === undefined ? {} : { ownerDirKey: optionalString(value, "ownerDirKey") }),
     ...(execution === undefined ? {} : { execution }),
@@ -785,6 +788,7 @@ export function encodeWorker(record: WorkerRecord): Schema.Json {
     createdAt: record.createdAt,
     ...(record.updatedAt === undefined ? {} : { updatedAt: record.updatedAt }),
     ...(record.lastReport === undefined ? {} : { lastReport: record.lastReport }),
+    ...(record.lastUsage === undefined ? {} : { lastUsage: encodeUsage(record.lastUsage) }),
     ...(record.directory === undefined ? {} : { directory: record.directory }),
     ...(record.ownerDirKey === undefined ? {} : { ownerDirKey: record.ownerDirKey }),
     ...(record.execution === undefined ? {} : { execution: record.execution }),
@@ -874,6 +878,10 @@ const reconcileRunningWorker = Effect.fn("superagent.reconcileRunningWorker")(fu
     yield* saveReport(ctx, captured)
     record.lastReport = reportSummary(captured)
   }
+  // Same mechanical capture as the live watcher: session counters first, the
+  // last assistant step as fallback. Never depends on what the worker wrote.
+  const usage = pickUsage(info, messages)
+  if (usage !== undefined) record.lastUsage = usage
   yield* saveWorker(ctx, record)
   const outcome = closeOutcomeForWorkerState(state)
   if (outcome !== undefined) {

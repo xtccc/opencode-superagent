@@ -7,6 +7,7 @@ import {
   findActiveTicketForWorker,
   isTerminalState,
   TICKET_STATES,
+  ticketWorkerIDs,
   transitionError,
   workerCloseSummary,
   type TicketState,
@@ -25,10 +26,10 @@ describe("ticket-state: terminal states and transitions", () => {
     open: ["in_progress", "blocked", "done", "failed", "cancelled", "superseded"],
     in_progress: ["blocked", "done", "failed", "cancelled", "superseded"],
     blocked: ["in_progress", "done", "failed", "cancelled", "superseded"],
-    done: [],
-    failed: [],
-    cancelled: [],
-    superseded: [],
+    done: ["in_progress"],
+    failed: ["in_progress"],
+    cancelled: ["in_progress"],
+    superseded: ["in_progress"],
   }
 
   test("only closed states are terminal", () => {
@@ -51,9 +52,15 @@ describe("ticket-state: terminal states and transitions", () => {
     }
   })
 
-  test("transitionError explains a closed ticket and lists legal moves otherwise", () => {
-    expect(transitionError("done", "in_progress")).toContain("already closed")
-    expect(transitionError("done", "in_progress")).toContain("done")
+  test("transitionError offers reopen from a closed ticket and lists legal moves otherwise", () => {
+    // Reopening is a legal move out of every closed state.
+    for (const from of ["done", "failed", "cancelled", "superseded"] as const) {
+      expect(transitionError(from, "in_progress")).toBeUndefined()
+    }
+    // ...but not straight back to open/blocked or to a different outcome.
+    const closed = transitionError("done", "open")
+    expect(closed).toContain("closed")
+    expect(closed).toContain("reopen")
     expect(transitionError("open", "in_progress")).toBeUndefined()
     expect(transitionError("open", "done")).toBeUndefined()
     expect(transitionError("open", "open")).toBeUndefined()
@@ -103,10 +110,32 @@ describe("ticket-state: worker close helpers", () => {
   })
 })
 
+// ── worker list on a ticket ───────────────────────────────────────────────────
+
+describe("ticket-state: ticketWorkerIDs", () => {
+  test("keeps every bound worker in order and de-duplicates", () => {
+    expect(ticketWorkerIDs({ workerSessionIDs: ["ses_a", "ses_b", "ses_a"] })).toEqual(["ses_a", "ses_b"])
+  })
+
+  test("folds in the legacy single field without reordering", () => {
+    expect(ticketWorkerIDs({ workerSessionIDs: ["ses_a"], workerSessionID: "ses_b" })).toEqual(["ses_a", "ses_b"])
+    expect(ticketWorkerIDs({ workerSessionID: "ses_legacy" })).toEqual(["ses_legacy"])
+    expect(ticketWorkerIDs({ workerSessionIDs: [], workerSessionID: "ses_direct" })).toEqual(["ses_direct"])
+    expect(ticketWorkerIDs({})).toEqual([])
+  })
+})
+
 // ── active ticket selector ────────────────────────────────────────────────────
 
 describe("ticket-state: findActiveTicketForWorker", () => {
   const ticket = (workerSessionID: string | undefined, state: TicketState) => ({ workerSessionID, state })
+
+  test("matches any worker in the session list, not only the latest", () => {
+    const bound = { workerSessionIDs: ["ses_old", "ses_new"], state: "in_progress" as const }
+    expect(findActiveTicketForWorker([bound], "ses_old")).toBe(bound)
+    expect(findActiveTicketForWorker([bound], "ses_new")).toBe(bound)
+    expect(findActiveTicketForWorker([bound], "ses_other")).toBeUndefined()
+  })
 
   test("returns the in-progress ticket bound to the worker", () => {
     const candidates = [ticket("ses_a", "open"), ticket("ses_b", "in_progress")]

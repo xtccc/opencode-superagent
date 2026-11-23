@@ -18,6 +18,7 @@ import {
   type TriggerRecord,
 } from "./state.js"
 import { specFor, toolPermission } from "./tools.js"
+import { formatUsage, pickUsage } from "./usage.js"
 
 export const ThreadDetailInput = Schema.Struct({
   threadID: Schema.String,
@@ -224,6 +225,17 @@ export const runWorkerDetail = Effect.fn("superagent.workerDetail")(function* (
   const messages = yield* ctx.session
     .context({ sessionID: toSessionID(input.sessionID) })
     .pipe(Effect.catch(() => Effect.succeed([])))
+  // Live, machine-read usage: `session.get()` counters first, the last assistant
+  // step as fallback, and the stored snapshot as a last resort. The worker is
+  // never asked to report its own consumption.
+  const sessionInfo =
+    typeof ctx.session.get === "function"
+      ? yield* ctx.session
+          .get({ sessionID: toSessionID(input.sessionID) })
+          .pipe(Effect.catch(() => Effect.succeed(undefined)))
+      : undefined
+  const usage = pickUsage(sessionInfo, messages) ?? worker?.lastUsage
+  const usageLine = `context usage: ${usage === undefined ? "unavailable" : formatUsage(usage)}`
   const texts = assistantTexts(messages, count)
   const handle =
     stored === undefined
@@ -231,10 +243,11 @@ export const runWorkerDetail = Effect.fn("superagent.workerDetail")(function* (
       : `${stored.length} chars${stored.truncated ? ` (仅存前 ${stored.text.length})` : ""}，用 report_read 读取全文`
   const lines =
     worker === undefined
-      ? [`worker ${input.sessionID}: not tracked by the router`]
+      ? [`worker ${input.sessionID}: not tracked by the router`, usageLine]
       : [
           `worker ${worker.sessionID} ${worker.title ?? "-"} [${worker.threads.join(",") || "-"}] ${worker.state}`,
           `directory: ${worker.directory ?? "(gateway default)"}`,
+          usageLine,
           `report: ${worker.lastReport ?? "none"}`,
           `report full: ${handle}`,
         ]

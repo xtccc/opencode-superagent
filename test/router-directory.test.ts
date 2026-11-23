@@ -399,6 +399,7 @@ function legacyTicket(id: string, now: number) {
     requester: { source: "telegram", threadID: "telegram:legacy" },
     authorization: { triggerID: "unknown", quote: "", at: now },
     threadID: "telegram:legacy",
+    workerSessionIDs: [],
     attempts: [],
     priority: "p1" as const,
     directory: OTHER_DIR,

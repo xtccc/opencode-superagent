@@ -20,6 +20,7 @@ import {
 } from "./state.js"
 import { blockTicketsForWorker, closeTicketsForWorker } from "./ticket.js"
 import { closeOutcomeForWorkerState } from "./ticket-state.js"
+import { formatUsage, parseTokenUsage, pickUsage } from "./usage.js"
 
 /**
  * Degradation warnings that must not spam: the same directory-less worker
@@ -65,6 +66,10 @@ export const captureReport = Effect.fn("superagent.captureReport")(function* (
   worker.lastReport = reportSummary(record)
   return record
 })
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
 
 function errorDetail(data: unknown): string | undefined {
   if (typeof data !== "object" || data === null) return undefined
@@ -215,6 +220,13 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   const messages = yield* sessions
     .context({ sessionID: toSessionID(sessionID) })
     .pipe(Effect.catch(() => Effect.succeed([])))
+  // One `session.get` serves both the outcome and the machine-read usage. The
+  // worker never reports its own consumption: these are the host's counters.
+  const info = yield* sessions.get({ sessionID: toSessionID(sessionID) }).pipe(
+    Effect.catch(() => Effect.succeed(undefined)),
+  )
+  const usage = pickUsage(info, messages)
+  if (usage !== undefined) worker.lastUsage = usage
   const report = lastAssistantText(messages)
   // Full text first: `report:<sessionID>` is the read-back handle. The worker
   // record only keeps a summary, which is what list/status lines show.
@@ -254,11 +266,7 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
   // same thread resume this worker (prompting a finished session starts a new
   // execution in it) instead of spawning a fresh session per message. A
   // genuinely new task clears the affinity.
-  const info = yield* sessions.get({ sessionID: toSessionID(sessionID) }).pipe(
-    Effect.map((session) => session as { outcome?: unknown }),
-    Effect.catch(() => Effect.succeed(undefined)),
-  )
-  const rawOutcome = info?.outcome
+  const rawOutcome = isRecord(info) ? info["outcome"] : undefined
   const outcome =
     rawOutcome === "succeeded" || rawOutcome === "failed" || rawOutcome === "interrupted"
       ? rawOutcome
@@ -272,7 +280,10 @@ export const handleEnded = Effect.fn("superagent.workerEnded")(function* (
     report !== undefined && captured !== undefined
       ? [`${label} finished (${state}):`, reportSummary(captured), "---", reportNotice(captured)].join("\n")
       : `${label} finished (${state}) with no report (outcome: ${outcome}).${detail === undefined ? "" : ` Cause: ${detail}.`} Suggest: 可换模型重派.`
-  const text = state === "failed" ? `${baseText}${FAILURE_ACTION_NOTICE}` : baseText
+  // Usage is appended mechanically from the host API, never from the worker's
+  // own report text, so it survives compaction and cannot be under-reported.
+  const usageLine = usage === undefined ? "" : `\n${formatUsage(usage)}`
+  const text = `${state === "failed" ? `${baseText}${FAILURE_ACTION_NOTICE}` : baseText}${usageLine}`
   const routerID = yield* ensureRouterForWorker(ctx, worker).pipe(
     Effect.catch((cause) =>
       Effect.logWarning("superagent cannot report without a router", { cause }).pipe(Effect.as(undefined)),
@@ -346,6 +357,31 @@ function routerPartitionOf(sessionID: string): string | undefined {
   return isRouterSession(sessionID) ? dirKeyForRouter(sessionID) : undefined
 }
 
+/**
+ * Live usage refresh for running workers. `session.usage.updated` is ephemeral
+ * and can fire often, so it updates only the in-memory record — `status` and
+ * `worker_detail` read that same map, so the Router sees a fresh number with no
+ * KV write per token increment. The final value is persisted by `handleEnded`
+ * (or hydrate) from `session.get()`.
+ */
+export const handleUsageUpdated = Effect.fn("superagent.usageUpdated")(function* (
+  sessionID: string,
+  data: unknown,
+) {
+  const worker = store.workers.get(sessionID)
+  if (worker === undefined || !isRecord(data)) return
+  const tokens = parseTokenUsage(data["tokens"])
+  if (tokens === undefined) return
+  const rawCost = data["cost"]
+  const cost = typeof rawCost === "number" && Number.isFinite(rawCost) ? rawCost : undefined
+  worker.lastUsage = {
+    tokens,
+    ...(cost === undefined ? {} : { cost }),
+    source: "session",
+    capturedAt: Date.now(),
+  }
+})
+
 export const registerWatcher = Effect.fn("superagent.registerWatcher")(function* (ctx: Plugin.Context) {
   yield* ctx.event
     .subscribe({
@@ -355,6 +391,7 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
         "session.execution.failed",
         "session.execution.interrupted",
         "session.idle",
+        "session.usage.updated",
       ],
     })
     .pipe(
@@ -400,6 +437,10 @@ export const registerWatcher = Effect.fn("superagent.registerWatcher")(function*
             }
             case "session.idle": {
               yield* handleIdle(ctx, sessionID)
+              return
+            }
+            case "session.usage.updated": {
+              yield* handleUsageUpdated(sessionID, event.data)
               return
             }
             default:

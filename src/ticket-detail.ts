@@ -27,6 +27,8 @@ export interface TicketDetail {
   readonly threadID?: string
   readonly directory?: string
   readonly workerSessionID?: string
+  /** Every bound worker session (when the gateway prints the list). */
+  readonly workerSessionIDs?: string
   /** Reasoning effort of the last dispatch, when the gateway prints one. */
   readonly effort?: string
   readonly attempts?: string
@@ -42,7 +44,7 @@ export interface TicketDetail {
 /** `tk_xxx · in_progress · p1`: the first line of `renderTicketDetail`. */
 const HEADER_LINE = /^(\S+) · ([a-z_]+) · (p[012])$/
 /** `目标：…`, `worker：ses_x`, … (the label is followed by its value). */
-const LABEL_LINE = /^(目标|thread|目录|worker|effort|档位|尝试|建档|更新|关闭|结论|父单|原话)：/
+const LABEL_LINE = /^(目标|thread|目录|workers|worker|effort|档位|尝试|建档|更新|关闭|结论|父单|原话)：/
 /** `验收：` and `历史（最近 N 条）：` introduce bullet sections. */
 const SECTION_LINE = /^(验收|历史（最近 \d+ 条）)：$/
 const BULLET_LINE = /^· (.*)$/
@@ -53,6 +55,7 @@ type StringField =
   | "threadID"
   | "directory"
   | "workerSessionID"
+  | "workerSessionIDs"
   | "effort"
   | "attempts"
   | "createdAt"
@@ -66,6 +69,7 @@ const FIELD_BY_LABEL: Readonly<Record<string, StringField>> = {
   目标: "objective",
   thread: "threadID",
   目录: "directory",
+  workers: "workerSessionIDs",
   worker: "workerSessionID",
   effort: "effort",
   // `renderTicketDetail` labels the dispatch's reasoning level `档位：`; the
@@ -194,6 +198,10 @@ export function detailRows(detail: TicketDetail, width: number): Array<string> {
     stamp("目录", detail.directory),
     stamp("档位", detail.effort),
     stamp("最近 worker", detail.workerSessionID === undefined || detail.workerSessionID === "-" ? undefined : detail.workerSessionID),
+    ...(() => {
+      const ids = detail.workerSessionIDs?.split(",").map((id) => id.trim()).filter((id) => id !== "") ?? []
+      return ids.length > 1 ? [stamp("全部 worker", ids.join(", "))] : []
+    })(),
     stamp("尝试", detail.attempts),
   ]
   for (const row of meta) if (row !== undefined) rows.push(...wrap(row))

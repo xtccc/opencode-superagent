@@ -5,7 +5,33 @@ version is independent of the main OpenCode line (see README, "发布与构建")
 
 ## Unreleased
 
-Nothing yet — see `0.6.0` below.
+### Added
+
+- **Machine-read context usage for workers.** Router can now see a worker's
+  token consumption without asking the worker to self-report it: the completion
+  notification appends `context <N> tokens (in/out/reason/cache) [session|step]`
+  taken from `session.get().tokens` (preferred) or the last assistant step in
+  `session.context()`. `session.usage.updated` refreshes the in-memory number
+  for running workers, surfaced as `ctx=...` in `status` and as a `context usage`
+  line in `worker_detail`. Snapshots persist on `worker:<id>.lastUsage` and are
+  restored on hydrate, including a native-compaction fallback.
+
+- **Reopenable tickets.** `done`/`failed`/`cancelled`/`superseded` are no longer
+  dead ends: `ticket_update({ status: "in_progress" })` reopens the same work
+  order, clears the previous `closedAt`/`closeReason` and records a `reopened`
+  history entry. Re-dispatching a reopened ticket appends a new attempt instead
+  of forcing a duplicate ticket.
+- **One-to-many ticket → worker association.** `Ticket.workerSessionIDs` keeps
+  every session ever bound to a work order (the legacy `workerSessionID` remains
+  the newest-session view for downgrade/TUI compatibility). Dispatch and
+  `ticket_update({ workerSessionID })` append without duplicates, encode/decode
+  keeps both views in sync, and the dispatch gate checks all bound workers for
+  liveness. Detail view prints the full list under `workers：`.
+- **Reusable worker context via `worker_prompt`.** A `done` worker session can
+  now be resumed just like `running`/`idle`, so follow-ups keep its accumulated
+  context instead of starting a cold worker. A closed ticket no longer blocks
+  the prompt: the reply reminds the Router to reopen it first. `failed`/`aborted`
+  workers and workers with no ticket are still refused.
 
 ## 0.6.0 — 2026-11-14
 

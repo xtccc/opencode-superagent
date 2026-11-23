@@ -85,6 +85,66 @@ beforeEach(() => {
   store.routerBusy = false
 })
 
+// ── machine-read usage ───────────────────────────────────────────────────────
+
+describe("worker completion carries context usage", () => {
+  test("usage from session.get() is appended to the router notification and persisted", async () => {
+    const h = memoryContext()
+    store.routerID = "ses_router"
+    h.infos.set("ses_router", {})
+    h.infos.set("ses_worker", {
+      outcome: "succeeded",
+      tokens: { input: 10_000, output: 2_000, reasoning: 500, cache: { read: 32_000, write: 1_000 } },
+      cost: 0.1234,
+    })
+    h.messages.set("ses_worker", [
+      {
+        type: "assistant",
+        content: [{ type: "text", text: "done" }],
+        tokens: { input: 1, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    ])
+    store.workers.set("ses_worker", worker("ses_worker", "running"))
+
+    await succeed(handleEnded(h.ctx, "ses_worker", "done", undefined, 1))
+
+    expect(h.calls.synthetic).toHaveLength(1)
+    // 10k + 2k + 500 + 32k + 1k = 45.5k, taken from the host counters.
+    expect(h.calls.synthetic[0]).toContain("context 45.5k tokens")
+    expect(h.calls.synthetic[0]).toContain("cost $0.1234")
+    expect(h.calls.synthetic[0]).toContain("[session]")
+    const saved = store.workers.get("ses_worker")!
+    expect(saved.lastUsage?.tokens.input).toBe(10_000)
+    expect(saved.lastUsage?.source).toBe("session")
+  })
+
+  test("falls back to the last assistant step when session.get() has no counters", async () => {
+    const h = memoryContext()
+    store.routerID = "ses_router"
+    h.infos.set("ses_router", {})
+    h.infos.set("ses_worker", { outcome: "succeeded" })
+    h.messages.set("ses_worker", [
+      {
+        type: "assistant",
+        content: [{ type: "text", text: "old" }],
+        tokens: { input: 10, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+      {
+        type: "assistant",
+        content: [{ type: "text", text: "latest" }],
+        tokens: { input: 3_000, output: 1_000, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    ])
+    store.workers.set("ses_worker", worker("ses_worker", "running"))
+
+    await succeed(handleEnded(h.ctx, "ses_worker", "done", undefined, 1))
+
+    expect(h.calls.synthetic[0]).toContain("context 4.0k tokens")
+    expect(h.calls.synthetic[0]).toContain("[step]")
+    expect(store.workers.get("ses_worker")?.lastUsage?.tokens.input).toBe(3_000)
+  })
+})
+
 // ── dedupe ───────────────────────────────────────────────────────────────────
 
 describe("worker completion dedupe", () => {
