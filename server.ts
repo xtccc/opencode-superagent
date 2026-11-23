@@ -6,6 +6,7 @@ import { registerAgents } from "./src/agents.js"
 import { registerContext } from "./src/context.js"
 import { hydrateDirs, dirKeyFor, resolveDirectory } from "./src/dirs.js"
 import { registerTools } from "./src/dispatch.js"
+import { registerFileRead } from "./src/file-read.js"
 import { formatTrigger } from "./src/format.js"
 import { Definition } from "./src/protocol.js"
 import { hydrateReports } from "./src/report.js"
@@ -164,6 +165,7 @@ export default Plugin.define({
     yield* hydrateSessionMeta(ctx)
     yield* hydrateReports(ctx)
     yield* registerTools(ctx)
+    yield* registerFileRead(ctx)
     yield* registerSleep(ctx)
     yield* registerTicketTools(ctx)
     yield* registerAbort(ctx)

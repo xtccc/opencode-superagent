@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { AbortInput } from "../src/abort.js"
 import { DispatchInput, StatusInput } from "../src/dispatch.js"
+import { FileReadInput } from "../src/file-read.js"
 import { ReportReadInput, ThreadDetailInput, WorkerDetailInput } from "../src/recall.js"
 import { SleepInput } from "../src/sleep.js"
 import { WorkerPromptInput } from "../src/worker-prompt.js"
@@ -40,6 +41,7 @@ const schemas = {
   thread_detail: ThreadDetailInput,
   worker_detail: WorkerDetailInput,
   report_read: ReportReadInput,
+  file_read: FileReadInput,
   abort_session: AbortInput,
   worker_prompt: WorkerPromptInput,
   sleep: SleepInput,

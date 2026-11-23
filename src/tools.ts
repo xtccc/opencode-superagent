@@ -278,6 +278,27 @@ export const ROUTER_TOOL_SPECS: ReadonlyArray<ToolSpec> = [
     ],
   },
   {
+    name: "file_read",
+    group: "query",
+    description:
+      "Read a text file inside the router's workspace or known directories (absolute path, or relative to them), with optional character-range paging (offset, limit; default 8000 chars, max 20000). Secret files (.env, credentials, private keys, certificates), sensitive directories (.ssh/.aws/.git/.gnupg) and paths outside known roots are refused. Returns the slice with total length, size and the next offset. Only the router may call it.",
+    summary: "分页读取工作区/已知目录内的文本（默认 8000 字/页，上限 20000），拒绝密钥文件。",
+    params: [
+      { name: "path", required: true, type: "string", note: "绝对路径或相对已知目录" },
+      { name: "offset", required: false, type: "number", note: "起始字符偏移，默认 0" },
+      { name: "limit", required: false, type: "number", note: "默认 8000，上限 20000" },
+    ],
+    risk: "read",
+    permission: "status",
+    confirmation: "只读，自动执行（permission: status）；越界路径或敏感文件直接拒绝。",
+    usage: [
+      "仅工作区（网关 cwd）与已知目录（thread 绑定、目录别名、Router 分区目录）内可读；其他路径拒绝。",
+      "拒绝 .env、credentials、密钥证书（*.key/*.pem）与 .ssh/.aws/.git 等敏感目录；越界符号链接也拒绝。",
+      "按返回的 next offset 翻页，到末尾会提示；单文件上限 2MB，超出派 Worker 分段处理。",
+      "这是只读工具：要写/改文件仍派 Worker，file_read 无法修改任何内容。",
+    ],
+  },
+  {
     name: "worker_prompt",
     group: "control",
     description:
@@ -360,7 +381,7 @@ export const ROUTER_PERMISSIONS: ReadonlyArray<{
 
 /** What the Router cannot do, independent of which tools it currently has. */
 export const ROUTER_LIMITS: ReadonlyArray<string> = [
-  "不能读写文件或执行命令：没有 Read/Write/Edit/Bash，只能派 Worker 去做。",
+  "不能写文件或执行命令：只能用 file_read 读工作区文本（拒绝密钥），写改派 Worker。",
   "不能操作非 superagent 会话：abort_session 只接受插件自己创建的 Worker，用户会话、Router 自身和未知 sessionID 一律拒绝。",
   "不能修改自身：改不了自己的 prompt、工具集或配置，也不能终止自己所在的 Router 会话。",
   "不能直接和 Worker 的模型对话：只能 dispatch 任务，或读它的状态、最近 assistant 消息与报告全文（report_read）。",
@@ -494,7 +515,7 @@ export function describeTool(spec: ToolSpec, width = DETAIL_WIDTH): string {
 
 /** The capability-boundary section shared by `/tools`. */
 export function describeLimits(width = DETAIL_WIDTH): string {
-  const lines = ["Router 只能调度，不能自己动手。以下是明确的边界：", ""]
+  const lines = ["Router 以调度为主。明确的边界：", ""]
   for (const limit of ROUTER_LIMITS) lines.push(...bullet(limit, width))
   return lines.join("\n")
 }
